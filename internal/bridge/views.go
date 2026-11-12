@@ -56,10 +56,6 @@ type (
 		ProgressNote string      `json:"progress_note,omitempty"`
 		OpenChildren int         `json:"open_children"`
 		ParkedAt     *time.Time  `json:"parked_at,omitempty"`
-		// BaseCommits are a done order's repos' base commits, by name:
-		// where its work starts, for the console's diff command (#4). Only
-		// the console's views carry them (consoleSource.orderView).
-		BaseCommits map[string]string `json:"base_commits,omitempty"`
 	}
 
 	// HailView is a hail. CreatedAt is omitted on a hail from before #147,

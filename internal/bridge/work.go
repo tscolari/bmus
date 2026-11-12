@@ -442,8 +442,10 @@ func doneText(summary string, landed []landedRepo) string {
 }
 
 // donePayload is the done entry's payload: the report, with each repo's
-// work as it landed on the bridge instead of the beam's paths.
+// work as it landed on the bridge instead of the beam's paths, and the
+// beam it came from (#104; absent before).
 type donePayload struct {
+	Beam      string       `json:"beam,omitempty"`
 	Summary   string       `json:"summary"`
 	Repos     []landedRepo `json:"repos"`
 	Artifacts []string     `json:"artifacts,omitempty"`

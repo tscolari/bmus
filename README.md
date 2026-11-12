@@ -29,6 +29,7 @@ A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026
 - [x] Swap a crew member's beam before its TTL and resume from a checkpoint
 - [x] Recall, belay, withdraw and re-route orders
 - [x] Push a done order's branch from the bridge
+- [x] Read a done order's mission report, with its diff, in the console
 - [x] Hold work through a `tsh` login expiry and resume after `tsh login`
 - [x] Run the ship from a web console with live updates and hail notifications
 

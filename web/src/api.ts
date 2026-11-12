@@ -54,8 +54,6 @@ export interface OrderView {
   readonly open_children: number;
   /** Set while its mission is parked, waiting for a resume (#167); absent otherwise. */
   readonly parked_at?: string;
-  /** A done order's repos' base commits, by name: where its work starts, from the ship-repos log entries (#4). */
-  readonly base_commits?: Readonly<Record<string, string>>;
 }
 
 /** A hail: bridge.HailView. */
@@ -134,8 +132,6 @@ export interface Snapshot {
   readonly repos: readonly string[];
   /** The registered repos' URLs without credentials, by name: where a push sends an order's work (#4). */
   readonly repo_urls: Readonly<Record<string, string>>;
-  /** The bridge's home: its clones are under <home>/repos (#4). */
-  readonly home: string;
 }
 
 /** GET /api/log's body. */
@@ -189,6 +185,37 @@ export interface PushedRepo {
   readonly url: string;
   readonly branch: string;
   readonly commit: string;
+}
+
+/** One repo's diff in GET /api/orders/{id}/diff: bridge.RepoDiff. diff is unified, from base to the work; truncated says it stops at the bridge's cap. */
+export interface RepoDiff {
+  readonly name: string;
+  readonly base: string;
+  readonly diff: string;
+  readonly truncated: boolean;
+}
+
+/** A push of the order's work in GET /api/orders/{id}/report: bridge.ReportPush. */
+export interface ReportPush {
+  readonly repo: string;
+  readonly branch: string;
+  readonly commit: string;
+  readonly force: boolean;
+  readonly at: string;
+}
+
+/** GET /api/orders/{id}/report's reply: bridge.OrderReport, a done order's mission report (#104). null and [] where the bridge has no record. */
+export interface OrderReport {
+  /** The order's view, with when it was created and done. */
+  readonly order: OrderView & { readonly created_at: string | null; readonly done_at: string | null };
+  readonly crew: CrewView | null;
+  /** The beams the order ran on, oldest first. */
+  readonly beams: readonly string[];
+  readonly report: { readonly summary: string; readonly artifacts: readonly string[] } | null;
+  readonly pushes: readonly ReportPush[];
+  /** The bytes each repo's diff was capped at. */
+  readonly cap: number;
+  readonly repos: readonly RepoDiff[];
 }
 
 /** POST /api/crew/{id}/reenergize's reply: bridge.CrewActionResult. */
@@ -294,6 +321,11 @@ export function routeOrder(csrf: string, id: string, args: OrderRouteArgs): Prom
 /** Pushes a done order's work to its repos' remotes; a diverged target is an ApiError with status 409. */
 export function pushOrder(csrf: string, id: string, args: OrderPushArgs): Promise<PushedRepo[]> {
   return postJSON<PushedRepo[]>(orderPath(id, "push"), csrf, args);
+}
+
+/** Reads a done order's mission report, its diff included. */
+export function orderReport(id: string, f: typeof fetch = fetch): Promise<OrderReport> {
+  return getJSON<OrderReport>(orderPath(id, "report"), f);
 }
 
 /** Gives a crew member in sickbay a new tour and beam. */

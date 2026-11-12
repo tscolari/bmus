@@ -1,4 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from "preact/hooks";
+import { ReportPage, reportPageOrder } from "./report.js";
 import { browserFeedEnv, connectFeed, type Link } from "./feed.js";
 import {
   AwayPanel,
@@ -27,7 +28,10 @@ type SessionState =
 /** How often the stardate clock ticks. */
 const clockTick = 15_000;
 
-/** The console's root: the session exchange, then the bridge console. */
+/**
+ * The console's root: the session exchange, then the bridge console, or
+ * the mission report at /report/<order> (#104).
+ */
 export function App() {
   const [session, setSession] = useState<SessionState>({ kind: "starting" });
   useEffect(() => {
@@ -36,7 +40,8 @@ export function App() {
       (err: unknown) => setSession({ kind: "failed", message: err instanceof Error ? err.message : String(err) }),
     );
   }, []);
-  if (session.kind === "ready") return <Console csrf={session.csrf} />;
+  const reportOrder = reportPageOrder(window.location.pathname);
+  if (session.kind === "ready") return reportOrder === undefined ? <Console csrf={session.csrf} /> : <ReportPage id={reportOrder} />;
   return (
     <main class="console">
       <h1 class="gate-title">BEAM ME UP, SCOTTY</h1>

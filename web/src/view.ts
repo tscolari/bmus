@@ -481,29 +481,9 @@ export function githubCompareURL(url: string, branch: string): string | undefine
   return `https://github.com/${owner}/${repo}/compare/${ref}?expand=1`;
 }
 
-/** s quoted for a POSIX shell: as it is when it holds only safe characters, else in single quotes. */
-export function shellQuote(s: string): string {
-  if (/^[A-Za-z0-9_/.,:@%+=-]+$/.test(s)) return s;
-  return `'${s.replaceAll("'", `'\\''`)}'`;
-}
-
-/**
- * The "Copy diff command" text for done order o: for each repo with a
- * base commit, `git -C '<home>/repos/<name>' diff <base>...bmus/<order>`,
- * one per line. The clone's path is always single-quoted. A base that
- * isn't a full commit id is skipped, and an order id outside
- * [A-Za-z0-9-] gives none. Undefined when there is nothing to diff, or no
- * home yet.
- */
-export function diffCommand(home: string, o: OrderView): string | undefined {
-  if (home === "" || !/^[A-Za-z0-9-]+$/.test(o.id)) return undefined;
-  const lines = o.repos.flatMap((r) => {
-    const base = o.base_commits?.[r.name];
-    if (base === undefined || !/^[0-9a-f]{40,64}$/.test(base)) return [];
-    const dir = `'${`${home.replace(/\/+$/, "")}/repos/${r.name}`.replaceAll("'", `'\\''`)}'`;
-    return [`git -C ${dir} diff ${shellQuote(`${base}...${orderBranch(o.id)}`)}`];
-  });
-  return lines.length === 0 ? undefined : lines.join("\n");
+/** The mission report's path for order id (#104): /report/<order>, which the console serves as itself. */
+export function reportPath(id: string): string {
+  return `/report/${encodeURIComponent(id)}`;
 }
 
 /** The branch order id's work was last pushed to, from its "repo <name> pushed to <branch> at <commit>" entries in the log; undefined if none. */

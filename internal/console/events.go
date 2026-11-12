@@ -63,6 +63,10 @@ type Source interface {
 	// member, order, hail, in that order), as events. An entity that
 	// doesn't exist is left out.
 	Views(ctx context.Context, e store.LogEntry) ([]Event, error)
+	// OrderReport reads done order id's mission report (#104): {order,
+	// crew, beams, report, pushes, cap, repos: [{name, base, diff,
+	// truncated}]}. Its errors carry their RPC codes as Actions errors do.
+	OrderReport(ctx context.Context, id string) (any, error)
 }
 
 // Snapshot is the snapshot event's body, and /api/state's. LastLogID is
@@ -84,9 +88,6 @@ type Snapshot struct {
 	// RepoURLs are the registered repos' URLs without credentials, by
 	// name: where a push sends an order's work (#4). Fixed, as Repos.
 	RepoURLs map[string]string `json:"repo_urls"`
-	// Home is the bridge's home: its clones are under <home>/repos, for
-	// the console's copied diff command (#4).
-	Home string `json:"home"`
 }
 
 // Status is the bridge's status. View is what the status event carries;
@@ -114,7 +115,8 @@ type logPage struct {
 }
 
 // apiRoutes are the /api/ routes behind the session checks: the reads
-// (#72), GET /api/session and the actions (#73, #78, actions.go).
+// (#72, the mission report #104), GET /api/session and the actions (#73, #78,
+// actions.go).
 func (s *Server) apiRoutes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", s.handleState)
@@ -130,6 +132,7 @@ func (s *Server) apiRoutes() http.Handler {
 	mux.HandleFunc("POST /api/orders/{id}/withdraw", s.handleOrderAction("withdraw order", Source.WithdrawOrder))
 	mux.HandleFunc("POST /api/orders/{id}/route", s.handleOrderAction("route order", Source.RouteOrder))
 	mux.HandleFunc("POST /api/orders/{id}/push", s.handlePushOrder)
+	mux.HandleFunc("GET /api/orders/{id}/report", s.handleOrderReport)
 	mux.HandleFunc("POST /api/crew/{id}/reenergize", s.handleReenergize)
 	mux.HandleFunc("PUT /api/standing-orders", s.handleStandingOrders)
 	mux.Handle("/api/", http.NotFoundHandler())
@@ -212,6 +215,23 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request) {
 		page.LastID = e.ID
 	}
 	writeJSON(w, http.StatusOK, page)
+}
+
+// handleOrderReport serves GET /api/orders/{id}/report (#104): 200 and
+// the done order's mission report. Errors map as an action's do: an
+// order that isn't done is a 400, an unknown one a 404, a report that
+// ran past its time a 504 (timeout).
+func (s *Server) handleOrderReport(w http.ResponseWriter, r *http.Request) {
+	src, ok := s.source(w)
+	if !ok {
+		return
+	}
+	v, err := src.OrderReport(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.actionError(w, "read mission report", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
 }
 
 // queryInt parses v as a non-negative integer; empty means def.

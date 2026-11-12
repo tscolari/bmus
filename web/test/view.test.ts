@@ -6,7 +6,7 @@ import {
   belayPrompt,
   canCountermand,
   canPush,
-  diffCommand,
+  reportPath,
   forcePushPrompt,
   githubCompareURL,
   canTake,
@@ -35,7 +35,6 @@ import {
   pushPrompt,
   pushRemotes,
   queuedFor,
-  shellQuote,
   routeArgs,
   routeValue,
   stardate,
@@ -432,42 +431,9 @@ describe("push (#4)", () => {
     expect(githubCompareURL("https://github.com/o/r.git", "feat/a b#c?d")).toBe("https://github.com/o/r/compare/feat/a%20b%23c%3Fd?expand=1");
   });
 
-  it("quotes for a shell", () => {
-    expect(shellQuote("abc123...bmus/ORD-0007")).toBe("abc123...bmus/ORD-0007");
-    expect(shellQuote("a b")).toBe("'a b'");
-    expect(shellQuote("it's $(x)")).toBe(`'it'\\''s $(x)'`);
-    expect(shellQuote("")).toBe("''");
-  });
-
-  it("copies one diff command per repo with a base commit, the clone's path quoted", () => {
-    const base = "0123456789abcdef0123456789abcdef01234567";
-    const o = order("ORD-0007", {
-      state: "done",
-      repos: [{ name: "app", base_ref: "main" }, { name: "lib", base_ref: "main" }, { name: "web", base_ref: "main" }],
-      base_commits: { app: base, lib: "f".repeat(64) },
-    });
-    expect(diffCommand("/srv/bmus", o)).toBe(
-      `git -C '/srv/bmus/repos/app' diff ${base}...bmus/ORD-0007\ngit -C '/srv/bmus/repos/lib' diff ${"f".repeat(64)}...bmus/ORD-0007`,
-    );
-    expect(diffCommand("/srv/it's here/", order("ORD-0007", { base_commits: { app: base } }))).toBe(
-      `git -C '/srv/it'\\''s here/repos/app' diff ${base}...bmus/ORD-0007`,
-    );
-    expect(diffCommand("", o)).toBeUndefined();
-    expect(diffCommand("/srv/bmus", order("ORD-0007", { state: "done" }))).toBeUndefined();
-  });
-
-  it("leaves out a base that isn't a full commit id, and an order id that isn't plain", () => {
-    const base = "0123456789abcdef0123456789abcdef01234567";
-    const two = [{ name: "app", base_ref: "main" }, { name: "lib", base_ref: "main" }];
-    for (const bad of ["fedcba", "HEAD", "0123456789ABCDEF0123456789ABCDEF01234567", `${base}; rm -rf /`, "-x", "a".repeat(65), ""]) {
-      expect(diffCommand("/srv/bmus", order("ORD-0007", { repos: two, base_commits: { app: base, lib: bad } })), bad).toBe(
-        `git -C '/srv/bmus/repos/app' diff ${base}...bmus/ORD-0007`,
-      );
-      expect(diffCommand("/srv/bmus", order("ORD-0007", { base_commits: { app: bad } })), bad).toBeUndefined();
-    }
-    for (const id of ["ORD-0007; rm -rf /", "ORD 7", "../ORD", "ORD$(x)", ""]) {
-      expect(diffCommand("/srv/bmus", order(id, { base_commits: { app: base } })), id).toBeUndefined();
-    }
+  it("the mission report's path is /report/<order>, encoded", () => {
+    expect(reportPath("ORD-0007")).toBe("/report/ORD-0007");
+    expect(reportPath("a/b?c")).toBe("/report/a%2Fb%3Fc");
   });
 
   it("reads where an order was last pushed from its log", () => {

@@ -81,5 +81,5 @@ export function status(over: Partial<BridgeStatus> = {}): BridgeStatus {
 }
 
 export function snapshot(over: Partial<Snapshot> = {}): Snapshot {
-  return { last_log_id: 0, crew: [], orders: [], hails: [], status: status(), log: [], repos: [], repo_urls: {}, home: "", ...over };
+  return { last_log_id: 0, crew: [], orders: [], hails: [], status: status(), log: [], repos: [], repo_urls: {}, ...over };
 }

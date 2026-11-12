@@ -278,7 +278,7 @@ func shipRepos(ctx context.Context, d *Daemon, in MissionInput) (shipped, error)
 		out.Repos = append(out.Repos, comms.OrderRepo{Name: r.Name, BaseRef: r.BaseRef, BundlePath: remote})
 		if err := d.appendLog(ctx, logOrder, in.CrewID, in.OrderID,
 			fmt.Sprintf("repo %s shipped to the beam at %s (%s)", r.Name, commit[:min(len(commit), 12)], start),
-			map[string]string{"repo": r.Name, "base_ref": r.BaseRef, "commit": commit, "bundle_path": remote, "from": start}); err != nil {
+			map[string]string{"repo": r.Name, "base_ref": r.BaseRef, "commit": commit, "bundle_path": remote, "from": start, "beam": beam.Alias}); err != nil {
 			return shipped{}, err
 		}
 	}
@@ -494,6 +494,19 @@ func runGit(ctx context.Context, gitDir string, args ...string) (string, error) 
 // /dev/null (git index-pack --stdin, #65's object check). A nil stdin
 // keeps runGit's own behavior (os/exec gives git /dev/null).
 func runGitStdin(ctx context.Context, gitDir string, stdin io.Reader, args ...string) (string, error) {
+	cmd := gitCommand(ctx, gitDir, args...)
+	cmd.Stdin = stdin
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := runGitCmd(ctx, cmd, &stderr, args); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
+// gitCommand is the git command runGit runs, args on the repository
+// gitDir, before its stdin and outputs are set: see runGit.
+func gitCommand(ctx context.Context, gitDir string, args ...string) *exec.Cmd {
 	full := []string{"-c", "gc.autoDetach=false", "-c", "maintenance.autoDetach=false"}
 	if gitDir != "" {
 		full = append(full, "--git-dir="+gitDir)
@@ -504,28 +517,135 @@ func runGitStdin(ctx context.Context, gitDir string, stdin io.Reader, args ...st
 		cmd.Dir = gitDir
 	}
 	cmd.Env = gitEnv()
-	cmd.Stdin = stdin
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	// git leads its own process group (Setsid): signal the group, so the
 	// ssh or helper it started goes too.
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM) }
 	cmd.WaitDelay = gitWaitDelay
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	return cmd
+}
+
+// runGitCmd runs cmd, from gitCommand with args, and returns its error
+// with git's stderr, which cmd writes to stderr. The error names git's
+// command, after any leading -c options.
+func runGitCmd(ctx context.Context, cmd *exec.Cmd, stderr fmt.Stringer, args []string) error {
 	err := cmd.Run()
 	if ctx.Err() != nil && cmd.Process != nil {
 		// git is gone (it exited, or WaitDelay killed it); kill whatever of
 		// its group outlived the SIGTERM.
 		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
-	if err != nil {
-		if ctx.Err() != nil {
-			err = fmt.Errorf("%w (%w)", context.Cause(ctx), err)
-		}
-		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return "", fmt.Errorf("git %s: %w: %s", args[0], err, msg)
-		}
-		return "", fmt.Errorf("git %s: %w", args[0], err)
+	if err == nil {
+		return nil
 	}
-	return strings.TrimSpace(stdout.String()), nil
+	return gitError(ctx, err, stderr, args)
 }
+
+// gitError is the error of git run with args that failed with err: with
+// the context's cause when ctx ended, and git's stderr. It names git's
+// command, after any leading -c options.
+func gitError(ctx context.Context, err error, stderr fmt.Stringer, args []string) error {
+	if ctx.Err() != nil {
+		err = fmt.Errorf("%w (%w)", context.Cause(ctx), err)
+	}
+	i := 0
+	for i+2 < len(args) && args[i] == "-c" {
+		i += 2
+	}
+	name := args[i]
+	if msg := strings.TrimSpace(stderr.String()); msg != "" {
+		return fmt.Errorf("git %s: %w: %s", name, err, msg)
+	}
+	return fmt.Errorf("git %s: %w", name, err)
+}
+
+// gitStderrCap caps how much of git's stderr runGitCapped keeps.
+const gitStderrCap = 64 << 10
+
+// runGitCapped is runGit for output that may be large, such as a diff
+// (#104): see cappedOutput.
+func runGitCapped(ctx context.Context, gitDir string, limit int, args ...string) (out []byte, truncated bool, err error) {
+	return cappedOutput(ctx, gitCommand(ctx, gitDir, args...), limit, args)
+}
+
+// cappedOutput runs cmd, from gitCommand with args, and reads at most
+// limit+1 bytes of its stdout as git writes it, returning them
+// untrimmed. With more than limit, it keeps limit, kills git's process
+// group and reports truncated: git is never left to write the rest, and
+// nothing past limit+1 bytes is held.
+//
+// git's stdout is a pipe read here, before Wait: git can't be reaped while
+// it is read, so its pid, which leads its group, is still its own when
+// the group is killed. A kill takes the lock and checks that Wait hasn't
+// started. When ctx ends, cmd.Cancel sends the group SIGTERM, which ends
+// the read; whatever holds the pipe open gitWaitDelay later is killed.
+func cappedOutput(ctx context.Context, cmd *exec.Cmd, limit int, args []string) (out []byte, truncated bool, err error) {
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return nil, false, err
+	}
+	defer pr.Close()
+	stderr := &cappedWriter{limit: gitStderrCap}
+	cmd.Stdout, cmd.Stderr = pw, stderr
+	err = cmd.Start()
+	pw.Close()
+	if err != nil {
+		return nil, false, gitError(ctx, err, stderr, args)
+	}
+	var (
+		mu      sync.Mutex
+		waiting bool
+	)
+	kill := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if !waiting {
+			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+	}
+	var late *time.Timer
+	stop := context.AfterFunc(ctx, func() {
+		mu.Lock()
+		defer mu.Unlock()
+		late = time.AfterFunc(gitWaitDelay, kill)
+	})
+	out, rerr := io.ReadAll(io.LimitReader(pr, int64(limit)+1))
+	if len(out) > limit {
+		out, truncated = out[:limit], true
+		kill()
+	}
+	pr.Close()
+	stop()
+	mu.Lock()
+	waiting = true
+	if late != nil {
+		late.Stop()
+	}
+	mu.Unlock()
+	werr := cmd.Wait()
+	if truncated {
+		// The kill is the error, if any; the output is what was asked for.
+		return out, true, nil
+	}
+	if werr == nil {
+		werr = rerr
+	}
+	if werr != nil {
+		return nil, false, gitError(ctx, werr, stderr, args)
+	}
+	return out, false, nil
+}
+
+// cappedWriter keeps the first limit bytes written to it and drops the
+// rest.
+type cappedWriter struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+func (w *cappedWriter) Write(p []byte) (int, error) {
+	w.buf.Write(p[:min(len(p), max(w.limit-w.buf.Len(), 0))])
+	return len(p), nil
+}
+
+func (w *cappedWriter) String() string { return w.buf.String() }

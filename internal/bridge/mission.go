@@ -991,7 +991,7 @@ func completeMission(ctx dbos.Context, in MissionInput, beam string, hail *openH
 			return MissionResult{}, err
 		}
 	}
-	payload := donePayload{Summary: report.Summary, Repos: fetched, Artifacts: report.Artifacts, Usage: report.Usage}
+	payload := donePayload{Beam: beam, Summary: report.Summary, Repos: fetched, Artifacts: report.Artifacts, Usage: report.Usage}
 	done, err := dbos.RunAsStep(ctx, func(c context.Context) (doneOutcome, error) {
 		d := daemonFrom(c)
 		if err := d.closeHail(c, in, hail); err != nil {
