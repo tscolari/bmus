@@ -1,0 +1,272 @@
+# Regulations (regs.yaml): who answers a hail. Written by `bmus regs init`.
+#
+# This is a starting point, not a considered security policy: tighten or
+# loosen it once real hails arrive. The bridge reads it at startup
+# (`bmus bridge run --regs`, default <home>/regs.yaml); without it every hail
+# goes to the captain. See spec/phase-3-plan-2026-10-29.md §2.
+#
+# A hail is classified in three steps:
+#   1. classify: every rule whose tool and match fit the hail's command
+#      tags it (destructive, external_effect, ...); the first names it. A
+#      tool_approval hail's command is the tool input's "command"; for any
+#      tool but Bash, every other string in the input is read after it.
+#      A command rule's regex reads each simple command in the command,
+#      its command word's basename then its arguments, once assignments,
+#      keywords and wrappers (env, sudo, xargs, ...) are skipped: bash x.sh
+#      reads as "bash x.sh" in "if sudo -u me /bin/bash x.sh; then", and
+#      also with the command's own variables filled in. An
+#      opaque rule fits a command that runs something whose name can't be
+#      read without running the shell: $x push, g[i]t push, gi? push, or a
+#      variable set by read or $(...). An ansi_c rule fits a command
+#      holding $'...' where bash decodes it: outside quotes, comments and
+#      heredoc bodies, in any word or ${...}. grep 'a$' x is no fit.
+#   2. captain_only: a rule that fits sends the hail to the captain alone.
+#      Match regexes are substring matches, tried on the command, on it
+#      with ' " and \ removed, on that with $() ${..} $[..] $@ $* removed,
+#      and on that with the command's own variables filled in (x=sh; pu$x
+#      reads as push) and ${x:-word} read as word, each also with ANSI-C
+#      strings decoded ($'\x70ush' reads as push). Cyrillic and Greek
+#      lookalikes read as the ASCII letters they look like.
+#   3. auto_allow: a rule that fits a tool_approval hail decides it by
+#      policy (decided_by policy, logged like any decision). Match regexes
+#      must match the whole command, and a command holding ; & | ` $( < >,
+#      or anything but printable ASCII, spaces and tabs, never fits.
+#      A tag rule here sees only tags from classify's match rules, over
+#      the command as written: command and opaque rules never allow.
+#   Anything else goes to Command, whose answer captain_only checks again:
+#   an option rule there rejects a match in the question, the picked option
+#   or the answer, so does a tag rule whose tag classify gives any of them,
+#   and any risk flag or low confidence escalates.
+#
+# Regexes are Go's (RE2) syntax; runs of whitespace in a command collapse to
+# one space before any of them runs. A rule's fields must all fit; alert
+# means the order's priority is at least that level.
+
+classify:
+  # Any tool: matching too much only costs the captain a hail.
+  - tag: destructive
+    match: '(?i)\brm\b.*\s(-[a-z]*r|--r[a-z]*)'
+  - tag: destructive
+    match: '(?i)\b(drop|truncate)\s+(table|database|schema)\b'
+  - tag: external_effect
+    match: '(?i)\bgit\b.*\bpush\b'
+  - tag: destructive
+    match: '(?i)\bfind\b.*\s-(delete\b|(exec|ok)(dir)?\s+((sudo|doas|env|command|nice|nohup|time|busybox|-\S*|\w+=\S*)\s+)*(\S*/)?(rm|unlink|shred)\b)'
+  - tag: destructive # git clean -f, -fdx, -xdf, -f -d -x, --force
+    match: '(?i)\bgit\b.*\sclean\b.*\s-(-f|[a-z]*f)|\bclean\.requireforce\b'
+  - tag: destructive # git reset --hard, or --ha...
+    match: '(?i)\bgit\b.*\sreset\b.*\s--ha'
+  # git settings and variables that run a program (core.pager, core.hooksPath,
+  # diff.external, GIT_SSH_COMMAND, ...), set with -c, --config-env, git
+  # config, GIT_CONFIG_* or the environment. cat, true, false, : or
+  # nothing, unquoted, as the value of -c or a variable runs nothing new:
+  # GIT_EDITOR=true git rebase --continue and git -c core.pager=cat log
+  # keep their routes. A $ or backtick in a -c or --config-env setting,
+  # anywhere in a git config command or in a GIT_CONFIG_* variable counts
+  # whatever it names.
+  - tag: external_effect
+    match: '(?i)(\bgit\b.*\s-c\s*(core\.(pager|editor|fsmonitor|hookspath|sshcommand|askpass|gitproxy|alternaterefscommand)|sequence\.editor|diff\.(external|[^\s=]*\.(command|textconv))|filter\.[^\s=]*\.(clean|smudge|process)|merge\.[^\s=]*\.driver|(diff|merge)tool\.[^\s=]*\.(cmd|path)|(man|browser)\.[^\s=]*\.(cmd|path)|pager\.[^\s=]+|credential\.([^\s=]*\.)?helper|gpg\.([^\s=]*\.)?program|uploadpack\.packobjectshook|remote\.[^\s=]*\.(uploadpack|receivepack)|include(if\.[^\s=]*)?\.path|protocol\.([^\s=]*\.)?allow)|(?-i:\b(GIT_(PAGER|EDITOR|SEQUENCE_EDITOR|EXTERNAL_DIFF|SSH|SSH_COMMAND|ASKPASS|PROXY_COMMAND)|PAGER|EDITOR|VISUAL|SSH_ASKPASS)))=([^\s;&|):cft]|:[^\s;&|)]|c([^a]|$)|f([^a]|$)|t([^r]|$)|ca([^t]|$)|fa([^l]|$)|tr([^u]|$)|cat[^\s;&|)]|fal([^s]|$)|tru([^e]|$)|fals([^e]|$)|true[^\s;&|)]|false[^\s;&|)])'
+  - tag: external_effect
+    match: '(?i)\bgit\b.*\s(-c\s*[''\"\\]+|--config-env[=\s]\s*[''\"\\]*|config\b.*\s[''\"\\]*)(core\.(pager|editor|fsmonitor|hookspath|sshcommand|askpass|gitproxy|alternaterefscommand)|sequence\.editor|diff\.(external|[^\s=]*\.(command|textconv))|filter\.[^\s=]*\.(clean|smudge|process)|merge\.[^\s=]*\.driver|(diff|merge)tool\.[^\s=]*\.(cmd|path)|(man|browser)\.[^\s=]*\.(cmd|path)|pager\.[^\s=]+|credential\.([^\s=]*\.)?helper|gpg\.([^\s=]*\.)?program|uploadpack\.packobjectshook|remote\.[^\s=]*\.(uploadpack|receivepack)|include(if\.[^\s=]*)?\.path|protocol\.([^\s=]*\.)?allow)|\bGIT_CONFIG_\w+\+?=\S*(core\.(pager|editor|fsmonitor|hookspath|sshcommand|askpass|gitproxy|alternaterefscommand)|sequence\.editor|diff\.(external|[^\s=]*\.(command|textconv))|filter\.[^\s=]*\.(clean|smudge|process)|merge\.[^\s=]*\.driver|(diff|merge)tool\.[^\s=]*\.(cmd|path)|(man|browser)\.[^\s=]*\.(cmd|path)|pager\.[^\s=]+|credential\.([^\s=]*\.)?helper|gpg\.([^\s=]*\.)?program|uploadpack\.packobjectshook|remote\.[^\s=]*\.(uploadpack|receivepack)|include(if\.[^\s=]*)?\.path|protocol\.([^\s=]*\.)?allow)|(?-i:\b(GIT_(CONFIG|CONFIG_GLOBAL|CONFIG_SYSTEM|CONFIG_PARAMETERS|EXEC_PATH|TEMPLATE_DIR)\+?=|(GIT_(PAGER|EDITOR|SEQUENCE_EDITOR|EXTERNAL_DIFF|SSH|SSH_COMMAND|ASKPASS|PROXY_COMMAND)|PAGER|EDITOR|VISUAL|SSH_ASKPASS)\+=))'
+  - tag: external_effect
+    match: '\bgit\b.*\s(-c|--config-env)(\s+|=)?\S*[$`]|\bgit\b.*\sconfig\b[^;&|\n]*[$`]|\bGIT_CONFIG_\w+\+?=\S*[$`]'
+  # A git or shell alias hides what it runs (git config alias.p push, then
+  # git p).
+  - tag: opaque
+    match: '(?i)\bgit\b.*\s(config\b.*|-c\s*)\balias\.|\bGIT_CONFIG_\w+=\S*alias\.|(^|\s)\[\s*alias\s*\]|\balias\s+[^\s=]+='
+  # A command whose name is an expansion, glob or brace expansion, on the
+  # tools that run a command: $x push, g[i]t push, {gi,}t push. For the
+  # commands opaque_args names, and any xargs or env -S runs, an argument
+  # whose variable is set by read, $(...), for over a glob and the like,
+  # or that uses ${x/a/b}, ${x%a}, ${#x}..., counts too, as does xargs
+  # running one of them with no visible subcommand. For opaque_split_args,
+  # a $(...), or a variable the command doesn't assign, counts in an
+  # argument when unquoted or at its start, since it may split or be an
+  # option: rm $(echo -rf) x, find . "$x", go test $flags ./... A $(...)
+  # that only lists Go packages doesn't: go test $(go list ./...). Nor do
+  # HOME, TMPDIR, PWD, GOPATH, GOBIN, GOROOT, GOCACHE, GOMODCACHE and USER
+  # unless the command assigns them.
+  - tag: opaque
+    tool: Bash
+    opaque: true
+    opaque_args: '(?i)^(git|find|go[0-9.]*|rm|(ba|da|k|z|c|tc|fi|a|mk|rba|ya|po)?sh|source|\.)$'
+    opaque_split_args: '(?i)^(rm|find|go[0-9.]*)$'
+  - tag: opaque
+    tool: Monitor
+    opaque: true
+    opaque_args: '(?i)^(git|find|go[0-9.]*|rm|(ba|da|k|z|c|tc|fi|a|mk|rba|ya|po)?sh|source|\.)$'
+    opaque_split_args: '(?i)^(rm|find|go[0-9.]*)$'
+  # git whose subcommand is an expansion: git $(printf '\x70ush').
+  - tag: opaque
+    tool: Bash
+    command: '(?i)^git(\s+(-c\s+\S+|-([^c\s]|c\S)\S*))*\s+([^-\s]\S*)?[$`]'
+  - tag: opaque
+    tool: Monitor
+    command: '(?i)^git(\s+(-c\s+\S+|-([^c\s]|c\S)\S*))*\s+([^-\s]\S*)?[$`]'
+  # git commands that discard work, read as commands so a commit message
+  # naming them is no match: checkout of paths (--, ., a glob, or a second
+  # word) or with -f/-B, switch -f/-C/--discard-changes, restore of the
+  # worktree (anything but --staged alone), branch -D/-f/-M/-C, stash drop
+  # and clear. git checkout main, git checkout -b x origin/main, git
+  # restore --staged x and git branch -d x keep their routes.
+  - tag: destructive
+    tool: Bash
+    command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+checkout((\s+\S+)*\s+(--|-[a-zA-Z]*[fB][a-zA-Z]*|--f\S*|[.:*?\[]\S*|\S*[*?:\[]\S*)(\s|$)|(\s+(-[bB]\s+\S+|-[^bB\s-]\S*|-[bB]\S+|--\S*))*\s+[^-\s]\S*(\s+(-[bB]\s+\S+|-[^bB\s-]\S*|-[bB]\S+|--\S*))*\s+[^-\s]\S*)'
+  - tag: destructive
+    tool: Bash
+    command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+switch(\s+\S+)*\s+(-[a-zA-Z]*[fC][a-zA-Z]*|--f\S*|--di\S*)(\s|$)'
+  - tag: destructive
+    tool: Bash
+    command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+restore((\s+\S+)*\s+(-[a-zA-Z]*W[a-zA-Z]*|--w\S*)(\s|$)|(\s+([^-\s]\S*|-[^-\sSs]*(s\S*)?|--|--([^s\s]\S*|s[^t\s]\S*|s)))*$)'
+  - tag: destructive
+    tool: Bash
+    command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+branch(\s+\S+)*\s+(-[a-zA-Z]*[DMCf][a-zA-Z]*|--forc\S*)(\s|$)'
+  - tag: destructive
+    tool: Bash
+    command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+stash(\s+-\S+)*\s+(drop|clear)(\s|$)'
+  - tag: destructive
+    tool: Monitor
+    command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+checkout((\s+\S+)*\s+(--|-[a-zA-Z]*[fB][a-zA-Z]*|--f\S*|[.:*?\[]\S*|\S*[*?:\[]\S*)(\s|$)|(\s+(-[bB]\s+\S+|-[^bB\s-]\S*|-[bB]\S+|--\S*))*\s+[^-\s]\S*(\s+(-[bB]\s+\S+|-[^bB\s-]\S*|-[bB]\S+|--\S*))*\s+[^-\s]\S*)'
+  - tag: destructive
+    tool: Monitor
+    command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+switch(\s+\S+)*\s+(-[a-zA-Z]*[fC][a-zA-Z]*|--f\S*|--di\S*)(\s|$)'
+  - tag: destructive
+    tool: Monitor
+    command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+restore((\s+\S+)*\s+(-[a-zA-Z]*W[a-zA-Z]*|--w\S*)(\s|$)|(\s+([^-\s]\S*|-[^-\sSs]*(s\S*)?|--|--([^s\s]\S*|s[^t\s]\S*|s)))*$)'
+  - tag: destructive
+    tool: Monitor
+    command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+branch(\s+\S+)*\s+(-[a-zA-Z]*[DMCf][a-zA-Z]*|--forc\S*)(\s|$)'
+  - tag: destructive
+    tool: Monitor
+    command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+stash(\s+-\S+)*\s+(drop|clear)(\s|$)'
+  # Code run inline or from a file, where the rules above can't see it, on
+  # the tools that run a command. A script run by another interpreter
+  # (python x.py) isn't covered.
+  - tag: external_effect
+    tool: Bash
+    match: '(?i)\b(ba|da|k|z)?sh\b.*\s-[a-z]*c'
+  - tag: external_effect
+    tool: Bash
+    match: '(?i)\beval\b'
+  - tag: external_effect
+    tool: Bash
+    ansi_c: true # ANSI-C quoting where bash decodes it: $'\x67it' reads as git, 'foo$' is no match
+  - tag: external_effect
+    tool: Bash
+    match: '(?i)\bpython[0-9.]*\b.*\s-[a-z]*c'
+  - tag: external_effect
+    tool: Bash
+    match: '(?i)\bnode\b.*\s(-[a-z]*[ep]|--eval|--print)'
+  - tag: external_effect
+    tool: Bash
+    match: '(?i)\b(perl|ruby)\b.*\s-[a-z]*e'
+  - tag: external_effect
+    tool: Bash
+    match: '(?i)\bphp\b.*\s-[a-z]*r'
+  - tag: external_effect # bash x.sh, | sh: a shell runs code from a file or stdin
+    tool: Bash
+    command: '(?i)^(ba|da|k|z|c|tc|fi|a|mk|rba|ya|po)?sh(\s|$)'
+  - tag: external_effect # su -c, flock -c, script -c: a shell runs the string
+    tool: Bash
+    command: '(?i)^(su|runuser|flock|script)\s(.*\s)?(-[a-z]*c|--command)(\s|=|$)'
+  - tag: external_effect # watch, parallel and sem run their arguments through sh -c
+    tool: Bash
+    command: '(?i)^(watch|parallel|sem)(\s|$)'
+  - tag: external_effect # sudo -s, sudo -i: a shell
+    tool: Bash
+    command: '^(sudo|doas)\s(.*\s)?-[a-zA-Z]*[si](\s|$)'
+  - tag: external_effect # source x, . x
+    tool: Bash
+    command: '(?i)^(source|\.)(\s|$)'
+  - tag: external_effect # ./x.sh, scripts/x.sh
+    tool: Bash
+    command: '(?i)^\S*\.(ba|da|k|z|c|tc|fi|a|mk)?sh(\s|$)'
+  - tag: external_effect # go test -exec, -toolexec, go vet -vettool
+    tool: Bash
+    command: '(?i)^go[0-9.]*\s.*[\s=]--?(exec|toolexec|vettool)\b'
+  - tag: external_effect # GOFLAGS='-v -toolexec=x', exported or not
+    tool: Bash
+    match: '\bGOFLAGS=[^;&|]*-(exec|toolexec|vettool)\b'
+  - tag: external_effect
+    tool: Monitor
+    match: '(?i)\b(ba|da|k|z)?sh\b.*\s-[a-z]*c'
+  - tag: external_effect
+    tool: Monitor
+    match: '(?i)\beval\b'
+  - tag: external_effect
+    tool: Monitor
+    ansi_c: true # ANSI-C quoting where bash decodes it: $'\x67it' reads as git, 'foo$' is no match
+  - tag: external_effect
+    tool: Monitor
+    match: '(?i)\bpython[0-9.]*\b.*\s-[a-z]*c'
+  - tag: external_effect
+    tool: Monitor
+    match: '(?i)\bnode\b.*\s(-[a-z]*[ep]|--eval|--print)'
+  - tag: external_effect
+    tool: Monitor
+    match: '(?i)\b(perl|ruby)\b.*\s-[a-z]*e'
+  - tag: external_effect
+    tool: Monitor
+    match: '(?i)\bphp\b.*\s-[a-z]*r'
+  - tag: external_effect # bash x.sh, | sh: a shell runs code from a file or stdin
+    tool: Monitor
+    command: '(?i)^(ba|da|k|z|c|tc|fi|a|mk|rba|ya|po)?sh(\s|$)'
+  - tag: external_effect # su -c, flock -c, script -c: a shell runs the string
+    tool: Monitor
+    command: '(?i)^(su|runuser|flock|script)\s(.*\s)?(-[a-z]*c|--command)(\s|=|$)'
+  - tag: external_effect # watch, parallel and sem run their arguments through sh -c
+    tool: Monitor
+    command: '(?i)^(watch|parallel|sem)(\s|$)'
+  - tag: external_effect # sudo -s, sudo -i: a shell
+    tool: Monitor
+    command: '^(sudo|doas)\s(.*\s)?-[a-zA-Z]*[si](\s|$)'
+  - tag: external_effect # source x, . x
+    tool: Monitor
+    command: '(?i)^(source|\.)(\s|$)'
+  - tag: external_effect # ./x.sh, scripts/x.sh
+    tool: Monitor
+    command: '(?i)^\S*\.(ba|da|k|z|c|tc|fi|a|mk)?sh(\s|$)'
+  - tag: external_effect # go test -exec, -toolexec, go vet -vettool
+    tool: Monitor
+    command: '(?i)^go[0-9.]*\s.*[\s=]--?(exec|toolexec|vettool)\b'
+  - tag: external_effect # GOFLAGS='-v -toolexec=x', exported or not
+    tool: Monitor
+    match: '\bGOFLAGS=[^;&|]*-(exec|toolexec|vettool)\b'
+
+captain_only:
+  - tag: destructive
+  - tag: external_effect
+  - category: order_split
+  - category: tracker_create
+  - category: tracker_close
+  - option: '(?i)delete|destroy|force'
+  - tag: opaque
+  # Tracker requests from beams (#54): a comment publishes text outside the
+  # ship, like git push, and closing an item ends work, so both are the
+  # captain's. Remove tracker_comment here to let Command answer comments:
+  # the bridge then waits out the countermand window before posting one.
+  # The bridge refuses both when it has no tracker.
+  - category: tracker_comment
+
+auto_allow:
+  - tool: Bash
+    match: 'go test \./\.\.\.'
+  - tool: Bash
+    match: 'go build \./\.\.\.'
+  - tool: Bash
+    match: 'npm ci'
+  - tool: Bash
+    match: 'npm install'
+  - tool: Bash
+    match: 'make lint'
+
+command_may_answer:
+  min_confidence: 0.75 # missing: 0.75; 0 lets any confidence through
+  countermand_window: 5m # missing: 5m; 0 gives the captain no window
+
+escalation:
+  captain_reminder_every: 30m # 0 never reminds; else at least 1s
+  # default_option with option 0 would allow, on timeout, any hail Command
+  # may answer: a tracker_comment too, once it is no longer captain_only.
+  on_timeout: hold # hold | belay | default_option
+  captain_timeout: 0s # 0 never times out; else at least 1s

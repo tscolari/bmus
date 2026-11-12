@@ -1,0 +1,16 @@
+[
+  { "at_pct": 10, "progress": "surveying the codebase" },
+  { "at_pct": 10, "sleep_ms": 1500 },
+  {
+    "at_pct": 40,
+    "hail": {
+      "category": "tool_approval",
+      "question": "Run <b>x</b> make deploy?",
+      "options": ["allow", "deny"],
+      "context": { "tool": "Bash", "command": "make deploy" }
+    }
+  },
+  { "at_pct": 70, "progress": "retries in, running tests" },
+  { "at_pct": 70, "sleep_ms": 1000 },
+  { "at_pct": 100, "report": { "summary": "retries added to the webhook sender", "artifacts": [] } }
+]

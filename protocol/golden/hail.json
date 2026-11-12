@@ -1,0 +1,1 @@
+{"v":1,"seq":1842,"crew":"sorell","order":"ORD-0414","type":"hail","ts":"2026-10-16T09:12:03Z","body":{"ref":"h-7","category":"clarifying_question","question":"The same deprecated API shows up in three other services. Widen the scope?","options":["Widen scope","Stay on target"],"context":{"files":["lib/raft/snapshot.go"],"diff_stat":"+212 −40"}}}

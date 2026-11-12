@@ -1,0 +1,5 @@
+[
+  { "at_pct": 10, "progress": "surveying the codebase" },
+  { "at_pct": 50, "commit": "add retries to the webhook sender" },
+  { "at_pct": 100, "report": { "summary": "retries committed", "artifacts": [] } }
+]
