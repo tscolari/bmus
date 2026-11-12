@@ -1638,8 +1638,9 @@ func (s *Store) NextTour(ctx context.Context, crewID string, from int, entry Log
 
 // SetCrewStatusUnlessDismissed is SetCrewStatus for a crew member that
 // isn't dismissed: a dismissed one is left alone, nothing is logged, and it
-// returns dismissed true. provision's crew on deck uses it, so a dismissal
-// landing while a beam is being provisioned stands.
+// returns dismissed true. provision uses it to record the new beam with
+// the crew member beaming_in (#106), so a dismissal landing while a beam is
+// being provisioned stands.
 func (s *Store) SetCrewStatusUnlessDismissed(ctx context.Context, id, status, beam string, entry LogEntry) (dismissed bool, err error) {
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE crew SET status = ?, current_beam = ?

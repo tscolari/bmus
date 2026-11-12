@@ -228,8 +228,10 @@ func TestCommandDown(t *testing.T) {
 		{"on deck", []store.Crew{crew("vance", DivisionCommand, store.CrewOnDeck)}, false},
 		{"away", []store.Crew{crew("vance", DivisionCommand, store.CrewAway)}, false},
 		{"hailing", []store.Crew{crew("vance", DivisionCommand, store.CrewHailing)}, false},
-		// As before #106, when it was on_deck while beaming in.
-		{"beaming in", []store.Crew{crew("vance", DivisionCommand, store.CrewBeamingIn)}, false},
+		// #106: beaming in with no beam yet is down; with its beam up and
+		// its hello pending, on deck.
+		{"beaming in, no beam", []store.Crew{crew("vance", DivisionCommand, store.CrewBeamingIn)}, true},
+		{"beaming in, beam up", []store.Crew{{ID: "vance", Division: DivisionCommand, Status: store.CrewBeamingIn, CurrentBeam: "b1"}}, false},
 		{"sickbay", []store.Crew{crew("vance", DivisionCommand, store.CrewSickbay)}, true},
 		{"dismissed", []store.Crew{crew("vance", DivisionCommand, store.CrewDismissed)}, false},
 		{"one of two on deck", []store.Crew{crew("ross", DivisionCommand, store.CrewSickbay),

@@ -92,9 +92,9 @@ func TestBeamingInWaitsForLogin(t *testing.T) {
 	short, err := transporter.NewHolodeck(transporter.HolodeckConfig{
 		Root: b.root, Combadge: combadgeBundle(t),
 		Harness: []string{"--harness", "holodeck", "--script", script},
-		// The first beam's watch is due 8s after it is made, and it
+		// The first beam's watch is due 15s after it is made, and it
 		// expires 2s later: the first bridge stops before either.
-		Lifetime: lead + 8*time.Second,
+		Lifetime: lead + 15*time.Second,
 	})
 	require.NoError(t, err)
 	p := &loginGateProvider{watchProvider: &watchProvider{Holodeck: short}}
@@ -107,11 +107,14 @@ func TestBeamingInWaitsForLogin(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, beams, 1)
 	expires := beams[0].ExpiresAt
+	made := expires.Add(-lead - 15*time.Second)
 
 	p.expired.Store(true)
 	requireReasons(t, hd.d, ConditionYellow, "tsh login expired")
 	hd.stop(t)
-	require.True(t, time.Now().Before(expires.Add(-lead)), "the first bridge stopped before the watch change")
+	require.True(t, time.Now().Before(expires.Add(-lead)),
+		"the first bridge must stop before the watch change: it stopped %s after the beam was made, the watch is due at %s",
+		time.Since(made).Round(time.Millisecond), (expires.Sub(made) - lead).Round(time.Millisecond))
 	// Down past the beam's lifetime.
 	require.Eventually(t, func() bool { return time.Now().After(expires) }, 30*time.Second, 50*time.Millisecond)
 

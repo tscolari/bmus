@@ -824,3 +824,33 @@ func TestLateMissionKeepsNextTourCrewStatus(t *testing.T) {
 	require.NoError(t, decideHail(ctx, r.d, inB, comms.AnswerBody{HailID: hailB, DecidedBy: "captain", Decision: "yes"}))
 	require.Equal(t, store.CrewAway, getCrew(t, r.d, "sorell").Status)
 }
+
+// #106 review: a crew member beaming in whose tour ended without a hello
+// (here cancelled while it provisioned) is re-energized as one in sickbay
+// would be: NextTour and a new tour, beaming in on tour 1.
+func TestReenergizeBeamingInEndedTour(t *testing.T) {
+	t.Parallel()
+	home := privateHome(t)
+	r := startDaemonWith(t, home, &fakeProvider{blockProvision: true})
+	defer r.stop(t)
+	ctx := t.Context()
+	require.NoError(t, r.d.AddCrew(ctx, store.Crew{ID: "sorell", Name: "Sorell"}))
+	requirePending(t, r.d, tourWorkflowID("sorell", 0))
+	_, err := r.d.ReenergizeCrew(ctx, "sorell")
+	require.NoError(t, err, "under way while its tour provisions")
+
+	require.NoError(t, dbos.CancelWorkflow(r.d.dbos, beamWorkflowID("sorell", 0)))
+	require.NoError(t, dbos.CancelWorkflow(r.d.dbos, tourWorkflowID("sorell", 0)))
+	require.Eventually(t, func() bool {
+		live, found, err := workflowLive(r.d, tourWorkflowID("sorell", 0))
+		return err == nil && found && !live
+	}, 10*time.Second, 20*time.Millisecond)
+	c := getCrew(t, r.d, "sorell")
+	require.Equal(t, [2]any{store.CrewBeamingIn, 0}, [2]any{c.Status, c.TourNo})
+
+	requireOutcome(t, OutcomeRequested)(r.d.ReenergizeCrew(ctx, "sorell"))
+	c = getCrew(t, r.d, "sorell")
+	require.Equal(t, [2]any{store.CrewBeamingIn, 1}, [2]any{c.Status, c.TourNo})
+	requirePending(t, r.d, tourWorkflowID("sorell", 1))
+	requireOutcome(t, OutcomeUnderWay)(r.d.ReenergizeCrew(ctx, "sorell"))
+}
