@@ -29,8 +29,8 @@ func newStatusCmd(a *app) *cobra.Command {
 			}
 			w := newTable(cmd.OutOrStdout())
 			fmt.Fprintf(w, "condition\t%s\n", cond)
-			fmt.Fprintf(w, "crew\t%d on deck, %d away, %d hailing, %d in sickbay\n",
-				s.Crew.OnDeck, s.Crew.Away, s.Crew.Hailing, s.Crew.Sickbay)
+			fmt.Fprintf(w, "crew\t%d beaming in, %d on deck, %d away, %d hailing, %d in sickbay\n",
+				s.Crew.BeamingIn, s.Crew.OnDeck, s.Crew.Away, s.Crew.Hailing, s.Crew.Sickbay)
 			fmt.Fprintf(w, "orders\t%d open, %d away\n", s.Orders.Open, s.Orders.Away)
 			fmt.Fprintf(w, "hails\t%d open\n", s.HailsOpen)
 			fmt.Fprintf(w, "beams\t%d live\n", s.BeamsLive)

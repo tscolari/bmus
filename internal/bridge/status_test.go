@@ -23,6 +23,7 @@ func TestStatusConditions(t *testing.T) {
 		crew      []store.Crew
 		red       []string // open red orders
 		login     string   // the login's reason
+		waits     []string // crew members whose provisioning waits for a login
 		command   bool     // Command down
 		condition string
 		reasons   []string
@@ -61,11 +62,30 @@ func TestStatusConditions(t *testing.T) {
 		{name: "Command down after hailing, before the login", crew: []store.Crew{crew("sorell", store.CrewHailing, "b1")},
 			command: true, login: "tsh login expired", condition: ConditionYellow,
 			reasons: []string{"sorell hailing", "Command not on deck", "tsh login expired"}, counts: CrewCounts{Hailing: 1}, beams: 1},
+		{name: "beaming in", crew: []store.Crew{crew("sorell", store.CrewBeamingIn, ""), crew("kirk", store.CrewBeamingIn, "b2")},
+			condition: ConditionGreen, reasons: []string{}, counts: CrewCounts{BeamingIn: 2}, beams: 1},
+		{name: "beaming in, waiting for a login",
+			crew: []store.Crew{crew("kirk", store.CrewBeamingIn, ""), crew("sorell", store.CrewBeamingIn, ""),
+				crew("spock", store.CrewOnDeck, "b3")},
+			waits: []string{"kirk", "sorell", "spock"}, login: "tsh login expired", condition: ConditionYellow,
+			reasons: []string{"2 crew waiting for a beam (tsh login)", "tsh login expired"},
+			counts:  CrewCounts{BeamingIn: 2, OnDeck: 1}, beams: 1},
+		{name: "beam wait listed when red, after Command",
+			crew:  []store.Crew{crew("sorell", store.CrewBeamingIn, ""), crew("vance", store.CrewSickbay, "b1")},
+			waits: []string{"sorell"}, command: true, login: "tsh login expired", condition: ConditionRed,
+			reasons: []string{"vance in sickbay", "Command not on deck", "1 crew waiting for a beam (tsh login)", "tsh login expired"},
+			counts:  CrewCounts{BeamingIn: 1, Sickbay: 1}},
+		{name: "beam wait alone is yellow", crew: []store.Crew{crew("sorell", store.CrewBeamingIn, "")}, waits: []string{"sorell"},
+			condition: ConditionYellow, reasons: []string{"1 crew waiting for a beam (tsh login)"}, counts: CrewCounts{BeamingIn: 1}},
 		{name: "Command down listed when red", crew: []store.Crew{crew("vance", store.CrewSickbay, "b1")}, command: true,
 			condition: ConditionRed, reasons: []string{"vance in sickbay", "Command not on deck"}, counts: CrewCounts{Sickbay: 1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := statusOf(store.StatusSnapshot{Crew: tc.crew, RedOrders: tc.red, CommandDown: tc.command}, tc.login)
+			waits := map[string]bool{}
+			for _, id := range tc.waits {
+				waits[id] = true
+			}
+			s := statusOf(store.StatusSnapshot{Crew: tc.crew, RedOrders: tc.red, CommandDown: tc.command}, tc.login, waits)
 			require.Equal(t, tc.condition, s.Condition)
 			require.Equal(t, tc.reasons, s.Reasons)
 			require.Equal(t, tc.counts, s.Crew)
@@ -152,7 +172,7 @@ func TestStatusJSON(t *testing.T) {
 	b, err := json.Marshal(BridgeStatus{Condition: ConditionGreen, Reasons: []string{}, Info: []string{}, Console: "127.0.0.1:4096",
 		StandingOrders: true})
 	require.NoError(t, err)
-	require.JSONEq(t, `{"condition":"green","reasons":[],"info":[],"crew":{"on_deck":0,"away":0,"hailing":0,"sickbay":0},
+	require.JSONEq(t, `{"condition":"green","reasons":[],"info":[],"crew":{"beaming_in":0,"on_deck":0,"away":0,"hailing":0,"sickbay":0},
 		"orders":{"open":0,"away":0},"hails_open":0,"beams_live":0,"last_log_id":0,"console":"127.0.0.1:4096",
 		"standing_orders":true}`, string(b))
 }
@@ -208,6 +228,8 @@ func TestCommandDown(t *testing.T) {
 		{"on deck", []store.Crew{crew("vance", DivisionCommand, store.CrewOnDeck)}, false},
 		{"away", []store.Crew{crew("vance", DivisionCommand, store.CrewAway)}, false},
 		{"hailing", []store.Crew{crew("vance", DivisionCommand, store.CrewHailing)}, false},
+		// As before #106, when it was on_deck while beaming in.
+		{"beaming in", []store.Crew{crew("vance", DivisionCommand, store.CrewBeamingIn)}, false},
 		{"sickbay", []store.Crew{crew("vance", DivisionCommand, store.CrewSickbay)}, true},
 		{"dismissed", []store.Crew{crew("vance", DivisionCommand, store.CrewDismissed)}, false},
 		{"one of two on deck", []store.Crew{crew("ross", DivisionCommand, store.CrewSickbay),

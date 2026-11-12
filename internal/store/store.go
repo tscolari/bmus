@@ -30,6 +30,10 @@ var schema string
 
 // Crew statuses.
 const (
+	// CrewBeamingIn: the crew member's tour is provisioning its beam, or
+	// waiting for its combadge's hello (#106). It claims no order until
+	// the hello moves it on_deck. current_beam is empty until serve is up.
+	CrewBeamingIn = "beaming_in"
 	CrewOnDeck    = "on_deck"
 	CrewAway      = "away"
 	CrewHailing   = "hailing"
@@ -415,6 +419,16 @@ func (s *Store) SetCrewStatus(ctx context.Context, id, status, beam string, entr
 		status, beam, id, CrewDismissed, status, beam)
 }
 
+// UpdateCrewStatusFrom sets a crew member's status to status, leaving its
+// current beam as is, and appends entry to the captain's log, in one
+// transaction, only while its status is from: a crew member in any other
+// status (dismissed or sickbay, say) is left alone and nothing is logged,
+// so a re-run writes nothing. It reports whether it changed the row. A
+// missing crew member returns sql.ErrNoRows.
+func (s *Store) UpdateCrewStatusFrom(ctx context.Context, id, from, status string, entry LogEntry) (changed bool, err error) {
+	return s.updateCrewChanged(ctx, id, entry, `UPDATE crew SET status = ? WHERE id = ? AND status = ?`, status, id, from)
+}
+
 // UpdateCrewStatus sets a crew member's status, leaving its current beam as
 // is, and appends entry to the captain's log, in one transaction. A crew
 // member already in status, or dismissed (terminal, #100), is left alone and
@@ -782,7 +796,8 @@ func (s *Store) ListOrders(ctx context.Context) ([]Order, error) {
 // that order is returned unchanged; otherwise the highest-priority directed
 // order assigned to it, the oldest of those, is moved to away and returned. This makes a re-run of the
 // claim (e.g. a replayed DBOS step) return the same order. found is false when
-// there is nothing to work on, or the crew member is dismissed.
+// there is nothing to work on, or the crew member is dismissed or beaming
+// in (#106).
 //
 // A claim that moves an order also sets the crew member away and appends
 // entry, with its OrderID set to the order's id, to the captain's log, all
@@ -799,8 +814,10 @@ func (s *Store) ClaimOldestDirectedOrder(ctx context.Context, crewID string, ent
 			!errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		if status == CrewDismissed {
-			return sql.ErrNoRows // a dismissed crew member takes nothing (#100)
+		if status == CrewDismissed || status == CrewBeamingIn {
+			// A dismissed crew member takes nothing (#100), nor does one
+			// beaming in: its combadge hasn't said hello (#106).
+			return sql.ErrNoRows
 		}
 		err := tx.QueryRowContext(ctx, `SELECT id FROM orders WHERE assignee = ? AND state = ? `+claimOrderBy+` LIMIT 1`,
 			crewID, OrderAway).Scan(&id)
@@ -857,9 +874,9 @@ const claimOrderBy = `ORDER BY priority DESC, rowid ASC`
 // parked mission, which the claimer resumes.
 //
 // found is false when there is nothing to claim, the division is empty
-// (an empty division matches nothing) or the crew member is dismissed. The
-// caller claims directed orders first: this doesn't check that the crew
-// member has no order away.
+// (an empty division matches nothing) or the crew member is dismissed or
+// beaming in (#106). The caller claims directed orders first: this doesn't
+// check that the crew member has no order away.
 func (s *Store) ClaimOldestPoolOrder(ctx context.Context, crewID, division string, entry LogEntry) (id string, found bool, err error) {
 	if division == "" {
 		return "", false, nil
@@ -869,7 +886,7 @@ func (s *Store) ClaimOldestPoolOrder(ctx context.Context, crewID, division strin
 		if err := tx.QueryRowContext(ctx, `SELECT status FROM crew WHERE id = ?`, crewID).Scan(&status); err != nil {
 			return err // a missing crew member claims nothing
 		}
-		if status == CrewDismissed {
+		if status == CrewDismissed || status == CrewBeamingIn {
 			return sql.ErrNoRows
 		}
 		err := tx.QueryRowContext(ctx, `
@@ -1604,17 +1621,19 @@ func (s *Store) RequestOrder(ctx context.Context, id string, fn func(tx *sql.Tx,
 	})
 }
 
-// NextTour moves crew member crewID from tour from to tour from+1 and
-// clears its current beam, appending entry, in one transaction, only while
-// its tour_no is from and it isn't dismissed: a re-run, or a second
-// caller, writes nothing (#100). It reports whether it changed the row, so
+// NextTour moves crew member crewID from tour from to tour from+1, clears
+// its current beam and sets it beaming_in (#106: the new tour provisions a
+// beam), appending entry, in one transaction, only while its tour_no is
+// from and it isn't dismissed: a re-run, or a second caller, writes
+// nothing (#100). It reports whether it changed the row, so
 // a caller can tell a dismissal that committed after its own read (#113).
 // With current_beam empty, a restarted daemon's ensurePumps can't attach
 // the new tour's pump to the old beam. A missing crew member returns
 // sql.ErrNoRows.
 func (s *Store) NextTour(ctx context.Context, crewID string, from int, entry LogEntry) (changed bool, err error) {
-	return s.updateCrewChanged(ctx, crewID, entry, `UPDATE crew SET tour_no = ?, current_beam = '' WHERE id = ? AND tour_no = ? AND status <> ?`,
-		from+1, crewID, from, CrewDismissed)
+	return s.updateCrewChanged(ctx, crewID, entry, `UPDATE crew SET tour_no = ?, current_beam = '', status = ?
+		WHERE id = ? AND tour_no = ? AND status <> ?`,
+		from+1, CrewBeamingIn, crewID, from, CrewDismissed)
 }
 
 // SetCrewStatusUnlessDismissed is SetCrewStatus for a crew member that

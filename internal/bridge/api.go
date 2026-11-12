@@ -40,7 +40,8 @@ var DefaultHarnesses = []string{"sdk", "echo"}
 
 // AddCrew adds a crew member and starts its first tour,
 // crew/<id>/tour/0, which provisions a beam and puts the crew member
-// on_deck. c.Status must be empty or on_deck and c.TourNo 0 (later tours
+// on_deck at its combadge's hello. The crew member is inserted beaming_in
+// (#106): c.Status must be empty or beaming_in and c.TourNo 0 (later tours
 // come from Phase 2's watch change); c.CurrentBeam is ignored. c.Harness
 // must be empty or one of Harnesses. c.Division must be empty or in the
 // roster (checkDivision). The resolved harness (resolveHarness: c's, else
@@ -63,9 +64,10 @@ func (d *Daemon) AddCrew(ctx context.Context, c store.Crew) error {
 	if err := d.checkHarness(c); err != nil {
 		return err
 	}
-	if c.Status != "" && c.Status != store.CrewOnDeck {
-		return badRequest("a new crew member starts on_deck, not %s", c.Status)
+	if c.Status != "" && c.Status != store.CrewBeamingIn {
+		return badRequest("a new crew member starts beaming_in, not %s", c.Status)
 	}
+	c.Status = store.CrewBeamingIn
 	if c.TourNo != 0 {
 		return badRequest("a new crew member starts on tour 0, not %d", c.TourNo)
 	}
@@ -855,8 +857,11 @@ func (d *Daemon) DismissCrew(ctx context.Context, id string) (string, error) {
 // re-energize is under way (or the tour is still ending) and it does
 // nothing: OutcomeUnderWay. A tour that doesn't exist (a crash after an
 // earlier call's NextTour) is started. Otherwise NextTour moves the crew
-// member to tour tour_no+1 and that tour is started under its deterministic
-// id, so repeated or concurrent calls start one tour. A started tour
+// member to tour tour_no+1, beaming_in (#106), and that tour is started
+// under its deterministic id, so repeated or concurrent calls start one
+// tour. A crew member beaming in is a bad request too, unless its tour is
+// under way (OutcomeUnderWay) or doesn't exist: an earlier call's NextTour
+// moved it out of sickbay before a crash, and its tour is started. A started tour
 // provisions its beam on its own: OutcomeRequested. A resolved harness
 // this bridge can't run (checkHarness) is the bad request AddCrew gives,
 // before anything starts: the tour would go straight back to sickbay.
@@ -868,7 +873,7 @@ func (d *Daemon) ReenergizeCrew(ctx context.Context, id string) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	if c.Status != store.CrewSickbay {
+	if c.Status != store.CrewSickbay && c.Status != store.CrewBeamingIn {
 		return "", badRequest("crew %s is %s, not in sickbay", id, c.Status)
 	}
 	live, found, err := workflowLive(d, tourWorkflowID(id, c.TourNo))
@@ -877,6 +882,9 @@ func (d *Daemon) ReenergizeCrew(ctx context.Context, id string) (string, error) 
 	}
 	if live {
 		return OutcomeUnderWay, nil
+	}
+	if c.Status == store.CrewBeamingIn && found {
+		return "", badRequest("crew %s is %s, not in sickbay", id, c.Status)
 	}
 	if err := d.checkHarness(c); err != nil {
 		return "", err

@@ -45,7 +45,7 @@ type TransporterInput struct {
 
 // TransporterResult is a transporter workflow's outcome. At most one of
 // Dismissed and Failed is set; with neither, Beam is up, serve runs in it,
-// and the crew member is on deck with it.
+// and the crew member is beaming_in with it until its hello (#106).
 type TransporterResult struct {
 	Beam transporter.Beam
 	// Dismissed: the crew member was dismissed. Beam is the one made for
@@ -102,6 +102,8 @@ func transporterWorkflow(ctx dbos.Context, in TransporterInput) (TransporterResu
 	wait := d.provisionBackoff
 	var waited time.Duration
 	waitingLogin := false // the last attempt found the login expired
+	// The status's hint (#106), not workflow state: never branched on.
+	defer d.setBeamLoginWait(in.CrewID, in.TourNo, false)
 	for {
 		at, err := dbos.RunAsStep(ctx, func(c context.Context) (provisionAttempt, error) {
 			return provision(c, daemonFrom(c), in, waitingLogin)
@@ -117,12 +119,14 @@ func transporterWorkflow(ctx dbos.Context, in TransporterInput) (TransporterResu
 				d.logger.Warn("transporter: provisioning waits for a tsh login", "crew", in.CrewID, "tour", in.TourNo)
 			}
 			waitingLogin = true
+			d.setBeamLoginWait(in.CrewID, in.TourNo, true)
 			if _, err := dbos.Sleep(ctx, d.loginWait); err != nil {
 				return TransporterResult{}, err
 			}
 			continue
 		}
 		waitingLogin = false
+		d.setBeamLoginWait(in.CrewID, in.TourNo, false)
 		if at.CreateFailed == "" {
 			return at.TransporterResult, nil
 		}
@@ -183,13 +187,14 @@ func (d *Daemon) removeBeam(ctx context.Context, crewID string, b store.BeamReco
 }
 
 // provision gives the crew member a beam running combadge serve and sets it
-// on_deck with that beam. It is the transporter workflow's provision step
+// beaming_in with that beam: the tour moves it on_deck at the beam's hello
+// (#106). It is the transporter workflow's provision step
 // and is safe to re-run (DBOS re-runs a step that crashed before its outcome
 // was recorded, and retries one that failed):
 //
 //   - A dismissed crew member gets no beam: the outcome is Dismissed.
 //   - A new beam is recorded only in the beams table, with the tour's
-//     number, right after Create. crew.current_beam (with on_deck) is set
+//     number, right after Create. crew.current_beam (with beaming_in) is set
 //     only once serve is up, so a bridge restarting mid-provisioning (Run's
 //     ensurePumps) never attaches a pump to a beam with no serve, whose
 //     heartbeat_missed would send the new tour to sickbay.
@@ -210,11 +215,12 @@ func (d *Daemon) removeBeam(ctx context.Context, crewID string, b store.BeamReco
 //     LoginExpired, and the workflow waits for a login. Unless the
 //     previous attempt was waiting too (waitingLogin), it logs
 //     "provisioning waits for a tsh login" (kind beam), so the captain
-//     sees it once per wait.
+//     sees it once per wait. The workflow also marks the crew member as
+//     waiting (setBeamLoginWait) for the status's reason, outside the step.
 //   - The status, beams-table and StartCombadge calls are idempotent. The
 //     beams row and the status each commit with their log entry, and a
 //     re-run that changes neither logs nothing.
-//   - The crew member goes on deck only if it isn't dismissed by then
+//   - The crew member gets the beam only if it isn't dismissed by then
 //     (DismissCrew may land while the beam is made): the outcome is then
 //     Dismissed with the beam, which the tour removes.
 //   - A resolved harness this bridge can't run (checkHarness) is the
@@ -323,7 +329,7 @@ func provisionBeam(ctx context.Context, d *Daemon, in TransporterInput) (provisi
 	if err != nil {
 		return provisionAttempt{}, err
 	}
-	dismissed, err := d.store.SetCrewStatusUnlessDismissed(ctx, crewID, store.CrewOnDeck, beam.Alias, up)
+	dismissed, err := d.store.SetCrewStatusUnlessDismissed(ctx, crewID, store.CrewBeamingIn, beam.Alias, up)
 	if err != nil {
 		return provisionAttempt{}, err
 	}

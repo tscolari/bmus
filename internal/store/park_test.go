@@ -196,7 +196,7 @@ func TestNextTourAndDismiss(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, c.TourNo)
 	require.Empty(t, c.CurrentBeam)
-	require.Equal(t, CrewAway, c.Status)
+	require.Equal(t, CrewBeamingIn, c.Status, "the new tour provisions a beam (#106)")
 	_, err = s.NextTour(ctx, "nobody", 0, testEntry)
 	require.ErrorIs(t, err, sql.ErrNoRows)
 
@@ -239,4 +239,78 @@ func TestNextTourAndDismiss(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, dismissed)
 	require.Equal(t, []string{"next", "dismissed", "up"}, texts(t, s))
+}
+
+// #106: a crew member beaming in claims nothing, directed, pool or its
+// parked order already away, and writes nothing; once its hello moves it
+// on deck (UpdateCrewStatusFrom), it claims. A dismissal while it beams in
+// stands: the hello's update leaves it dismissed.
+func TestBeamingInClaimsNothing(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := openTest(t)
+	require.NoError(t, s.InsertCrew(ctx, Crew{ID: "sorell", Name: "Sorell", Division: "science", Status: CrewBeamingIn}, testEntry))
+	directed, err := s.InsertOrder(ctx, Order{Title: "d", Assignee: "sorell"}, testEntry)
+	require.NoError(t, err)
+	pool, err := s.InsertOrder(ctx, Order{Title: "p", Division: "science"}, testEntry)
+	require.NoError(t, err)
+
+	claim := func(want string) {
+		t.Helper()
+		id, found, err := s.ClaimOldestDirectedOrder(ctx, "sorell", LogEntry{Kind: "order", Text: "claimed"})
+		require.NoError(t, err)
+		if found {
+			require.Equal(t, want, id)
+			return
+		}
+		id, found, err = s.ClaimOldestPoolOrder(ctx, "sorell", "science", LogEntry{Kind: "order", Text: "claimed"})
+		require.NoError(t, err)
+		require.Equal(t, want != "", found)
+		require.Equal(t, want, id)
+	}
+	claim("")
+	for _, id := range []string{directed, pool} {
+		o, err := s.GetOrder(ctx, id)
+		require.NoError(t, err)
+		require.NotEqual(t, OrderAway, o.State, id)
+	}
+	c, err := s.GetCrew(ctx, "sorell")
+	require.NoError(t, err)
+	require.Equal(t, CrewBeamingIn, c.Status)
+	require.Empty(t, texts(t, s), "nothing logged")
+
+	// Its order already away (parked by a watch change) isn't taken up
+	// either.
+	away, err := s.InsertOrder(ctx, Order{Title: "a", Assignee: "sorell", State: OrderAway}, testEntry)
+	require.NoError(t, err)
+	claim("")
+	require.Equal(t, CrewBeamingIn, getCrewStatus(t, s, "sorell"))
+
+	changed, err := s.UpdateCrewStatusFrom(ctx, "sorell", CrewBeamingIn, CrewOnDeck, LogEntry{Kind: "crew", Text: "on deck"})
+	require.NoError(t, err)
+	require.True(t, changed)
+	changed, err = s.UpdateCrewStatusFrom(ctx, "sorell", CrewBeamingIn, CrewOnDeck, LogEntry{Kind: "crew", Text: "on deck"})
+	require.NoError(t, err)
+	require.False(t, changed, "a re-run writes nothing")
+	claim(away)
+	require.Equal(t, CrewAway, getCrewStatus(t, s, "sorell"))
+	require.Equal(t, []string{"on deck", "claimed"}, texts(t, s))
+
+	// Dismissed while beaming in: the hello moves nothing.
+	require.NoError(t, s.InsertCrew(ctx, Crew{ID: "tuvok", Name: "Tuvok", Status: CrewBeamingIn}, testEntry))
+	_, _, err = s.DismissCrew(ctx, "tuvok", testEntry, nil)
+	require.NoError(t, err)
+	changed, err = s.UpdateCrewStatusFrom(ctx, "tuvok", CrewBeamingIn, CrewOnDeck, testEntry)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.Equal(t, CrewDismissed, getCrewStatus(t, s, "tuvok"))
+	_, err = s.UpdateCrewStatusFrom(ctx, "nobody", CrewBeamingIn, CrewOnDeck, testEntry)
+	require.ErrorIs(t, err, sql.ErrNoRows)
+}
+
+func getCrewStatus(t *testing.T, s *Store, id string) string {
+	t.Helper()
+	c, err := s.GetCrew(t.Context(), id)
+	require.NoError(t, err)
+	return c.Status
 }

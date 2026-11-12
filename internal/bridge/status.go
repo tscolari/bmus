@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/tscolari/bmus/internal/store"
 )
@@ -22,16 +23,19 @@ const infoRegsNotConfigured = "regs.yaml not configured"
 //
 //   - Condition is red with anyone in sickbay or any open red order (pool,
 //     directed, away or hailing with store.PriorityRed), else yellow with
-//     anyone hailing, Command down (store.StatusSnapshot.CommandDown, #150)
-//     or a tsh login reason (#102), else green. Reasons name the crew
-//     members and orders that set it, in id order, crew members first
-//     ("sorell in sickbay", "ORD-0007 red alert", "sorell hailing"); a
-//     lower condition's causes aren't listed, except Command's and the
-//     login's, which always come last, in that order ("Command not on
-//     deck"; "tsh login expires in 10m", "tsh login expired", "tsh login
-//     unknown: <err>"), so a sickbay can't hide them. Green has no
-//     reasons.
+//     anyone hailing, Command down (store.StatusSnapshot.CommandDown, #150),
+//     crew beaming in whose provisioning waits for a tsh login (#106) or a
+//     tsh login reason (#102), else green. Reasons name the crew members
+//     and orders that set it, in id order, crew members first ("sorell in
+//     sickbay", "ORD-0007 red alert", "sorell hailing"); a lower
+//     condition's causes aren't listed, except Command's, the beam wait's
+//     and the login's, which always come last, in that order ("Command not
+//     on deck"; "2 crew waiting for a beam (tsh login)"; "tsh login
+//     expires in 10m", "tsh login expired", "tsh login unknown: <err>"), so
+//     a sickbay can't hide them. Green has no reasons.
 //   - Crew counts crew members by status; dismissed ones aren't counted.
+//     BeamingIn counts those whose tour is provisioning a beam or waiting
+//     for its hello (#106).
 //   - Orders.Open counts orders not yet claimed (pool or directed),
 //     Orders.Away orders on a mission (away or hailing).
 //   - HailsOpen counts open hails.
@@ -60,10 +64,11 @@ type BridgeStatus struct {
 }
 
 type CrewCounts struct {
-	OnDeck  int `json:"on_deck"`
-	Away    int `json:"away"`
-	Hailing int `json:"hailing"`
-	Sickbay int `json:"sickbay"`
+	BeamingIn int `json:"beaming_in"`
+	OnDeck    int `json:"on_deck"`
+	Away      int `json:"away"`
+	Hailing   int `json:"hailing"`
+	Sickbay   int `json:"sickbay"`
 }
 
 type OrderCounts struct {
@@ -80,7 +85,7 @@ func (d *Daemon) Status(ctx context.Context) (BridgeStatus, error) {
 		return BridgeStatus{}, err
 	}
 	snap.CommandDown = d.regsConfigured && commandDown(snap.Crew)
-	s := statusOf(snap, d.loginReason())
+	s := statusOf(snap, d.loginReason(), d.beamLoginWaiting())
 	s.Console = d.consoleAddr
 	if !d.regsConfigured {
 		s.Info = append(s.Info, infoRegsNotConfigured)
@@ -91,9 +96,12 @@ func (d *Daemon) Status(ctx context.Context) (BridgeStatus, error) {
 	return s, nil
 }
 
-// statusOf computes a BridgeStatus from a snapshot and the login's reason
-// (loginState.reason; "" for none).
-func statusOf(snap store.StatusSnapshot, login string) BridgeStatus {
+// statusOf computes a BridgeStatus from a snapshot, the login's reason
+// (loginState.reason; "" for none) and the crew members whose provisioning
+// waits for a login (Daemon.beamLoginWaiting; nil for none). Only those
+// beaming in count: the set is a hint kept outside the store, and the row
+// is what the captain sees.
+func statusOf(snap store.StatusSnapshot, login string, beamWaits map[string]bool) BridgeStatus {
 	s := BridgeStatus{
 		Orders: OrderCounts{
 			Open: snap.OrderStates[store.OrderPool] + snap.OrderStates[store.OrderDirected],
@@ -104,8 +112,14 @@ func statusOf(snap store.StatusSnapshot, login string) BridgeStatus {
 		Info:      []string{},
 	}
 	var sick, hailing []string
+	waiting := 0
 	for _, c := range snap.Crew {
 		switch c.Status {
+		case store.CrewBeamingIn:
+			s.Crew.BeamingIn++
+			if beamWaits[c.ID] {
+				waiting++
+			}
 		case store.CrewOnDeck:
 			s.Crew.OnDeck++
 		case store.CrewAway:
@@ -128,7 +142,7 @@ func statusOf(snap store.StatusSnapshot, login string) BridgeStatus {
 	switch {
 	case len(red) > 0:
 		s.Condition, s.Reasons = ConditionRed, red
-	case len(hailing) > 0 || snap.CommandDown || login != "":
+	case len(hailing) > 0 || snap.CommandDown || waiting > 0 || login != "":
 		s.Condition, s.Reasons = ConditionYellow, hailing
 	default:
 		s.Condition, s.Reasons = ConditionGreen, []string{}
@@ -136,6 +150,9 @@ func statusOf(snap store.StatusSnapshot, login string) BridgeStatus {
 	if snap.CommandDown {
 		// Only a sickbay downs Command today, so this mostly shows under red.
 		s.Reasons = append(s.Reasons, whyCommandNotOnDeck)
+	}
+	if waiting > 0 {
+		s.Reasons = append(s.Reasons, fmt.Sprintf("%d crew waiting for a beam (tsh login)", waiting))
 	}
 	if login != "" {
 		s.Reasons = append(s.Reasons, login)

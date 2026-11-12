@@ -496,7 +496,9 @@ func TestConsoleActions(t *testing.T) {
 		listed[c.ID] = c.Name
 	}
 	require.Equal(t, map[string]string{"gone": "Gone", "sorell": "Sorell"}, listed)
-	require.Equal(t, CrewView{ID: "sorell", Name: "Sorell", Rank: "Lt", Status: store.CrewOnDeck, CurrentBeam: cv.CurrentBeam,
+	// It starts beaming in (#106), and may be on deck already.
+	require.Contains(t, []string{store.CrewBeamingIn, store.CrewOnDeck}, cv.Status)
+	require.Equal(t, CrewView{ID: "sorell", Name: "Sorell", Rank: "Lt", Status: cv.Status, CurrentBeam: cv.CurrentBeam,
 		HarnessSource: SourceDefault, ModelSource: SourceDefault}, cv)
 	require.Equal(t, "sorell", untilLog("crew member added: Sorell").CrewID)
 	for body, code := range map[string]string{

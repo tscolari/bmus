@@ -488,8 +488,10 @@ func consultCommand(ctx dbos.Context, id string, r *hailRouting) (HailResult, bo
 }
 
 // commandCrew returns the id of the first crew member of the command
-// division on deck (on_deck, away or hailing: anyone with a live beam), by
-// id, preferring one whose pump is connected, or "" for none.
+// division on deck (beaming_in, on_deck, away or hailing: anyone with a
+// live tour), by id, preferring one whose pump is connected, or "" for
+// none. beaming_in counts as before #106, when that crew member was
+// on_deck: a consult then waits on its hello or the consult timeout.
 func (d *Daemon) commandCrew(ctx context.Context) (string, error) {
 	crew, err := d.store.ListCrew(ctx)
 	if err != nil {

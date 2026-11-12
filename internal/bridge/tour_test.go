@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -520,9 +521,19 @@ func TestProvisionPassesDivisionHarness(t *testing.T) {
 // A roster changed at a restart can give a crew member added earlier a
 // division default this bridge can't run. Its next provisioning sends it to
 // sickbay at once, saying why, before making a beam (#59). Re-energizing
-// it is refused the same way until the roster changes.
+// it is refused the same way until the roster changes. Crashed: a crash
+// cut off an earlier re-energize after its NextTour (#106).
 func TestProvisionRefusesUnrunnableDivisionHarness(t *testing.T) {
 	t.Parallel()
+	for _, crashed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("crashed=%t", crashed), func(t *testing.T) {
+			t.Parallel()
+			testProvisionRefusesUnrunnableDivisionHarness(t, crashed)
+		})
+	}
+}
+
+func testProvisionRefusesUnrunnableDivisionHarness(t *testing.T, crashed bool) {
 	home := privateHome(t)
 	insertCrew(t, home, store.Crew{ID: "sorell", Name: "Sorell", Division: "ops"})
 	p := &fakeProvider{}
@@ -551,15 +562,31 @@ func TestProvisionRefusesUnrunnableDivisionHarness(t *testing.T) {
 	require.Empty(t, workflows(t, r.d, tourWorkflowID("sorell", 1)))
 	r.stop(t)
 
-	// With the roster fixed, re-energize starts the next tour.
+	// With the roster fixed, re-energize starts the next tour. The crew
+	// member is beaming in, out of sickbay, until its beam's hello (#106).
 	cfg.Divisions = map[string]DivisionConfig{"ops": {Harness: "echo"}}
-	cfg.Transporter = &fakeProvider{hello: true}
+	gate := make(chan struct{})
+	cfg.Transporter = &fakeProvider{hello: true, startGate: gate}
 	r = startDaemonConfig(t, cfg)
 	defer r.stop(t)
+	if crashed {
+		// An earlier call's NextTour, then a crash before its tour started:
+		// beaming in with no tour behind it, which re-energize starts.
+		_, err := r.d.store.NextTour(ctx, "sorell", 0, store.LogEntry{Kind: logCrew, CrewID: "sorell", Text: "crew re-energized: tour 1"})
+		require.NoError(t, err)
+		require.Empty(t, workflows(t, r.d, tourWorkflowID("sorell", 1)))
+	}
 	out, err := r.d.ReenergizeCrew(ctx, "sorell")
 	require.NoError(t, err)
 	require.Equal(t, OutcomeRequested, out)
+	c = getCrew(t, r.d, "sorell")
+	require.Equal(t, [3]any{store.CrewBeamingIn, 1, ""}, [3]any{c.Status, c.TourNo, c.CurrentBeam})
+	requireOutcome(t, OutcomeUnderWay)(r.d.ReenergizeCrew(ctx, "sorell"))
+	close(gate)
 	waitOnDeck(t, r.d, "sorell", "fake-1")
+	require.Empty(t, workflows(t, r.d, tourWorkflowID("sorell", 2)))
+	_, err = r.d.ReenergizeCrew(ctx, "sorell")
+	require.Equal(t, CodeBadRequest, errorCode(ctx, err), "on deck")
 }
 
 func TestAPIValidation(t *testing.T) {

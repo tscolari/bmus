@@ -67,6 +67,7 @@ describe("formatters", () => {
     expect(divisionInfo("").label).toBe("No division");
     expect(crewStatusInfo("hailing")).toEqual({ label: "Hailing", tone: "blue", blink: true });
     expect(crewStatusInfo("on_deck").label).toBe("On deck");
+    expect(crewStatusInfo("unknown_status")).toEqual({ label: "unknown_status", tone: "grey", blink: false });
     expect(priorityInfo(2).label).toBe("Red alert");
     expect(priorityInfo(0)).toEqual({ label: "Routine", tone: "slate" });
     expect(logTag("done")).toEqual({ tag: "BACK", tone: "green" });
@@ -132,6 +133,18 @@ describe("panels' lists", () => {
     expect(padInfo(crew("a", { status: "sickbay" })).mode).toBe("lost");
     expect(padInfo(crew("a", { current_beam: "bm-2" })).label).toBe("standby");
     expect(padInfo(crew("a")).label).toBe("no beam");
+  });
+
+  // #106: a crew member beaming in has its own chip, a colour no other
+  // status uses, and its pad reads provisioning, with or without a beam.
+  it("shows beaming in", () => {
+    const st = crewStatusInfo("beaming_in");
+    expect(st).toEqual({ label: "Beaming in", tone: "cream", blink: true });
+    for (const other of ["on_deck", "away", "hailing", "sickbay", "dismissed"]) {
+      expect(crewStatusInfo(other).tone).not.toBe(st.tone);
+    }
+    expect(padInfo(crew("a", { status: "beaming_in" }))).toEqual({ mode: "beaming", label: "provisioning", tone: "cream" });
+    expect(padInfo(crew("a", { status: "beaming_in", current_beam: "bm-3" }))).toEqual({ mode: "beaming", label: "provisioning", tone: "cream" });
   });
 });
 

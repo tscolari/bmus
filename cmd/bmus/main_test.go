@@ -144,3 +144,13 @@ func TestProgressCell(t *testing.T) {
 	}
 	require.Equal(t, "-", progressCell(nil))
 }
+
+// crew list's BEAM cell (#106): a crew member beaming in without a beam
+// shows provisioning; any other without one, "-".
+func TestBeamCell(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, "provisioning", beamCell(bridge.CrewView{Status: store.CrewBeamingIn}))
+	require.Equal(t, "warm-orbit", beamCell(bridge.CrewView{Status: store.CrewBeamingIn, CurrentBeam: "warm-orbit"}))
+	require.Equal(t, "-", beamCell(bridge.CrewView{Status: store.CrewOnDeck}))
+	require.Equal(t, "warm-orbit", beamCell(bridge.CrewView{Status: store.CrewOnDeck, CurrentBeam: "warm-orbit"}))
+}

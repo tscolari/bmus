@@ -288,7 +288,12 @@ const lampCount = 28;
 export function Stats(props: { state: State }) {
   const s = props.state.status;
   const stats: { label: string; value: number | undefined; tone: Tone }[] = [
-    { label: "Crew aboard", value: s && s.crew.on_deck + s.crew.away + s.crew.hailing + s.crew.sickbay, tone: "cream" },
+    {
+      label: "Crew aboard",
+      value: s && s.crew.beaming_in + s.crew.on_deck + s.crew.away + s.crew.hailing + s.crew.sickbay,
+      tone: "cream",
+    },
+    { label: "Beaming in", value: s?.crew.beaming_in, tone: "cream" },
     { label: "On deck", value: s?.crew.on_deck, tone: "green" },
     { label: "Away", value: s?.crew.away, tone: "gold" },
     { label: "Hailing", value: s?.crew.hailing, tone: "blue" },
@@ -343,6 +348,7 @@ function CrewCard(props: { state: State; csrf: string; crew: CrewView; selected:
   let task = "Standing by for orders";
   if (c.status === "sickbay") task = "Lost contact with beam";
   else if (order) task = order.title;
+  else if (c.status === "beaming_in") task = "Beaming in: no orders until its combadge says hello";
   return (
     <article class={props.selected ? "crew sel" : "crew"} aria-label={c.name || c.id}>
       <div class="crew-head">
@@ -368,7 +374,7 @@ function CrewCard(props: { state: State; csrf: string; crew: CrewView; selected:
       {onMission && order && <Bar pct={pct} tone={st.tone} label={`${order.id} progress`} />}
       <div class="crew-foot">
         <span class="mono muted-id">
-          BEAM {c.current_beam || "none"}
+          BEAM {c.current_beam || (c.status === "beaming_in" ? "provisioning" : "none")}
           {queued > 0 ? ` · ${queued} queued` : ""}
         </span>
         {c.status === "sickbay" ? (

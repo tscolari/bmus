@@ -120,21 +120,24 @@ func quickScript(t *testing.T) string {
 	return p
 }
 
+// addSorell adds sorell and waits until its tour has provisioned a beam:
+// sorell is beaming in with it, or on deck already if its hello came
+// (#106).
 func addSorell(t *testing.T, hd *hdaemon) store.Crew {
 	t.Helper()
 	require.NoError(t, hd.d.AddCrew(t.Context(), store.Crew{ID: "sorell", Name: "Sorell", Rank: "Lieutenant"}))
 	var c store.Crew
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
 		c = hd.crew(ct, "sorell")
-		require.Equal(ct, store.CrewOnDeck, c.Status)
+		require.Contains(ct, []string{store.CrewBeamingIn, store.CrewOnDeck}, c.Status)
 		require.NotEmpty(ct, c.CurrentBeam)
 	}, 30*time.Second, 50*time.Millisecond)
 	return c
 }
 
 // #173: a combadge whose hello is late gets no order until it says hello,
-// though a directed order waits and the crew member is on deck with its
-// beam the whole time.
+// though a directed order waits. The crew member is beaming in with its
+// beam the whole time, and on deck from the hello (#106).
 func TestTourWaitsForHello(t *testing.T) {
 	t.Parallel()
 	b := newHolodeckBridge(t, quickScript(t))
@@ -150,9 +153,14 @@ func TestTourWaitsForHello(t *testing.T) {
 	require.Equal(t, store.OrderDirected, o.State)
 	require.Empty(t, workflows(t, hd.d, missionWorkflowID(id)), "no mission before the hello")
 	cr := hd.crew(t, "sorell")
-	require.Equal(t, store.CrewOnDeck, cr.Status)
+	require.Equal(t, store.CrewBeamingIn, cr.Status)
 	require.Equal(t, c.CurrentBeam, cr.CurrentBeam)
-	_, err := os.Stat(b.stepLog)
+	s, err := hd.d.Status(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, CrewCounts{BeamingIn: 1}, s.Crew)
+	require.Equal(t, 1, s.BeamsLive)
+	require.Equal(t, ConditionGreen, s.Condition, "no login wait: no reason")
+	_, err = os.Stat(b.stepLog)
 	require.ErrorIs(t, err, os.ErrNotExist, "the holodeck ran no step")
 
 	g.release()
@@ -295,8 +303,10 @@ func TestTourRestartDuringHelloWait(t *testing.T) {
 	id := hd.createOrder(t)
 	tourID := tourWorkflowID("sorell", 0)
 	requireAwaitingHello(t, hd.d, g, tourID)
+	require.Equal(t, store.CrewBeamingIn, hd.crew(t, "sorell").Status)
 	hd.stop(t)
 
+	// ensurePumps attaches the beaming-in crew member's beam (#106).
 	b.tunePump = nil
 	hd = b.start(t)
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {

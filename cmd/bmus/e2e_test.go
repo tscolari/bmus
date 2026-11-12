@@ -417,7 +417,9 @@ func TestCLIEndToEnd(t *testing.T) {
 
 	br := e.startBridge(t)
 	f := e.follow(t)
-	e.run(t, "crew", "add", "sorell", "--name", "Sorell", "--rank", "Lieutenant", "--division", "science")
+	// A new crew member is beaming in until its beam's hello (#106).
+	require.Regexp(t, `^crew sorell added \((beaming_in|on_deck)\); tour started, provisioning a beam\n$`,
+		e.run(t, "crew", "add", "sorell", "--name", "Sorell", "--rank", "Lieutenant", "--division", "science"))
 	// Green with sorell on deck, its beam up (#70). No regs.yaml is
 	// information, never a reason (#149).
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
@@ -427,6 +429,7 @@ func TestCLIEndToEnd(t *testing.T) {
 			Crew: bridge.CrewCounts{OnDeck: 1}, BeamsLive: 1, LastLogID: st.LastLogID}, st)
 	}, 30*time.Second, 200*time.Millisecond)
 	require.Regexp(t, `(?m)^condition\s+green\n(.*\n)*info\s+regs\.yaml not configured\n`, e.run(t, "status"))
+	require.Regexp(t, `(?m)^crew\s+0 beaming in, 1 on deck, 0 away, 0 hailing, 0 in sickbay$`, e.run(t, "status"))
 	orderID := e.createOrder(t)
 	require.Equal(t, "ORD-0001", orderID)
 

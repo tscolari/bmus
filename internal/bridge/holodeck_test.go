@@ -130,6 +130,8 @@ type holodeckBridge struct {
 	helloTimeout time.Duration
 	// tracker, if set, is the daemons' Config.Tracker.
 	tracker tracker.Tracker
+	// loginCheckEvery and loginWait, if set, are the daemons' Config's.
+	loginCheckEvery, loginWait time.Duration
 }
 
 func newHolodeckBridge(t *testing.T, script string) *holodeckBridge {
@@ -229,6 +231,8 @@ func (b *holodeckBridge) start(t *testing.T) *hdaemon {
 		pullWorkHook:      b.pullWorkHook,
 		sendOrderHook:     b.sendOrderHook,
 		Tracker:           b.tracker,
+		loginCheckEvery:   b.loginCheckEvery,
+		loginWait:         b.loginWait,
 	}
 	if b.regs != nil {
 		cfg.Regs, cfg.RegsConfigured = *b.regs, true
@@ -282,7 +286,8 @@ func (hd *hdaemon) logEntries(t require.TestingT) []store.LogEntry {
 }
 
 // addCrew adds sorell and waits until its tour has provisioned a beam, the
-// crew member is on_deck and the pump is connected.
+// crew member is on_deck (its combadge said hello, #106) and the pump is
+// connected.
 func (hd *hdaemon) addCrew(t *testing.T) store.Crew {
 	t.Helper()
 	return hd.addCrewWith(t, store.Crew{ID: "sorell", Name: "Sorell", Rank: "Lieutenant"})

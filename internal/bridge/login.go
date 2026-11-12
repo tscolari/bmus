@@ -154,6 +154,36 @@ func (d *Daemon) loginReason() string {
 	return d.login.reason(time.Now())
 }
 
+// setBeamLoginWait records whether crewID's transporter workflow for tour
+// tourNo waits for a tsh login (#106). Clearing it leaves a later tour's
+// wait alone. Only the status reads it, so a replay setting it for a
+// moment, before its next attempt runs, is harmless.
+func (d *Daemon) setBeamLoginWait(crewID string, tourNo int, waiting bool) {
+	d.loginMu.Lock()
+	defer d.loginMu.Unlock()
+	switch {
+	case waiting:
+		if d.beamLoginWaits == nil {
+			d.beamLoginWaits = map[string]int{}
+		}
+		d.beamLoginWaits[crewID] = tourNo
+	case d.beamLoginWaits[crewID] == tourNo:
+		delete(d.beamLoginWaits, crewID)
+	}
+}
+
+// beamLoginWaiting returns the crew members whose provisioning waits for a
+// tsh login (setBeamLoginWait).
+func (d *Daemon) beamLoginWaiting() map[string]bool {
+	d.loginMu.Lock()
+	defer d.loginMu.Unlock()
+	out := make(map[string]bool, len(d.beamLoginWaits))
+	for id := range d.beamLoginWaits {
+		out[id] = true
+	}
+	return out
+}
+
 // wakeOnDeck signals the tour of every crew member on deck to claim, best
 // effort, as wakeDivision does for one division.
 func (d *Daemon) wakeOnDeck(ctx context.Context) {

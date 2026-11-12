@@ -123,9 +123,11 @@ EOF
 ./bmus order create order.yaml
 ```
 
+A new crew member is `beaming_in` while its tour provisions a beam and waits for its combadge to say hello, and claims no order until it is `on_deck`. `bmus crew list` shows its beam as `provisioning` until there is one. A watch change and a re-energize go through `beaming_in` too.
+
 The body is the agent's task, so give it real work. The agent commits on `bmus/<order>` on the beam and never pushes. When the order is done, the bridge fetches that branch into `$BMUS_HOME/repos/<name>` (default `~/.bmus`), and pushing it is up to you. Follow it with `log tail` and `hails` as above.
 
-The bridge needs your `tsh` login to stay valid. `bmus status` turns yellow 30 minutes before the login expires (`tsh login expires in <n>m`). From 2 minutes before the expiry (`tsh login expired`), the bridge runs no new `tsh` command until you run `tsh login`. Crew members stay on deck and claim no new orders. Provisioning and an order's transfers to and from its beam wait. A crew member whose connection was already open can still report back, and the bridge pulls its work once you log in. Work resumes within a minute or two of logging in.
+The bridge needs your `tsh` login to stay valid. `bmus status` turns yellow 30 minutes before the login expires (`tsh login expires in <n>m`). From 2 minutes before the expiry (`tsh login expired`), the bridge runs no new `tsh` command until you run `tsh login`. Crew members stay on deck and claim no new orders. Provisioning and an order's transfers to and from its beam wait: a crew member whose tour waits for a beam stays `beaming_in`, and `bmus status` says so (`1 crew waiting for a beam (tsh login)`). A crew member whose connection was already open can still report back, and the bridge pulls its work once you log in. Work resumes within a minute or two of logging in.
 
 To push a done order's work, run `./bmus order push ORD-0001`. The bridge pushes `bmus/<order>` from its clone to the repo's registered URL with your own git config and credentials, to `bmus/<order>` or `--target-branch <name>`. It refuses an order that isn't done or whose work wasn't fetched at the reported commit. `--force` overwrites a target branch that has diverged. Each push goes into the captain's log.
 
