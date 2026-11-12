@@ -437,7 +437,8 @@ func TestTrackerRequestCallRefuses(t *testing.T) {
 	require.Len(t, fake.Comments(), 1)
 
 	later := MissionInput{OrderID: orderID, CrewID: "sorell", TourID: tourWorkflowID("sorell", 3)}
-	require.Equal(t, "the order's tour has ended (sorell is on_deck)", d.trackerRequestCall(ctx, later, past).Why)
+	// The daemon's own tour for sorell may or may not have provisioned yet.
+	require.Regexp(t, `^the order's tour has ended \(sorell is (on_deck|beaming_in)\)$`, d.trackerRequestCall(ctx, later, past).Why)
 	d.markTourEnded(tour)
 	require.Equal(t, "the order's tour has ended", d.trackerRequestCall(ctx, in, past).Why)
 	require.Len(t, fake.Comments(), 1, "no refusal posted")
