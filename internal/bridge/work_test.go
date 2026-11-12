@@ -30,11 +30,19 @@ import (
 // and the new commit.
 func workBundle(t *testing.T, shipped, orderID, out string) (base, commit string) {
 	t.Helper()
+	return workBundleFiles(t, shipped, orderID, out, map[string]string{"work.txt": "work\n"})
+}
+
+// workBundleFiles is workBundle, committing files (name to content).
+func workBundleFiles(t *testing.T, shipped, orderID, out string, files map[string]string) (base, commit string) {
+	t.Helper()
 	clone := filepath.Join(t.TempDir(), "c")
 	gitT(t, filepath.Dir(clone), "clone", "-q", "--branch", orderBranch(orderID), shipped, clone)
 	base = gitT(t, clone, "rev-parse", "HEAD")
-	require.NoError(t, os.WriteFile(filepath.Join(clone, "work.txt"), []byte("work\n"), 0o600))
-	gitT(t, clone, "add", "work.txt")
+	for name, content := range files {
+		require.NoError(t, os.WriteFile(filepath.Join(clone, name), []byte(content), 0o600))
+		gitT(t, clone, "add", name)
+	}
 	gitT(t, clone, "commit", "-q", "-m", "work")
 	commit = gitT(t, clone, "rev-parse", "HEAD")
 	require.NoError(t, os.MkdirAll(filepath.Dir(out), 0o700))

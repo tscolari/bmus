@@ -289,25 +289,27 @@ describe("order form repos (#211)", () => {
 });
 
 describe("push (#4)", () => {
-  const record = (state: string) =>
+  const record = (state: string, repos = true) =>
     reduce(emptyState, {
       type: "snapshot",
       snapshot: snapshot({
         last_log_id: 2,
-        orders: [order("ORD-0007", { state, assignee: "vance", base_commits: { app: "a".repeat(40) } })],
+        orders: [order("ORD-0007", { state, assignee: "vance", ...(repos ? {} : { repos: [] }) })],
         log: [
           entry(1, { kind: state === "done" ? "done" : "fail", order_id: "ORD-0007", crew_id: "vance", text: "over" }),
           entry(2, { kind: "order", order_id: "ORD-0007", text: "repo app pushed to bmus/ORD-0007 at 0123456789ab" }),
         ],
         repo_urls: { app: "https://example.com/o/app.git" },
-        home: "/srv/bmus",
       }),
     });
 
-  it("a done order's record row offers Push and Copy diff command, and shows where it was pushed", () => {
+  it("a done order's record row offers Push and Show diff, and shows where it was pushed", () => {
     const html = renderToString(<RecordPanel state={record("done")} csrf="c" />);
     expect(html).toContain(`aria-label="Push ORD-0007's work to its remote"`);
-    expect(html).toContain(">Copy diff command</button>");
+    expect(html).toContain(
+      '<a class="btn ghost small" href="/diff/ORD-0007" target="_blank" rel="noopener noreferrer" aria-label="Show the diff of ORD-0007">Show diff</a>',
+    );
+    expect(html).not.toContain("Copy diff command");
     expect(html).toContain("pushed to bmus/ORD-0007");
     expect(html).not.toContain("Force push");
   });
@@ -316,9 +318,15 @@ describe("push (#4)", () => {
     for (const state of ["failed", "belayed", "withdrawn", "split"]) {
       const html = renderToString(<RecordPanel state={record(state)} csrf="c" />);
       expect(html, state).not.toContain(">Push</button>");
-      expect(html, state).not.toContain("Copy diff command");
+      expect(html, state).not.toContain("Show diff");
       expect(html, state).not.toContain("pushed to");
     }
+  });
+
+  it("a done order without repos offers neither", () => {
+    const html = renderToString(<RecordPanel state={record("done", false)} csrf="c" />);
+    expect(html).not.toContain(">Push</button>");
+    expect(html).not.toContain("Show diff");
   });
 
   const remotes = [{ name: "app", url: "git@github.com:o/app.git" }];

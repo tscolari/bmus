@@ -44,12 +44,34 @@ func TestEmbeddedIndexServed(t *testing.T) {
 	require.Equal(t, "default-src 'self'; connect-src 'self'", resp.Header.Get("Content-Security-Policy"))
 	require.Equal(t, "no-cache", resp.Header.Get("Cache-Control"))
 	require.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
-	require.Contains(t, body, `<script type="module" src="app.js"></script>`)
+	require.Contains(t, body, `<script type="module" src="/app.js"></script>`)
 
 	for _, path := range []string{"/app.js", "/app.css", "/fonts/syncopate-latin-400-normal.woff2", "/preact-LICENSE.txt"} {
 		resp, body := get(t, addr, path)
 		require.Equal(t, http.StatusOK, resp.StatusCode, path)
 		require.NotEmpty(t, body, path)
+	}
+}
+
+// The diff page (#104), /diff/<order>, is index.html under the same
+// headers as /; no other path under /diff/ serves anything.
+func TestDiffPageServed(t *testing.T) {
+	t.Parallel()
+	addr := serveAssets(t, fstest.MapFS{
+		"index.html": {Data: []byte("<!doctype html><title>index</title>")},
+		"app.js":     {Data: []byte("js")},
+	})
+	resp, body := get(t, addr, "/diff/ORD-0007")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Contains(t, resp.Header.Get("Content-Type"), "text/html")
+	require.Equal(t, "default-src 'self'; connect-src 'self'", resp.Header.Get("Content-Security-Policy"))
+	require.Equal(t, "DENY", resp.Header.Get("X-Frame-Options"))
+	require.Equal(t, "no-cache", resp.Header.Get("Cache-Control"))
+	require.Equal(t, "<!doctype html><title>index</title>", body)
+
+	for _, path := range []string{"/diff", "/diff/", "/diff/ORD-0007/", "/diff/ORD-0007/x", "/diff/app.js", "/diff/.ORD", "/diff/ORD%2F1", "/diffx/ORD-0007"} {
+		resp, _ := get(t, addr, path)
+		require.Equal(t, http.StatusNotFound, resp.StatusCode, path)
 	}
 }
 
@@ -78,7 +100,7 @@ func TestAssetsBadHost(t *testing.T) {
 
 func TestMissingBuildPage(t *testing.T) {
 	addr := serveAssets(t, fstest.MapFS{".gitkeep": {}})
-	for _, path := range []string{"/", "/app.js"} {
+	for _, path := range []string{"/", "/app.js", "/diff/ORD-0007"} {
 		resp, body := get(t, addr, path)
 		require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode, path)
 		require.Contains(t, resp.Header.Get("Content-Type"), "text/html")

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -98,7 +97,7 @@ func (c consoleSource) Snapshot(ctx context.Context) (console.Snapshot, error) {
 	for name, u := range d.repos {
 		urls[name] = redactURL(u)
 	}
-	snap := console.Snapshot{LastLogID: last, Status: status, Repos: d.registeredRepos(), RepoURLs: urls, Home: d.home}
+	snap := console.Snapshot{LastLogID: last, Status: status, Repos: d.registeredRepos(), RepoURLs: urls}
 	crewViews := []CrewView{}
 	for _, cm := range crew {
 		crewViews = append(crewViews, d.crewView(cm))
@@ -115,11 +114,7 @@ func (c consoleSource) Snapshot(ctx context.Context) (console.Snapshot, error) {
 	orderViews := []OrderView{}
 	for _, o := range orders {
 		if slices.Contains([]string{store.OrderPool, store.OrderDirected, store.OrderAway, store.OrderHailing, store.OrderSplit}, o.State) || named[o.ID] {
-			v, err := c.orderView(ctx, o)
-			if err != nil {
-				return console.Snapshot{}, err
-			}
-			orderViews = append(orderViews, v)
+			orderViews = append(orderViews, orderView(o))
 		}
 	}
 	hailViews := []HailView{}
@@ -132,41 +127,6 @@ func (c consoleSource) Snapshot(ctx context.Context) (console.Snapshot, error) {
 	}
 	snap.Crew, snap.Orders, snap.Hails, snap.Log = crewViews, orderViews, hailViews, logViews
 	return snap, nil
-}
-
-// orderView is o's view, with a done order's BaseCommits: for each repo,
-// the commit of its latest ship-repos entry that shipped it from its
-// base_ref rather than a checkpoint. That is the commit the work started
-// from, or one upstream moved to since, which a three-dot diff with the
-// work still resolves to the work's own start.
-func (c consoleSource) orderView(ctx context.Context, o store.Order) (OrderView, error) {
-	v := orderView(o)
-	if o.State != store.OrderDone {
-		return v, nil
-	}
-	entries, err := c.d.store.ListOrderLogKind(ctx, o.ID, logOrder)
-	if err != nil {
-		return OrderView{}, err
-	}
-	for _, e := range entries {
-		if !strings.Contains(e.Text, " shipped to the beam at ") {
-			continue
-		}
-		var p struct {
-			Repo    string `json:"repo"`
-			BaseRef string `json:"base_ref"`
-			Commit  string `json:"commit"`
-			From    string `json:"from"`
-		}
-		if json.Unmarshal(e.Payload, &p) != nil || p.Repo == "" || p.Commit == "" || p.From != p.BaseRef {
-			continue
-		}
-		if v.BaseCommits == nil {
-			v.BaseCommits = map[string]string{}
-		}
-		v.BaseCommits[p.Repo] = p.Commit
-	}
-	return v, nil
 }
 
 // Status is Daemon.Status, keyed on everything but the log id.
@@ -215,11 +175,7 @@ func (c consoleSource) Views(ctx context.Context, e store.LogEntry) ([]console.E
 	if e.OrderID != "" {
 		o, err := d.store.GetOrder(ctx, e.OrderID)
 		if err == nil {
-			v, err := c.orderView(ctx, o)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, console.Event{Type: "order", Data: v})
+			out = append(out, console.Event{Type: "order", Data: orderView(o)})
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
 		}
@@ -411,6 +367,18 @@ func (c consoleSource) PushOrder(ctx context.Context, id string, args json.RawMe
 	})
 }
 
+// consoleDiffTimeout bounds the console's diff of an order (#104): the
+// page waits on the request.
+const consoleDiffTimeout = 30 * time.Second
+
+// OrderDiff is done order id's diff, each repo's capped at
+// consoleDiffCap, read as readFor reads.
+func (c consoleSource) OrderDiff(ctx context.Context, id string) (any, error) {
+	return c.readFor(ctx, consoleDiffTimeout, "diff", func(ctx context.Context) (any, error) {
+		return c.d.OrderDiff(ctx, id, consoleDiffCap)
+	})
+}
+
 // act runs an action as the RPC server runs a handler, bounded by
 // rpcHandlerTimeout: see actFor.
 func (c consoleSource) act(_ context.Context, f func(context.Context) (any, error)) (any, error) {
@@ -429,7 +397,29 @@ func (c consoleSource) actFor(timeout time.Duration, what string, f func(context
 		return nil, &rpcError{code: CodeShutdown, err: errors.New("bridge is shutting down")}
 	}
 	defer c.actions.leave()
-	ctx, cancel := context.WithTimeout(c.ctx, timeout)
+	return c.runFor(c.ctx, timeout, what, "; it may have taken effect in part: see the captain's log", f)
+}
+
+// readFor runs read what as actFor runs an action, except that it takes
+// no part in the action gate and runs on the request's context: a read
+// changes nothing, so a client that goes away, or the daemon stopping,
+// ends it. One that runs past timeout fails with console.CodeTimeout.
+func (c consoleSource) readFor(ctx context.Context, timeout time.Duration, what string, f func(context.Context) (any, error)) (any, error) {
+	if c.ctx.Err() != nil {
+		return nil, &rpcError{code: CodeShutdown, err: errors.New("bridge is shutting down")}
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer context.AfterFunc(c.ctx, cancel)()
+	return c.runFor(ctx, timeout, what, "", f)
+}
+
+// runFor runs f on parent bounded by timeout, for actFor and readFor,
+// with its error as an *rpcError carrying its RPC code. Past timeout the
+// error is console.CodeTimeout's, with a message naming what and the
+// timeout, then note; the error f ended with is logged.
+func (c consoleSource) runFor(parent context.Context, timeout time.Duration, what, note string, f func(context.Context) (any, error)) (any, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	v, err := f(ctx)
 	if err != nil {
@@ -439,8 +429,7 @@ func (c consoleSource) actFor(timeout time.Duration, what string, f func(context
 			if c.d != nil {
 				c.d.logger.Info("console: "+what+" timed out", "err", err)
 			}
-			return nil, &rpcError{code: console.CodeTimeout,
-				err: fmt.Errorf("%s timed out after %s; it may have taken effect in part: see the captain's log", what, timeout)}
+			return nil, &rpcError{code: console.CodeTimeout, err: fmt.Errorf("%s timed out after %s%s", what, timeout, note)}
 		}
 		return nil, codedError(c.ctx, err)
 	}

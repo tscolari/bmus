@@ -45,8 +45,6 @@ export interface State {
   readonly repos: readonly string[];
   /** The registered repos' URLs, without credentials, by name (#4). */
   readonly repoUrls: Readonly<Record<string, string>>;
-  /** The bridge's home, from the snapshot; "" until it comes (#4). */
-  readonly home: string;
 }
 
 export type Action =
@@ -74,7 +72,6 @@ export const emptyState: State = {
   loaded: false,
   repos: [],
   repoUrls: {},
-  home: "",
 };
 
 /** Returns the state after action. It never mutates state. */
@@ -98,7 +95,6 @@ export function reduce(state: State, action: Action): State {
         loaded: true,
         repos: snap.repos ?? [],
         repoUrls: snap.repo_urls ?? {},
-        home: snap.home ?? "",
       };
     }
     case "log": {

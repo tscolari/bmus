@@ -1096,7 +1096,7 @@ func TestConsoleBelayRecall(t *testing.T) {
 // results through POST /api/orders/{id}/push. An order that isn't done is
 // a 400; the push returns each repo's URL, branch and commit, and the
 // remote has the branch; a diverged target is a 409, and force then
-// overwrites it. A done order's view carries its repos' base commits.
+// overwrites it. The order's base commits are its ship-repos entries'.
 func TestConsolePushOrder(t *testing.T) {
 	t.Parallel()
 	home := privateHome(t)
@@ -1151,19 +1151,14 @@ func TestConsolePushOrder(t *testing.T) {
 	require.Equal(t, []PushedRepo{{Name: "app", URL: "file://" + bare, Branch: "feature", Commit: commit}}, pushed)
 	require.Equal(t, commit, gitT(t, bare, "rev-parse", "feature"))
 
-	// The snapshot: the done order's base commit, the repos' URLs and the
-	// bridge's home.
+	// The snapshot carries the repos' URLs; the order's base commit is
+	// the diff's (#104).
 	snap, err := consoleSource{d: d}.Snapshot(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, map[string]string{"app": "file://" + bare}, snap.RepoURLs)
-	require.Equal(t, d.home, snap.Home)
-	var view OrderView
-	for _, o := range snap.Orders.([]OrderView) {
-		if o.ID == id {
-			view = o
-		}
-	}
-	require.Equal(t, map[string]string{"app": base}, view.BaseCommits)
+	bases, err := d.baseCommits(t.Context(), id)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"app": base}, bases)
 }
 
 // The snapshot's repo URLs carry no credentials.

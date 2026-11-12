@@ -5,6 +5,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"regexp"
 	"strings"
 )
 
@@ -40,10 +41,15 @@ go build ./cmd/bmus</pre>
 </html>
 `
 
+// diffPageRE matches the diff page's path, /diff/<order> (#104): one
+// segment of an order id's characters, so no other path reaches it.
+var diffPageRE = regexp.MustCompile(`^/diff/[A-Za-z0-9-]+$`)
+
 // assetsHandler serves the frontend from assets to GET and HEAD:
-// index.html at /, every other file at its path. Directory listings and
-// dotfiles are 404s. With no index.html in assets, every path gets
-// missingBuildPage with a 503.
+// index.html at / and at the diff page's /diff/<order>, whose route the
+// page reads from its URL, and every other file at its path. Directory
+// listings and dotfiles are 404s. With no index.html in assets, every
+// path gets missingBuildPage with a 503.
 func assetsHandler(assets fs.FS) http.Handler {
 	var serve http.Handler
 	if _, err := fs.Stat(assets, "index.html"); err != nil {
@@ -63,6 +69,10 @@ func assetsHandler(assets fs.FS) http.Handler {
 			}
 			// File names carry no content hash: revalidate every time.
 			w.Header().Set("Cache-Control", "no-cache")
+			if diffPageRE.MatchString(p) {
+				http.ServeFileFS(w, r, assets, "index.html")
+				return
+			}
 			files.ServeHTTP(w, r)
 		})
 	}
