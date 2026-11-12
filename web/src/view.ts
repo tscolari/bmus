@@ -59,6 +59,9 @@ export function divisionInfo(division: string): { label: string; tone: Tone } {
 /** A crew member's status: its label, tone and whether its light blinks. */
 export function crewStatusInfo(status: string): { label: string; tone: Tone; blink: boolean } {
   switch (status) {
+    case "beaming_in":
+      // Provisioning a beam or waiting for its combadge's hello (#106).
+      return { label: "Beaming in", tone: "cream", blink: true };
     case "on_deck":
       return { label: "On deck", tone: "green", blink: false };
     case "away":
@@ -362,9 +365,11 @@ export function summaryOf(e: LogEntryView): string {
   return typeof s === "string" ? s : e.text;
 }
 
-/** A transporter pad's look for a crew member. */
-export function padInfo(c: CrewView): { mode: "standby" | "on" | "hail" | "lost"; label: string; tone: Tone } {
+/** A transporter pad's look for a crew member. One beaming in shows as provisioning, beam or not, until its hello (#106). */
+export function padInfo(c: CrewView): { mode: "standby" | "on" | "hail" | "lost" | "beaming"; label: string; tone: Tone } {
   switch (c.status) {
+    case "beaming_in":
+      return { mode: "beaming", label: "provisioning", tone: "cream" };
     case "away":
       return { mode: "on", label: c.current_beam || "energizing", tone: "gold" };
     case "hailing":

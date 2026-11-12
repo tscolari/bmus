@@ -185,18 +185,22 @@ func (d *Daemon) closePumps() {
 
 // pumpCrewStatuses are the crew statuses whose beam should have a pump:
 // the crew member has a live beam and tour. sickbay and dismissed don't.
+// beaming_in has one once serve is up (current_beam set): its hello comes
+// through the pump (#106).
 var pumpCrewStatuses = map[string]bool{
-	store.CrewOnDeck:  true,
-	store.CrewAway:    true,
-	store.CrewHailing: true,
+	store.CrewBeamingIn: true,
+	store.CrewOnDeck:    true,
+	store.CrewAway:      true,
+	store.CrewHailing:   true,
 }
 
-// ensurePumps starts a pump for every crew member that is on_deck, away or
-// hailing with a current beam, for tour crew.tour_no. It recreates the pumps
-// a previous daemon had, before the resumed workflows need them. A crew
-// member that is on_deck with no current beam is still being provisioned
-// (the beam is only recorded in the beams table until serve is up); its tour
-// starts the pump.
+// ensurePumps starts a pump for every crew member that is beaming_in,
+// on_deck, away or hailing with a current beam, for tour crew.tour_no. It
+// recreates the pumps a previous daemon had, before the resumed workflows
+// need them. A crew member beaming in with no current beam is still being
+// provisioned (the beam is only recorded in the beams table until serve is
+// up); its tour starts the pump. So is one on_deck with none, a row from
+// before #106.
 func (d *Daemon) ensurePumps(ctx context.Context) error {
 	crew, err := d.store.ListCrew(ctx)
 	if err != nil {

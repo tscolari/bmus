@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/tscolari/bmus/internal/bridge"
+	"github.com/tscolari/bmus/internal/store"
 )
 
 func newCrewCmd(a *app) *cobra.Command {
@@ -82,7 +83,7 @@ crew member's beam was provisioned, HARNESS shows what its next tour will get.`,
 			for _, c := range res.Crew {
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", c.ID, c.Name, dash(c.Rank), dash(c.Division),
 					sourced(c.Harness, c.HarnessSource, "sdk"), sourced(c.Model, c.ModelSource, "-"),
-					c.Status, dash(c.CurrentBeam), strconv.Itoa(c.TourNo))
+					c.Status, beamCell(c), strconv.Itoa(c.TourNo))
 			}
 			return w.Flush()
 		},
@@ -139,4 +140,13 @@ func crewActionCmd(a *app, use, rpc, short string, says map[string]string) *cobr
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print the crew member as JSON")
 	return cmd
+}
+
+// beamCell is crew list's BEAM: the current beam, "provisioning" for a
+// crew member beaming in without one yet (#106), else "-".
+func beamCell(c bridge.CrewView) string {
+	if c.CurrentBeam == "" && c.Status == store.CrewBeamingIn {
+		return "provisioning"
+	}
+	return dash(c.CurrentBeam)
 }

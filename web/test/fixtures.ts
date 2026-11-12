@@ -69,7 +69,7 @@ export function status(over: Partial<BridgeStatus> = {}): BridgeStatus {
     condition: "green",
     reasons: [],
     info: [],
-    crew: { on_deck: 0, away: 0, hailing: 0, sickbay: 0 },
+    crew: { beaming_in: 0, on_deck: 0, away: 0, hailing: 0, sickbay: 0 },
     orders: { open: 0, away: 0 },
     hails_open: 0,
     beams_live: 0,

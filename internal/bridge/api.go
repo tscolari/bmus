@@ -40,7 +40,8 @@ var DefaultHarnesses = []string{"sdk", "echo"}
 
 // AddCrew adds a crew member and starts its first tour,
 // crew/<id>/tour/0, which provisions a beam and puts the crew member
-// on_deck. c.Status must be empty or on_deck and c.TourNo 0 (later tours
+// on_deck at its combadge's hello. The crew member is inserted beaming_in
+// (#106): c.Status must be empty or beaming_in and c.TourNo 0 (later tours
 // come from Phase 2's watch change); c.CurrentBeam is ignored. c.Harness
 // must be empty or one of Harnesses. c.Division must be empty or in the
 // roster (checkDivision). The resolved harness (resolveHarness: c's, else
@@ -63,9 +64,10 @@ func (d *Daemon) AddCrew(ctx context.Context, c store.Crew) error {
 	if err := d.checkHarness(c); err != nil {
 		return err
 	}
-	if c.Status != "" && c.Status != store.CrewOnDeck {
-		return badRequest("a new crew member starts on_deck, not %s", c.Status)
+	if c.Status != "" && c.Status != store.CrewBeamingIn {
+		return badRequest("a new crew member starts beaming_in, not %s", c.Status)
 	}
+	c.Status = store.CrewBeamingIn
 	if c.TourNo != 0 {
 		return badRequest("a new crew member starts on tour 0, not %d", c.TourNo)
 	}
@@ -461,8 +463,10 @@ func (d *Daemon) belayChild(tx *sql.Tx, o store.Order, reason string) (store.Bel
 // next, the recalled one included. It takes an order that is away or
 // hailing and has a division (a directed order without one has no pool to
 // return to). A parked order (watch change, beam loss) qualifies only while
-// its crew member is in sickbay: one being handed to a new beam is a bad
-// request ("being resumed by <crew>; try again"), and one whose crew member
+// its crew member is in sickbay or beaming in (#106: its new tour claims
+// nothing until its hello, which can take a whole tsh login wait): one
+// being handed to a new beam is a bad request ("being resumed by <crew>;
+// try again"), and one whose crew member
 // was dismissed is being failed by the dismissal. Any other state is a bad
 // request, and a missing order ErrNotFound. It returns once the recall is
 // queued for the mission.
@@ -482,7 +486,7 @@ func (d *Daemon) RecallOrder(ctx context.Context, id, reason string) error {
 					"belay it (`bmus order belay`), and give orders a division to recall them (`bmus order route --division`)", o.ID)
 			case o.ParkedAt != nil && assigneeStatus == store.CrewDismissed:
 				return badRequest("order %s is being failed: its crew member %s was dismissed", o.ID, o.Assignee)
-			case o.ParkedAt != nil && assigneeStatus != store.CrewSickbay:
+			case o.ParkedAt != nil && assigneeStatus != store.CrewSickbay && assigneeStatus != store.CrewBeamingIn:
 				return badRequest("order %s is being resumed by %s; try again", o.ID, o.Assignee)
 			}
 			return nil
@@ -855,8 +859,12 @@ func (d *Daemon) DismissCrew(ctx context.Context, id string) (string, error) {
 // re-energize is under way (or the tour is still ending) and it does
 // nothing: OutcomeUnderWay. A tour that doesn't exist (a crash after an
 // earlier call's NextTour) is started. Otherwise NextTour moves the crew
-// member to tour tour_no+1 and that tour is started under its deterministic
-// id, so repeated or concurrent calls start one tour. A started tour
+// member to tour tour_no+1, beaming_in (#106), and that tour is started
+// under its deterministic id, so repeated or concurrent calls start one
+// tour. A crew member beaming in is handled the same way: its tour is under
+// way (OutcomeUnderWay), doesn't exist (an earlier call's NextTour moved it
+// out of sickbay before a crash, and its tour is started), or ended without
+// a hello (ERROR or CANCELLED: NextTour and a new tour, as from sickbay). A started tour
 // provisions its beam on its own: OutcomeRequested. A resolved harness
 // this bridge can't run (checkHarness) is the bad request AddCrew gives,
 // before anything starts: the tour would go straight back to sickbay.
@@ -868,7 +876,7 @@ func (d *Daemon) ReenergizeCrew(ctx context.Context, id string) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	if c.Status != store.CrewSickbay {
+	if c.Status != store.CrewSickbay && c.Status != store.CrewBeamingIn {
 		return "", badRequest("crew %s is %s, not in sickbay", id, c.Status)
 	}
 	live, found, err := workflowLive(d, tourWorkflowID(id, c.TourNo))

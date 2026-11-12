@@ -14,6 +14,7 @@ import {
   pushFailed,
   RecordPanel,
   StandingOrdersSwitch,
+  Stats,
   TransporterPanel,
 } from "../src/panels.js";
 import { emptyState, reduce } from "../src/store.js";
@@ -407,5 +408,35 @@ describe("push (#4)", () => {
     expect(done).toContain("lib: bmus/ORD-0007 at fedcba987654");
     expect(done).toContain('<a href="https://github.com/o/app/compare/bmus/ORD-0007?expand=1" target="_blank" rel="noopener noreferrer">Open a pull request</a>');
     expect(done.split("Open a pull request").length - 1).toBe(1);
+  });
+});
+
+describe("beaming in (#106)", () => {
+  const s = reduce(emptyState, {
+    type: "snapshot",
+    snapshot: snapshot({
+      crew: [crew("sorell", { status: "beaming_in" }), crew("worf", { status: "beaming_in", current_beam: "bm-2" })],
+      status: status({ crew: { beaming_in: 2, on_deck: 1, away: 0, hailing: 0, sickbay: 0 } }),
+    }),
+  });
+
+  it("the crew card shows the chip and the beam as provisioning while there is none", () => {
+    const html = renderToString(<CrewPanel state={s} csrf="c" target="pool" onDirect={() => {}} />);
+    expect(html).toContain('<div class="crew-status tone-cream"><span class="light bg-cream blink" aria-hidden="true"></span>Beaming in</div>');
+    expect(html).toContain("BEAM provisioning");
+    expect(html).toContain("BEAM bm-2");
+    expect(html).toContain("no orders until its combadge says hello");
+  });
+
+  it("the transporter pad reads provisioning", () => {
+    const html = renderToString(<TransporterPanel state={s} csrf="c" />);
+    expect(html.split('class="pad pad-beaming"').length - 1).toBe(2);
+    expect(html).toContain('<div class="mono pad-lbl tone-cream">provisioning</div>');
+  });
+
+  it("the counters count it, and crew aboard includes it", () => {
+    const html = renderToString(<Stats state={s} />);
+    expect(html).toMatch(/Beaming in<\/span><\/div><span class="mono stat-val">2<\/span>/);
+    expect(html).toMatch(/Crew aboard<\/span><\/div><span class="mono stat-val">3<\/span>/);
   });
 });

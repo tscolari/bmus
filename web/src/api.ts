@@ -10,7 +10,7 @@ export interface CrewView {
   readonly rank: string;
   readonly division: string;
   readonly spec: string;
-  /** on_deck, away, hailing, sickbay or dismissed. */
+  /** beaming_in (#106), on_deck, away, hailing, sickbay or dismissed. */
   readonly status: string;
   readonly current_beam: string;
   readonly tour_no: number;
@@ -107,7 +107,14 @@ export interface BridgeStatus {
   readonly reasons: readonly string[];
   /** Facts that never change the condition, e.g. "regs.yaml not configured" (#149). */
   readonly info: readonly string[];
-  readonly crew: { readonly on_deck: number; readonly away: number; readonly hailing: number; readonly sickbay: number };
+  readonly crew: {
+    /** Crew members whose tour is provisioning a beam or waiting for its hello (#106). */
+    readonly beaming_in: number;
+    readonly on_deck: number;
+    readonly away: number;
+    readonly hailing: number;
+    readonly sickbay: number;
+  };
   readonly orders: { readonly open: number; readonly away: number };
   readonly hails_open: number;
   readonly beams_live: number;

@@ -488,8 +488,8 @@ func consultCommand(ctx dbos.Context, id string, r *hailRouting) (HailResult, bo
 }
 
 // commandCrew returns the id of the first crew member of the command
-// division on deck (on_deck, away or hailing: anyone with a live beam), by
-// id, preferring one whose pump is connected, or "" for none.
+// division on deck (commandOnDeck), by id, preferring one whose pump is
+// connected, or "" for none.
 func (d *Daemon) commandCrew(ctx context.Context) (string, error) {
 	crew, err := d.store.ListCrew(ctx)
 	if err != nil {
@@ -497,7 +497,7 @@ func (d *Daemon) commandCrew(ctx context.Context) (string, error) {
 	}
 	first := ""
 	for _, c := range crew {
-		if c.Division != DivisionCommand || !pumpCrewStatuses[c.Status] {
+		if c.Division != DivisionCommand || !commandOnDeck(c) {
 			continue
 		}
 		if p, ok := d.Pump(c.ID); ok && p.Connected() {
@@ -510,15 +510,27 @@ func (d *Daemon) commandCrew(ctx context.Context) (string, error) {
 	return first, nil
 }
 
+// commandOnDeck reports whether c, of the command division, can take a
+// consult: on_deck, away or hailing, or beaming_in with its beam up and its
+// hello pending (#106). One beaming in with no beam yet (provisioning,
+// perhaps waiting on a tsh login) isn't on deck: its hails go to the
+// captain.
+func commandOnDeck(c store.Crew) bool {
+	if c.Status == store.CrewBeamingIn {
+		return c.CurrentBeam != ""
+	}
+	return pumpCrewStatuses[c.Status]
+}
+
 // commandDown reports whether crew, every crew member, has someone in the
-// command division but nobody of it on deck (commandCrew).
+// command division but nobody of it on deck (commandOnDeck).
 func commandDown(crew []store.Crew) bool {
 	down := false
 	for _, c := range crew {
 		if c.Division != DivisionCommand || c.Status == store.CrewDismissed {
 			continue
 		}
-		if pumpCrewStatuses[c.Status] {
+		if commandOnDeck(c) {
 			return false
 		}
 		down = true

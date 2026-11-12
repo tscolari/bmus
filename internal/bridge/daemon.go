@@ -298,6 +298,11 @@ type Daemon struct {
 	loginMu        sync.Mutex
 	login          loginState
 	loginExpiredAt time.Time
+	// beamLoginWaits holds the crew members whose transporter workflow
+	// last found the login expired and waits for one (#106), with the tour
+	// it provisions for: a display hint for the status, kept by
+	// transporterWorkflow outside its steps. Under loginMu.
+	beamLoginWaits map[string]int
 	// loginCheckEvery: how often watchLogin reads the login; loginWait:
 	// how long provisioning waits for a login before it tries again.
 	loginCheckEvery, loginWait time.Duration

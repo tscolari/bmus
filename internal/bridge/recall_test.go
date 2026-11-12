@@ -421,7 +421,7 @@ func TestRouteOrder(t *testing.T) {
 // Recall's refusals (#101): an order without a division points at route
 // and belay; an unclaimed one at route; a parked one whose crew member is
 // on deck (being handed to a new beam) is "being resumed"; a settled one is
-// too late. Nothing is logged or sent for any of them.
+// too late. One whose crew member is beaming in is accepted (#106). Nothing is logged or sent for any of them.
 func TestRecallRefusals(t *testing.T) {
 	t.Parallel()
 	od := startOrderDaemon(t)
@@ -457,6 +457,20 @@ func TestRecallRefusals(t *testing.T) {
 	for _, e := range entries {
 		require.NotContains(t, e.Text, "recall requested")
 	}
+
+	// #106 review: a parked order whose crew member is beaming in (its new
+	// tour claims nothing until its hello, perhaps a whole tsh login wait
+	// away) can be recalled, as from sickbay.
+	require.NoError(t, od.d.store.InsertCrew(ctx, store.Crew{ID: "worf", Name: "Worf", Division: "ops",
+		Status: store.CrewBeamingIn}, testEntry))
+	beaming := od.insertOrder(t, store.Order{Title: "b", Assignee: "worf", Division: "ops", State: store.OrderAway})
+	_, err = od.d.store.ParkOrder(ctx, beaming, testEntry)
+	require.NoError(t, err)
+	// The check lets it through: only the delivery fails, as this order has
+	// no mission workflow.
+	err = od.d.RecallOrder(ctx, beaming, "reprioritise")
+	require.ErrorContains(t, err, "deliver recall to "+missionWorkflowID(beaming))
+	require.NotEqual(t, CodeBadRequest, errorCode(ctx, err))
 }
 
 // A recalled order whose parked mission is gone (#101 review): the claimer

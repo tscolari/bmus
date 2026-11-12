@@ -414,6 +414,36 @@ func TestCommandCrew(t *testing.T) {
 	require.Equal(t, "vance", got)
 }
 
+// #106: Command beaming in with no beam yet (provisioning, perhaps
+// waiting on a tsh login) isn't on deck: find-command finds nobody, so the
+// hail goes to the captain, and the status says "Command not on deck".
+// With its beam up and its hello pending it is Command again.
+func TestCommandBeamingIn(t *testing.T) {
+	t.Parallel()
+	d, id := hailStore(t, defaultRegs(t), "", store.PriorityRoutine, storeHail("make deploy"))
+	ctx := t.Context()
+	e := store.LogEntry{Kind: "test"}
+	require.NoError(t, d.store.InsertCrew(ctx, store.Crew{ID: "vance", Name: "Vance", Division: DivisionCommand,
+		Status: store.CrewBeamingIn}, e))
+	found, err := d.findCommand(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, commandFound{Open: true}, found, "nobody: the captain's route")
+	h, err := d.store.GetHail(ctx, id)
+	require.NoError(t, err)
+	require.NotEqual(t, regs.RouteCommand, h.Route)
+	s, err := d.Status(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{"sorell hailing", "Command not on deck"}, s.Reasons)
+
+	require.NoError(t, d.store.SetCrewStatus(ctx, "vance", store.CrewBeamingIn, "b1", e))
+	found, err = d.findCommand(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, commandFound{Crew: "vance", Open: true}, found)
+	s, err = d.Status(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{"sorell hailing"}, s.Reasons)
+}
+
 // A roster with divisions takes crew members into command only when it
 // lists it.
 func TestCommandDivisionInRoster(t *testing.T) {

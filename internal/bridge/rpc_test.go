@@ -72,10 +72,12 @@ func TestRPCCommands(t *testing.T) {
 	var added CrewView
 	require.NoError(t, call(t, home, "crew.add", CrewAddArgs{ID: "sorell", Name: "Sorell", Rank: "Lieutenant", Division: "science"}, &added))
 	// The reply re-reads the row after the tour starts, and the tour may
-	// already have provisioned its beam.
+	// already have provisioned its beam, and had its hello. It starts
+	// beaming in (#106).
 	require.Contains(t, []string{"", "fake-1"}, added.CurrentBeam)
-	added.CurrentBeam = ""
-	require.Equal(t, CrewView{ID: "sorell", Name: "Sorell", Rank: "Lieutenant", Division: "science", Status: store.CrewOnDeck,
+	require.Contains(t, []string{store.CrewBeamingIn, store.CrewOnDeck}, added.Status)
+	added.CurrentBeam, added.Status = "", store.CrewBeamingIn
+	require.Equal(t, CrewView{ID: "sorell", Name: "Sorell", Rank: "Lieutenant", Division: "science", Status: store.CrewBeamingIn,
 		HarnessSource: SourceDefault, ModelSource: SourceDefault}, added)
 	requirePending(t, r.d, tourWorkflowID("sorell", 0))
 	requireRPCError(t, call(t, home, "crew.add", CrewAddArgs{ID: "sorell", Name: "Again"}, nil), CodeExists)

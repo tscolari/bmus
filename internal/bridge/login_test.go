@@ -23,8 +23,9 @@ import (
 // `tsh status` runs status.sh (setLogin). Every `tsh beams` call is
 // recorded in beams.log and acts as one healthy beam, warm-orbit: add
 // creates it, ls lists it, `beamctl list` shows combadge running, and an
-// attach sends one heartbeat (seq 1, with the ts of when the fake was
-// made) and stays open, silent, until its stdin closes.
+// attach sends a hello (seq 1, which puts the crew member on deck, #106)
+// and one heartbeat (seq 2, with the ts of when the fake was made) and
+// stays open, silent, until its stdin closes.
 type loginTsh struct {
 	dir, bin string
 }
@@ -33,9 +34,14 @@ func newLoginTsh(t *testing.T) *loginTsh {
 	t.Helper()
 	f := &loginTsh{dir: t.TempDir()}
 	f.bin = filepath.Join(f.dir, "tsh")
+	hello, err := comms.NewMessage(comms.TypeHello, comms.HelloBody{Protocol: comms.Version, Harness: "fake", CombadgeVersion: "test"})
+	require.NoError(t, err)
+	hello.Seq, hello.Crew = 1, "sorell"
 	hb, err := comms.NewMessage(comms.TypeHeartbeat, comms.HeartbeatBody{})
 	require.NoError(t, err)
-	hb.Seq = 1
+	hb.Seq, hb.Crew = 2, "sorell"
+	helloLine, err := json.Marshal(hello)
+	require.NoError(t, err)
 	line, err := json.Marshal(hb)
 	require.NoError(t, err)
 	beam := `{"id":"warm-orbit","expires":"` + time.Now().Add(24*time.Hour).UTC().Format(time.RFC3339) + `"}`
@@ -49,7 +55,7 @@ ls) echo '[` + beam + `]' ;;
 exec)
 	case "$*" in
 	*"'beamctl' 'list'"*) echo 'combadge (running PID=42)' ;;
-	*"'attach'"*) echo '` + string(line) + `'; cat >/dev/null ;;
+	*"'attach'"*) echo '` + string(helloLine) + `'; echo '` + string(line) + `'; cat >/dev/null ;;
 	esac ;;
 esac
 `

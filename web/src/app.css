@@ -950,6 +950,14 @@ body {
   border-color: var(--blue);
   box-shadow: 0 0 14px rgba(92, 157, 230, 0.5);
 }
+.pad-beaming .beamcol {
+  opacity: 0.4;
+  animation: shimmer 2.2s linear infinite;
+}
+.pad-beaming .disc {
+  border-color: var(--cream);
+  border-style: dashed;
+}
 .pad-lost .disc {
   border-color: var(--red);
   border-style: dashed;

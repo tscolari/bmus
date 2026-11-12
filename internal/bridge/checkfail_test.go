@@ -172,7 +172,7 @@ func TestHarnessCheckFailedIdle(t *testing.T) {
 		require.Positive(ct, countSignal(steps, SignalCrewError))
 	}, 30*time.Second, 50*time.Millisecond)
 	requirePending(t, hd.d, tourID)
-	require.Equal(t, store.CrewOnDeck, hd.crew(t, "sorell").Status)
+	require.Equal(t, store.CrewOnDeck, hd.crew(t, "sorell").Status, "on deck since its hello")
 	// The tour logs the line after its Recv step is recorded.
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
 		logs, err := os.ReadFile(b.logFile)

@@ -217,17 +217,19 @@ func storeStep(ctx dbos.Context, name string, fn func(context.Context, *Daemon) 
 // Steps:
 //  1. Run the transporter workflow beam/<crew>/<tour> on the transporter
 //     queue and wait for it: it removes an earlier tour's beam, gives the
-//     crew member a beam with combadge serve running and sets it on_deck
-//     with that beam (see transporterWorkflow). A dismissed crew member
+//     crew member a beam with combadge serve running and sets it
+//     beaming_in with that beam (see transporterWorkflow). A dismissed crew member
 //     ends the tour dismissed (remove-beam removes a beam made meanwhile);
 //     a failure sends it to sickbay. Then start-pump records whether the
 //     comms pump started (see startPump): a failure sends the crew member
 //     to sickbay. EnsurePump is then called again outside any step, on
 //     every run (replays included).
 //  2. awaitHello: wait for the beam's combadge to say hello before the
-//     first claim (#173). The crew row doesn't change: it is on_deck with
-//     its current_beam since provisioning, and the tour is the only caller
-//     of claimOrder.
+//     first claim (#173). The crew member is beaming_in with its
+//     current_beam since provisioning (since crew add, a re-energize or a
+//     watch change without one), and its hello-logged step sets it on_deck
+//     (#106). The tour is the only caller of claimOrder, and the store
+//     claims nothing for a crew member beaming in.
 //  3. Loop. While idle: claim-order (the order already away, else the
 //     highest-priority, oldest directed order, else, with standing orders
 //     on, the same from the pool of the crew member's division -> away,
@@ -476,9 +478,10 @@ func crewTourWorkflow(ctx dbos.Context, in CrewTourInput) (CrewTourResult, error
 // The hello-deadline step records when the wait gives up (helloTimeout), so
 // a resumed tour waits only for what is left of it. While it waits:
 //
-//   - crew_hello for the tour's beam ends the wait, and hello-logged logs
-//     "crew on deck: combadge said hello". One from another beam (a stale
-//     pump's) is ignored.
+//   - crew_hello for the tour's beam ends the wait, and hello-logged sets
+//     the crew member on_deck from beaming_in, logging "crew on deck:
+//     combadge said hello" (#106). One from another beam (a stale pump's)
+//     is ignored.
 //   - heartbeat_missed for the tour's beam ends the tour in sickbay as
 //     beam lost: a serve that exits before its hello lands here, through
 //     the pump's sickbay check. One for another beam is ignored.
@@ -551,7 +554,7 @@ func awaitHello(ctx dbos.Context, in CrewTourInput, beam transporter.Beam) (res 
 				continue
 			}
 			err := storeStep(ctx, "hello-logged", func(c context.Context, d *Daemon) error {
-				return d.appendLog(c, logCrew, in.CrewID, "", "crew on deck: combadge said hello", map[string]string{"beam": beam.Alias})
+				return d.helloOnDeck(c, in.CrewID, beam.Alias)
 			})
 			return CrewTourResult{}, false, err
 		case SignalHeartbeatMissed:
@@ -578,6 +581,21 @@ func awaitHello(ctx dbos.Context, in CrewTourInput, beam transporter.Beam) (res 
 			d.logger.Warn("crew tour: ignoring unknown crew signal", "tour", tourID, "kind", sig.Kind)
 		}
 	}
+}
+
+// helloOnDeck is the hello-logged step: the beam's combadge said hello, so
+// a crew member beaming in goes on deck, logged "crew on deck: combadge
+// said hello" (#106). One in any other status is left as it is and nothing
+// is logged: a dismissal stands, and the tour then claims nothing. So is
+// one already on deck: a re-run of the step, or a tour provisioned before
+// #106, whose row never left on_deck.
+func (d *Daemon) helloOnDeck(ctx context.Context, crewID, beam string) error {
+	entry, err := logEntry(logCrew, crewID, "", "crew on deck: combadge said hello", map[string]string{"beam": beam})
+	if err != nil {
+		return err
+	}
+	_, err = d.store.UpdateCrewStatusFrom(ctx, crewID, store.CrewBeamingIn, store.CrewOnDeck, entry)
+	return err
 }
 
 // beamLost ends the tour in sickbay: the beam stopped answering. A running
@@ -723,7 +741,7 @@ func logCrewError(ctx dbos.Context, in CrewTourInput, sig CrewSignal) error {
 //     checkpoint in 30m") and waited on for missionSettleTimeout more.
 //  2. markTourEnded, StopPump.
 //  3. next-tour: backstop a mission that neither parked nor finished, then
-//     store.NextTour (tour_no+1, current_beam cleared).
+//     store.NextTour (tour_no+1, current_beam cleared, beaming_in).
 //  4. Start tour tour_no+1 from the workflow body, under its deterministic
 //     id: a replay gets the existing handle, and so does a tour
 //     attachCrewTours already started after a crash between 3 and 4.
