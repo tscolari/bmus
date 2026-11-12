@@ -1,7 +1,7 @@
 import { renderToString } from "preact-render-to-string";
 import { describe, expect, it } from "vitest";
 import type { OrderDiff } from "../src/api.js";
-import { CopyButton, copyText, diffPageOrder, DiffView, parseDiff, rawDiff } from "../src/diff.js";
+import { capLines, CopyButton, copyText, diffPageOrder, DiffView, formatBytes, parseDiff, rawDiff } from "../src/diff.js";
 
 const base = "0123456789abcdef0123456789abcdef01234567";
 
@@ -30,6 +30,7 @@ const diff: OrderDiff = {
   id: "ORD-0007",
   title: "Add <b>retries</b>",
   branch: "bmus/ORD-0007",
+  cap: 2 << 20,
   repos: [
     { name: "app", base, diff: appDiff, truncated: false },
     { name: "lib", base, diff: "", truncated: true },
@@ -92,6 +93,36 @@ describe("DiffView", () => {
       `${appDiff}diff --git a/l b/l\n`,
     );
     expect(html).toContain('<button type="button" class="btn ghost small" aria-label="Copy the diff of ORD-0007">Copy</button>');
+  });
+});
+
+describe("rendered lines", () => {
+  it("caps the lines across a repo's files and counts the rest", () => {
+    const files = parseDiff(appDiff);
+    expect(capLines(files, 100)).toEqual({ files, omitted: 0 });
+    const cut = capLines(files, 10);
+    expect(cut.files.map((f) => [f.path, f.lines.length])).toEqual([
+      ["holodeck.txt", 9],
+      ["gone.txt", 1],
+    ]);
+    expect(cut.omitted).toBe(5);
+    expect(capLines(files, 9).files.map((f) => f.path)).toEqual(["holodeck.txt"]);
+    expect(capLines(files, 9).omitted).toBe(6);
+  });
+
+  it("notes the lines left out, which Copy still has", () => {
+    const html = renderToString(<DiffView diff={diff} maxLines={4} />);
+    expect(html).toContain('<p class="error" role="note">11 more lines are not shown here. Copy still has them.</p>');
+    expect(html).not.toContain("dl-add");
+    expect(html.match(/class="dl /g)).toHaveLength(4);
+    expect(renderToString(<DiffView diff={diff} />)).not.toContain("not shown here");
+  });
+
+  it("names the cap from the reply", () => {
+    expect(formatBytes(2 << 20)).toBe("2 MiB");
+    expect(formatBytes(64 << 10)).toBe("64 KiB");
+    expect(formatBytes(1000)).toBe("1000 bytes");
+    expect(renderToString(<DiffView diff={{ ...diff, cap: 512 << 10 }} />)).toContain("cut at the bridge's 512 KiB cap");
   });
 });
 

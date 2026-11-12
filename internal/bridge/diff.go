@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/tscolari/bmus/internal/store"
@@ -25,11 +26,13 @@ const consoleDiffCap = 2 << 20
 var fullCommitRE = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
 
 // OrderDiff is a done order's work as the console's diff page shows it:
-// the order, its branch in the bridge's clone, and each repo's diff.
+// the order, its branch in the bridge's clone, each repo's diff, and Cap,
+// the bytes each diff was capped at.
 type OrderDiff struct {
 	ID     string     `json:"id"`
 	Title  string     `json:"title"`
 	Branch string     `json:"branch"`
+	Cap    int        `json:"cap"`
 	Repos  []RepoDiff `json:"repos"`
 }
 
@@ -80,7 +83,7 @@ func (d *Daemon) OrderDiff(ctx context.Context, id string, limit int) (OrderDiff
 			return OrderDiff{}, badRequest("repo %s: %s is missing from the bridge's clone", r.Name, branch)
 		}
 	}
-	out := OrderDiff{ID: o.ID, Title: o.Title, Branch: branch, Repos: []RepoDiff{}}
+	out := OrderDiff{ID: o.ID, Title: o.Title, Branch: branch, Cap: limit, Repos: []RepoDiff{}}
 	for _, r := range o.Repos {
 		base := bases[r.Name]
 		diff, truncated, err := repoDiff(ctx, d.repoDir(r.Name), base, branch, limit)
@@ -103,12 +106,17 @@ func (d *Daemon) OrderDiff(ctx context.Context, id string, limit int) (OrderDiff
 // core.attributesFile=/dev/null drop the external diff and the captain's
 // own attributes file besides. Fixed prefixes keep "diff --git a/x b/x"
 // headers whatever diff.noprefix or diff.mnemonicPrefix say.
+//
+// git reads each blob whole before it writes a line of its diff, so the
+// output cap doesn't bound its memory. core.bigFileThreshold at
+// consoleDiffCap makes a bigger file "Binary files ... differ", which
+// spares the line diff's copies: git still reads the blob once to say so.
 func repoDiff(ctx context.Context, gitDir, base, branch string, limit int) (string, bool, error) {
 	if !fullCommitRE.MatchString(base) {
 		return "", false, fmt.Errorf("base %q is not a full commit id", base)
 	}
 	out, truncated, err := runGitCapped(ctx, gitDir, limit,
-		"-c", "core.attributesFile=/dev/null", "-c", "diff.external=",
+		"-c", "core.attributesFile=/dev/null", "-c", "diff.external=", "-c", "core.bigFileThreshold="+strconv.Itoa(consoleDiffCap),
 		"diff", "--no-ext-diff", "--no-textconv", "--no-color", "--src-prefix=a/", "--dst-prefix=b/",
 		"--end-of-options", base+"...refs/heads/"+branch, "--")
 	if err != nil {

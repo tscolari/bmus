@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -22,8 +24,10 @@ import (
 // /api/orders/{id}/diff is a 401 without a session, a 404 for an unknown
 // order and a 400 for one that isn't done. A done order's diff is its
 // work from its base commit, as plain text. The work commits a
-// .gitattributes naming a diff driver, which the clone's config defines
-// as a command and a textconv: neither runs.
+// .gitattributes naming a diff driver and a filter driver, which the
+// clone's config defines as a command and a textconv, and a process,
+// clean and smudge: none runs. git runs no filter for a diff of two
+// commits, flags or not; the test keeps it that way.
 func TestConsoleOrderDiff(t *testing.T) {
 	t.Parallel()
 	home := privateHome(t)
@@ -58,7 +62,7 @@ func TestConsoleOrderDiff(t *testing.T) {
 	work := "/beams/fake-1/work/" + id
 	base, commit := workBundleFiles(t, filepath.Join(beams, work, "in", "app.bundle"), id, filepath.Join(beams, work, "out", "app.bundle"),
 		map[string]string{
-			".gitattributes": "* diff=evil\n",
+			".gitattributes": "* diff=evil filter=evil\n",
 			"work.txt":       "retries added\n<script>alert(1)</script>\n",
 		})
 	sendReport(t, d, id, 2, comms.ReportBody{Summary: "did it",
@@ -81,11 +85,28 @@ func TestConsoleOrderDiff(t *testing.T) {
 	require.NoError(t, os.Remove(ranCommand))
 	require.NoError(t, os.Remove(ranTextconv))
 
+	// The filter driver: smudge, then process once it is set, run on a
+	// read with filters.
+	ranClean, ranSmudge, ranProcess := filepath.Join(markers, "clean-ran"), filepath.Join(markers, "smudge-ran"), filepath.Join(markers, "process-ran")
+	gitT(t, clone, "config", "filter.evil.clean", fmt.Sprintf("sh -c 'touch %s; cat'", ranClean))
+	gitT(t, clone, "config", "filter.evil.smudge", fmt.Sprintf("sh -c 'touch %s; cat'", ranSmudge))
+	gitT(t, clone, "cat-file", "--filters", "refs/heads/"+branch+":work.txt")
+	require.FileExists(t, ranSmudge)
+	gitT(t, clone, "config", "filter.evil.process", fmt.Sprintf("sh -c 'touch %s; exit 1'", ranProcess))
+	_ = exec.Command("git", "-C", clone, "cat-file", "--filters", "refs/heads/"+branch+":work.txt").Run() // the process fails
+	require.FileExists(t, ranProcess)
+	require.NoError(t, os.Remove(ranSmudge))
+	require.NoError(t, os.Remove(ranProcess))
+
 	var got OrderDiff
 	status, _ = diff(id, &got)
 	require.Equal(t, http.StatusOK, status)
 	require.NoFileExists(t, ranCommand)
 	require.NoFileExists(t, ranTextconv)
+	require.NoFileExists(t, ranClean)
+	require.NoFileExists(t, ranSmudge)
+	require.NoFileExists(t, ranProcess)
+	require.Equal(t, consoleDiffCap, got.Cap)
 	require.Equal(t, id, got.ID)
 	require.Equal(t, "t", got.Title)
 	require.Equal(t, branch, got.Branch)
@@ -142,6 +163,36 @@ func TestRepoDiffCap(t *testing.T) {
 	require.Equal(t, full, out)
 }
 
+// A diff cut with no newline under the cap keeps the cap's bytes.
+func TestRepoDiffCapNoNewline(t *testing.T) {
+	t.Parallel()
+	gitDir, base := diffRepo(t, "ORD-0001", 10)
+	out, truncated, err := repoDiff(t.Context(), gitDir, base, "bmus/ORD-0001", 16)
+	require.NoError(t, err)
+	require.True(t, truncated)
+	require.Equal(t, "diff --git a/big", out)
+}
+
+// A file bigger than consoleDiffCap is binary to the diff: git writes no
+// line diff of it.
+func TestRepoDiffBigFile(t *testing.T) {
+	t.Parallel()
+	up := testRepo(t)
+	base := up.rev(t, "main")
+	gitT(t, up.url, "checkout", "-q", "-b", "bmus/ORD-0001")
+	require.NoError(t, os.WriteFile(filepath.Join(up.url, "huge.txt"), []byte(strings.Repeat("x", consoleDiffCap+1)), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(up.url, "small.txt"), []byte("small\n"), 0o600))
+	gitT(t, up.url, "add", "huge.txt", "small.txt")
+	gitT(t, up.url, "commit", "-q", "-m", "huge")
+	out, truncated, err := repoDiff(t.Context(), filepath.Join(up.url, ".git"), base, "bmus/ORD-0001", consoleDiffCap)
+	require.NoError(t, err)
+	require.False(t, truncated)
+	require.Contains(t, out, "diff --git a/huge.txt b/huge.txt\n")
+	require.Contains(t, out, "Binary files /dev/null and b/huge.txt differ\n")
+	require.NotContains(t, out, "+xxx")
+	require.Contains(t, out, "\n+small\n")
+}
+
 // repoDiff takes only a full commit id as the base, and git's failure is
 // its error.
 func TestRepoDiffBase(t *testing.T) {
@@ -156,14 +207,22 @@ func TestRepoDiffBase(t *testing.T) {
 }
 
 // runGitCapped kills git once it writes past the cap: a diff far bigger
-// than the cap returns the cap's worth, and git's error is not one.
+// than the cap returns the cap's worth, git's error is not one, and git
+// and its process group are gone, killed rather than finished.
 func TestRunGitCappedKillsGit(t *testing.T) {
 	t.Parallel()
 	gitDir, base := diffRepo(t, "ORD-0001", 200000)
-	out, truncated, err := runGitCapped(t.Context(), gitDir, 4096, "diff", base+"...bmus/ORD-0001")
+	args := []string{"diff", base + "...bmus/ORD-0001"}
+	cmd := gitCommand(t.Context(), gitDir, args...)
+	out, truncated, err := cappedOutput(t.Context(), cmd, 4096, args)
 	require.NoError(t, err)
 	require.True(t, truncated)
 	require.Len(t, out, 4096)
+	ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus)
+	require.True(t, ok)
+	require.True(t, ws.Signaled())
+	require.Equal(t, syscall.SIGKILL, ws.Signal())
+	require.ErrorIs(t, syscall.Kill(-cmd.Process.Pid, 0), syscall.ESRCH)
 	out, truncated, err = runGitCapped(t.Context(), gitDir, 4096, "rev-parse", base)
 	require.NoError(t, err)
 	require.False(t, truncated)

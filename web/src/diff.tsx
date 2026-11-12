@@ -7,8 +7,36 @@
 import { useEffect, useState } from "preact/hooks";
 import { orderDiff, type OrderDiff, type RepoDiff } from "./api.js";
 
-/** The bridge's cap on each repo's diff (consoleDiffCap), for the truncation note. */
-export const diffCapLabel = "2 MiB";
+/**
+ * The most diff lines a repo's section renders: an agent can write a
+ * million, and each is an element. The rest stays in Copy.
+ */
+export const maxRenderedLines = 50_000;
+
+/** n bytes for a note: whole MiB or KiB where it divides, else bytes. */
+export function formatBytes(n: number): string {
+  if (n >= 1 << 20 && n % (1 << 20) === 0) return `${n / (1 << 20)} MiB`;
+  if (n >= 1 << 10 && n % (1 << 10) === 0) return `${n / (1 << 10)} KiB`;
+  return `${n} bytes`;
+}
+
+/** files cut to at most max lines in all, and how many lines were left out. */
+export function capLines(files: readonly DiffFile[], max: number): { files: DiffFile[]; omitted: number } {
+  const out: DiffFile[] = [];
+  let left = max;
+  let omitted = 0;
+  for (const f of files) {
+    if (left <= 0) {
+      omitted += f.lines.length;
+      continue;
+    }
+    const lines = f.lines.length > left ? f.lines.slice(0, left) : f.lines;
+    omitted += f.lines.length - lines.length;
+    left -= lines.length;
+    out.push(lines === f.lines ? f : { ...f, lines });
+  }
+  return { files: out, omitted };
+}
 
 /** How a diff line reads: added, removed, a hunk header, a file's metadata (index, ---, +++, modes) or context. */
 export type DiffLineKind = "add" | "del" | "hunk" | "meta" | "context";
@@ -127,10 +155,11 @@ export function CopyButton(props: { text: string; label: string; initial?: CopyN
   );
 }
 
-/** One repo's section: its name and base, a truncation note, and a block per file. */
-function RepoSection(props: { repo: RepoDiff; branch: string }) {
+/** One repo's section: its name and base, a truncation note, a block per file and, past maxLines, a note. */
+function RepoSection(props: { repo: RepoDiff; branch: string; cap: number; maxLines: number }) {
   const r = props.repo;
-  const files = parseDiff(r.diff);
+  const parsed = parseDiff(r.diff);
+  const { files, omitted } = capLines(parsed, props.maxLines);
   const hid = `diff-repo-${r.name}`;
   return (
     <section class="panel diff-repo" aria-labelledby={hid}>
@@ -143,10 +172,10 @@ function RepoSection(props: { repo: RepoDiff; branch: string }) {
       </h2>
       {r.truncated && (
         <p class="error" role="note">
-          This diff is cut at the bridge's {diffCapLabel} cap: it stops at its last whole line under it.
+          This diff is cut at the bridge's {formatBytes(props.cap)} cap: it stops at its last whole line under it.
         </p>
       )}
-      {files.length === 0 && <p class="empty">No changes.</p>}
+      {parsed.length === 0 && <p class="empty">No changes.</p>}
       {files.map((f, i) => (
         <div class="diff-file" key={i}>
           <h3 class="diff-file-h mono" title={f.header}>
@@ -163,12 +192,17 @@ function RepoSection(props: { repo: RepoDiff; branch: string }) {
           </div>
         </div>
       ))}
+      {omitted > 0 && (
+        <p class="error" role="note">
+          {omitted.toLocaleString("en-US")} more {omitted === 1 ? "line is" : "lines are"} not shown here. Copy still has them.
+        </p>
+      )}
     </section>
   );
 }
 
-/** A loaded diff: the order's id, title and branch, Copy, and a section per repo. */
-export function DiffView(props: { diff: OrderDiff; copy?: CopyNote }) {
+/** A loaded diff: the order's id, title and branch, Copy, and a section per repo, each rendering at most maxLines lines. */
+export function DiffView(props: { diff: OrderDiff; copy?: CopyNote; maxLines?: number }) {
   const d = props.diff;
   return (
     <>
@@ -181,7 +215,7 @@ export function DiffView(props: { diff: OrderDiff; copy?: CopyNote }) {
       </header>
       {d.repos.length === 0 && <p class="empty">This order has no repos.</p>}
       {d.repos.map((r) => (
-        <RepoSection key={r.name} repo={r} branch={d.branch} />
+        <RepoSection key={r.name} repo={r} branch={d.branch} cap={d.cap} maxLines={props.maxLines ?? maxRenderedLines} />
       ))}
     </>
   );

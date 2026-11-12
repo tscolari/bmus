@@ -538,6 +538,13 @@ func runGitCmd(ctx context.Context, cmd *exec.Cmd, stderr fmt.Stringer, args []s
 	if err == nil {
 		return nil
 	}
+	return gitError(ctx, err, stderr, args)
+}
+
+// gitError is the error of git run with args that failed with err: with
+// the context's cause when ctx ended, and git's stderr. It names git's
+// command, after any leading -c options.
+func gitError(ctx context.Context, err error, stderr fmt.Stringer, args []string) error {
 	if ctx.Err() != nil {
 		err = fmt.Errorf("%w (%w)", context.Cause(ctx), err)
 	}
@@ -556,62 +563,88 @@ func runGitCmd(ctx context.Context, cmd *exec.Cmd, stderr fmt.Stringer, args []s
 const gitStderrCap = 64 << 10
 
 // runGitCapped is runGit for output that may be large, such as a diff
-// (#104). It keeps at most limit bytes of git's stdout, as git writes it,
-// and returns them untrimmed. Once git writes more than limit, it stops
-// reading, kills git's process group and reports truncated: git is never
-// left to write the rest, and nothing past limit+1 bytes is held.
+// (#104): see cappedOutput.
 func runGitCapped(ctx context.Context, gitDir string, limit int, args ...string) (out []byte, truncated bool, err error) {
-	cmd := gitCommand(ctx, gitDir, args...)
-	stdout := &cappedWriter{limit: limit, onOver: func() {
-		// Write runs only once git has started: Process is set.
-		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}}
-	stderr := &cappedWriter{limit: gitStderrCap}
-	cmd.Stdout, cmd.Stderr = stdout, stderr
-	err = runGitCmd(ctx, cmd, stderr, args)
-	if stdout.over {
-		// The kill is the error, if any; the output is what was asked for.
-		return stdout.buf.Bytes(), true, nil
-	}
+	return cappedOutput(ctx, gitCommand(ctx, gitDir, args...), limit, args)
+}
+
+// cappedOutput runs cmd, from gitCommand with args, and reads at most
+// limit+1 bytes of its stdout as git writes it, returning them
+// untrimmed. With more than limit, it keeps limit, kills git's process
+// group and reports truncated: git is never left to write the rest, and
+// nothing past limit+1 bytes is held.
+//
+// git's stdout is a pipe read here, before Wait: git can't be reaped while
+// it is read, so its pid, which leads its group, is still its own when
+// the group is killed. A kill takes the lock and checks that Wait hasn't
+// started. When ctx ends, cmd.Cancel sends the group SIGTERM, which ends
+// the read; whatever holds the pipe open gitWaitDelay later is killed.
+func cappedOutput(ctx context.Context, cmd *exec.Cmd, limit int, args []string) (out []byte, truncated bool, err error) {
+	pr, pw, err := os.Pipe()
 	if err != nil {
 		return nil, false, err
 	}
-	return stdout.buf.Bytes(), false, nil
+	defer pr.Close()
+	stderr := &cappedWriter{limit: gitStderrCap}
+	cmd.Stdout, cmd.Stderr = pw, stderr
+	err = cmd.Start()
+	pw.Close()
+	if err != nil {
+		return nil, false, gitError(ctx, err, stderr, args)
+	}
+	var (
+		mu      sync.Mutex
+		waiting bool
+	)
+	kill := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if !waiting {
+			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+	}
+	var late *time.Timer
+	stop := context.AfterFunc(ctx, func() {
+		mu.Lock()
+		defer mu.Unlock()
+		late = time.AfterFunc(gitWaitDelay, kill)
+	})
+	out, rerr := io.ReadAll(io.LimitReader(pr, int64(limit)+1))
+	if len(out) > limit {
+		out, truncated = out[:limit], true
+		kill()
+	}
+	pr.Close()
+	stop()
+	mu.Lock()
+	waiting = true
+	if late != nil {
+		late.Stop()
+	}
+	mu.Unlock()
+	werr := cmd.Wait()
+	if truncated {
+		// The kill is the error, if any; the output is what was asked for.
+		return out, true, nil
+	}
+	if werr == nil {
+		werr = rerr
+	}
+	if werr != nil {
+		return nil, false, gitError(ctx, werr, stderr, args)
+	}
+	return out, false, nil
 }
 
-// errCapped ends the copy of a command's output into a cappedWriter that
-// is full.
-var errCapped = errors.New("output over its cap")
-
-// cappedWriter keeps the first limit bytes written to it. With onOver
-// set, the first write past limit calls it and fails, as does every write
-// after it, which stops os/exec copying the command's output; without,
-// the rest is dropped.
+// cappedWriter keeps the first limit bytes written to it and drops the
+// rest.
 type cappedWriter struct {
-	buf    bytes.Buffer
-	limit  int
-	over   bool
-	onOver func()
+	buf   bytes.Buffer
+	limit int
 }
 
 func (w *cappedWriter) Write(p []byte) (int, error) {
-	if w.over && w.onOver != nil {
-		return 0, errCapped
-	}
-	room := w.limit - w.buf.Len()
-	if len(p) <= room {
-		return w.buf.Write(p)
-	}
-	w.buf.Write(p[:room])
-	if !w.over {
-		w.over = true
-		if w.onOver != nil {
-			w.onOver()
-		}
-	}
-	if w.onOver != nil {
-		return room, errCapped
-	}
+	w.buf.Write(p[:min(len(p), max(w.limit-w.buf.Len(), 0))])
 	return len(p), nil
 }
 

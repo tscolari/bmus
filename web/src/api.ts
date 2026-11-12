@@ -200,6 +200,8 @@ export interface OrderDiff {
   readonly id: string;
   readonly title: string;
   readonly branch: string;
+  /** The bytes each repo's diff was capped at. */
+  readonly cap: number;
   readonly repos: readonly RepoDiff[];
 }
 
