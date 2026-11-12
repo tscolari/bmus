@@ -6,7 +6,7 @@ import {
   belayPrompt,
   canCountermand,
   canPush,
-  diffPath,
+  reportPath,
   forcePushPrompt,
   githubCompareURL,
   canTake,
@@ -431,9 +431,9 @@ describe("push (#4)", () => {
     expect(githubCompareURL("https://github.com/o/r.git", "feat/a b#c?d")).toBe("https://github.com/o/r/compare/feat/a%20b%23c%3Fd?expand=1");
   });
 
-  it("the diff page's path is /diff/<order>, encoded", () => {
-    expect(diffPath("ORD-0007")).toBe("/diff/ORD-0007");
-    expect(diffPath("a/b?c")).toBe("/diff/a%2Fb%3Fc");
+  it("the mission report's path is /report/<order>, encoded", () => {
+    expect(reportPath("ORD-0007")).toBe("/report/ORD-0007");
+    expect(reportPath("a/b?c")).toBe("/report/a%2Fb%3Fc");
   });
 
   it("reads where an order was last pushed from its log", () => {

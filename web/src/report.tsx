@@ -1,11 +1,16 @@
-// The diff page (#104): a done order's work, opened from its mission record
-// row at /diff/<order> in a new tab. It reads GET /api/orders/{id}/diff
-// and shows each repo's unified diff, a section per repo and a header per
-// file, added lines green and removed ones red. The diff is an agent's
-// work: it is rendered as plain text children only, never as HTML.
+// The mission report (#104): a done order, opened from its mission record
+// row at /report/<order> in a new tab. It reads GET
+// /api/orders/{id}/report and shows the order, the crew member and beams
+// that ran it, the crew's report, its pushes, then each repo's unified
+// diff, a section per repo and a header per file, added lines green and
+// removed ones red. The order's body, the report and the diff come from
+// the captain and the agent: they are rendered as plain text children
+// only, never as HTML.
 
+import { Fragment, type ComponentChildren } from "preact";
 import { useEffect, useState } from "preact/hooks";
-import { orderDiff, type OrderDiff, type RepoDiff } from "./api.js";
+import { orderReport, type CrewView, type OrderReport, type RepoDiff } from "./api.js";
+import { divisionInfo, orderBranch, priorityInfo } from "./view.js";
 
 /**
  * The most diff lines a repo's section renders: an agent can write a
@@ -109,7 +114,7 @@ function filePath(header: string, lines: readonly DiffLine[]): string {
 }
 
 /** The raw unified diff of every repo, in order: what Copy puts on the clipboard. */
-export function rawDiff(d: OrderDiff): string {
+export function rawDiff(d: { readonly repos: readonly RepoDiff[] }): string {
   return d.repos.map((r) => r.diff).join("");
 }
 
@@ -201,55 +206,197 @@ function RepoSection(props: { repo: RepoDiff; branch: string; cap: number; maxLi
   );
 }
 
-/** A loaded diff: the order's id, title and branch, Copy, and a section per repo, each rendering at most maxLines lines. */
-export function DiffView(props: { diff: OrderDiff; copy?: CopyNote; maxLines?: number }) {
-  const d = props.diff;
+/** What shows for a field the bridge has no record of. */
+export const unknown = "unknown";
+
+/** A timestamp as "YYYY-MM-DD HH:MM UTC"; unknown when missing or unparsable. */
+export function reportTime(ts: string | null | undefined): string {
+  if (!ts) return unknown;
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return unknown;
+  return `${d.toISOString().slice(0, 16).replace("T", " ")} UTC`;
+}
+
+/** A report panel: a heading and its content. */
+function Panel(props: { id: string; title: string; class?: string; children: ComponentChildren }) {
+  return (
+    <section class={`panel report-panel${props.class ? ` ${props.class}` : ""}`} aria-labelledby={props.id}>
+      <h2 id={props.id} class="sect">
+        <span class="tab bg-gold" aria-hidden="true" />
+        {props.title}
+      </h2>
+      {props.children}
+    </section>
+  );
+}
+
+/** Label and value pairs; an empty value shows as unknown. */
+function Facts(props: { rows: readonly (readonly [string, ComponentChildren])[] }) {
+  return (
+    <dl class="facts">
+      {props.rows.map(([k, v]) => (
+        <Fragment key={k}>
+          <dt>{k}</dt>
+          <dd>{v === "" || v === undefined || v === null ? unknown : v}</dd>
+        </Fragment>
+      ))}
+    </dl>
+  );
+}
+
+function CrewFacts(props: { crew: CrewView | null }) {
+  const c = props.crew;
+  if (c === null) return <p class="empty">Crew member: {unknown}.</p>;
+  return (
+    <Facts
+      rows={[
+        ["Name", c.name],
+        ["Id", <span class="mono">{c.id}</span>],
+        ["Rank", c.rank],
+        ["Division", c.division === "" ? "" : divisionInfo(c.division).label],
+      ]}
+    />
+  );
+}
+
+/** A loaded mission report: the header, the order, crew, beam, report and pushes, then the diff with Copy, each repo rendering at most maxLines lines. */
+export function ReportView(props: { report: OrderReport; copy?: CopyNote; maxLines?: number }) {
+  const r = props.report;
+  const o = r.order;
+  const branch = orderBranch(o.id);
   return (
     <>
-      <header class="diff-head">
-        <h1 class="diff-title">
-          <span class="mono order-id">{d.id}</span> {d.title}
-        </h1>
-        <span class="mono diff-branch">{d.branch}</span>
-        <CopyButton text={rawDiff(d)} label={`Copy the diff of ${d.id}`} {...(props.copy ? { initial: props.copy } : {})} />
+      <header class="report-head">
+        <h1 class="gate-title">MISSION REPORT</h1>
+        <p class="report-order">
+          <span class="mono order-id">{o.id}</span> {o.title}
+        </p>
       </header>
-      {d.repos.length === 0 && <p class="empty">This order has no repos.</p>}
-      {d.repos.map((r) => (
-        <RepoSection key={r.name} repo={r} branch={d.branch} cap={d.cap} maxLines={props.maxLines ?? maxRenderedLines} />
+      <Panel id="report-order-h" title="Order" class="report-wide">
+        <Facts
+          rows={[
+            ["State", o.state],
+            ["Priority", priorityInfo(o.priority).label],
+            ["Division", o.division === "" ? "" : divisionInfo(o.division).label],
+            [
+              "Repos",
+              o.repos.length === 0 ? (
+                "none"
+              ) : (
+                <ul class="report-list">
+                  {o.repos.map((repo) => (
+                    <li key={repo.name} class="mono">
+                      {repo.name} @ {repo.base_ref}
+                    </li>
+                  ))}
+                </ul>
+              ),
+            ],
+            ["Branch", <span class="mono">{branch}</span>],
+            ["Created", reportTime(o.created_at)],
+            ["Done", reportTime(o.done_at)],
+          ]}
+        />
+        <h3 class="report-sub">Body</h3>
+        {o.body === "" ? <p class="empty">No body.</p> : <pre class="report-pre">{o.body}</pre>}
+      </Panel>
+      <div class="report-grid">
+        <Panel id="report-crew-h" title="Crew">
+          <CrewFacts crew={r.crew} />
+        </Panel>
+        <Panel id="report-beam-h" title="Beam">
+          {r.beams.length === 0 ? (
+            <p class="empty">Beam: {unknown}.</p>
+          ) : (
+            <ul class="report-list">
+              {r.beams.map((b) => (
+                <li key={b} class="mono">
+                  {b}
+                </li>
+              ))}
+            </ul>
+          )}
+        </Panel>
+      </div>
+      <Panel id="report-report-h" title="Report" class="report-wide">
+        {r.report === null ? (
+          <p class="empty">Report: {unknown}.</p>
+        ) : (
+          <>
+            {r.report.summary === "" ? <p class="empty">No summary.</p> : <p class="report-summary">{r.report.summary}</p>}
+            <h3 class="report-sub">Artifacts</h3>
+            {r.report.artifacts.length === 0 ? (
+              <p class="empty">None.</p>
+            ) : (
+              <ul class="report-list">
+                {r.report.artifacts.map((a, i) => (
+                  <li key={i} class="mono">
+                    {a}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
+        )}
+      </Panel>
+      {r.pushes.length > 0 && (
+        <Panel id="report-pushes-h" title="Pushes" class="report-wide">
+          <ul class="report-list">
+            {r.pushes.map((p, i) => (
+              <li key={i}>
+                <span class="mono">
+                  {p.repo}: {p.branch} at {p.commit.slice(0, 12)}
+                </span>
+                {p.force && " (forced)"}, {reportTime(p.at)}
+              </li>
+            ))}
+          </ul>
+        </Panel>
+      )}
+      <div class="report-diff-head">
+        <h2 class="sect">
+          <span class="tab bg-blue" aria-hidden="true" />
+          Diff
+        </h2>
+        <CopyButton text={rawDiff(r)} label={`Copy the diff of ${o.id}`} {...(props.copy ? { initial: props.copy } : {})} />
+      </div>
+      {r.repos.length === 0 && <p class="empty">This order has no repos.</p>}
+      {r.repos.map((repo) => (
+        <RepoSection key={repo.name} repo={repo} branch={branch} cap={r.cap} maxLines={props.maxLines ?? maxRenderedLines} />
       ))}
     </>
   );
 }
 
-type Load = { readonly kind: "loading" } | { readonly kind: "loaded"; readonly diff: OrderDiff } | { readonly kind: "failed"; readonly message: string };
+type Load = { readonly kind: "loading" } | { readonly kind: "loaded"; readonly report: OrderReport } | { readonly kind: "failed"; readonly message: string };
 
-/** The diff page for order id: it reads the diff once. */
-export function DiffPage(props: { id: string }) {
+/** The mission report page for order id: it reads the report once. */
+export function ReportPage(props: { id: string }) {
   const [load, setLoad] = useState<Load>({ kind: "loading" });
   useEffect(() => {
-    document.title = `Diff ${props.id} - BMUS Bridge`;
-    orderDiff(props.id).then(
-      (diff) => setLoad({ kind: "loaded", diff }),
+    document.title = `Mission report ${props.id} - BMUS Bridge`;
+    orderReport(props.id).then(
+      (report) => setLoad({ kind: "loaded", report }),
       (err: unknown) => setLoad({ kind: "failed", message: err instanceof Error ? err.message : String(err) }),
     );
   }, [props.id]);
   return (
     <div class="console">
       <main class="frame">
-        {load.kind === "loading" && <p class="mono gate">Reading the diff of {props.id}...</p>}
+        {load.kind === "loading" && <p class="mono gate">Reading the mission report of {props.id}...</p>}
         {load.kind === "failed" && (
           <p class="error" role="alert">
-            Could not read the diff of {props.id}: {load.message}
+            Could not read the mission report of {props.id}: {load.message}
           </p>
         )}
-        {load.kind === "loaded" && <DiffView diff={load.diff} />}
+        {load.kind === "loaded" && <ReportView report={load.report} />}
       </main>
     </div>
   );
 }
 
-/** The order id in a diff page's path, /diff/<order>; undefined for any other path. */
-export function diffPageOrder(pathname: string): string | undefined {
-  const m = /^\/diff\/([A-Za-z0-9-]+)$/.exec(pathname);
+/** The order id in a mission report's path, /report/<order>; undefined for any other path. */
+export function reportPageOrder(pathname: string): string | undefined {
+  const m = /^\/report\/([A-Za-z0-9-]+)$/.exec(pathname);
   return m?.[1];
 }

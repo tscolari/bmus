@@ -37,7 +37,7 @@ import {
   countermandableHails,
   decidedByLabel,
   conditionInfo,
-  diffPath,
+  reportPath,
   forcePushPrompt,
   githubCompareURL,
   contextText,
@@ -1079,24 +1079,34 @@ export function RecordPanel(props: { state: State; csrf: string }) {
           const o = props.state.order.get(r.orderId);
           return (
             <div class="record-row" key={r.orderId}>
-              <span class="mono order-id">{r.orderId}</span>
-              <span class="record-title">
-                {r.title || r.summary}
-                {r.title && r.summary && <span class="record-sum">{r.summary}</span>}
-              </span>
-              <span class="record-crew">{r.crewId ? shortName(r.crewId) : ""}</span>
-              <span class={`chip bg-${r.tone} on-${r.tone}`}>{r.result}</span>
-              {canPush(o) && <DoneOrderActions state={props.state} order={o} csrf={props.csrf} />}
-              {r.splitChildren !== undefined && (
-                <ConfirmAction
-                  idBase={`belay-${r.orderId}`}
-                  label="Belay"
-                  ariaLabel={`Belay ${r.orderId} and its open child orders`}
-                  prompt={belayPrompt(r.orderId, r.splitChildren)}
-                  confirmLabel="Belay"
-                  run={() => belayOrder(props.csrf, r.orderId)}
-                />
-              )}
+              <div class="record-main">
+                <span class="mono order-id">{r.orderId}</span>
+                <span class="record-title">
+                  {r.title || r.summary}
+                  {r.title && r.summary && <span class="record-sum">{r.summary}</span>}
+                </span>
+              </div>
+              <div class="record-foot">
+                <div class="record-who">
+                  {r.crewId && <span class="record-crew">{shortName(r.crewId)}</span>}
+                  <span class={`chip bg-${r.tone} on-${r.tone}`}>{r.result}</span>
+                </div>
+                {(canPush(o) || r.splitChildren !== undefined) && (
+                  <div class="record-acts">
+                    {canPush(o) && <DoneOrderActions state={props.state} order={o} csrf={props.csrf} />}
+                    {r.splitChildren !== undefined && (
+                      <ConfirmAction
+                        idBase={`belay-${r.orderId}`}
+                        label="Belay"
+                        ariaLabel={`Belay ${r.orderId} and its open child orders`}
+                        prompt={belayPrompt(r.orderId, r.splitChildren)}
+                        confirmLabel="Belay"
+                        run={() => belayOrder(props.csrf, r.orderId)}
+                      />
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
           );
         })}
@@ -1107,8 +1117,8 @@ export function RecordPanel(props: { state: State; csrf: string }) {
 }
 
 /**
- * A done order's controls (#4): the pushed marker, Push and "Show diff",
- * which opens the diff page in a new tab (#104).
+ * A done order's controls (#4): the pushed marker, Push and "Mission
+ * report", which opens its report in a new tab (#104).
  */
 function DoneOrderActions(props: { state: State; order: OrderView; csrf: string }) {
   const o = props.order;
@@ -1116,10 +1126,12 @@ function DoneOrderActions(props: { state: State; order: OrderView; csrf: string 
   return (
     <>
       {pushed && <span class="mono pushed-to">pushed to {pushed}</span>}
-      <PushAction orderId={o.id} remotes={pushRemotes(props.state, o)} run={(args) => pushOrder(props.csrf, o.id, args)} />
-      <a class="btn ghost small" href={diffPath(o.id)} target="_blank" rel="noopener noreferrer" aria-label={`Show the diff of ${o.id}`}>
-        Show diff
-      </a>
+      <div class="record-btns">
+        <PushAction orderId={o.id} remotes={pushRemotes(props.state, o)} run={(args) => pushOrder(props.csrf, o.id, args)} />
+        <a class="btn ghost small" href={reportPath(o.id)} target="_blank" rel="noopener noreferrer" aria-label={`Open the mission report of ${o.id}`}>
+          Mission report
+        </a>
+      </div>
     </>
   );
 }
@@ -1220,7 +1232,7 @@ export function PushAction(props: {
         <button
           ref={askRef}
           type="button"
-          class="btn ghost"
+          class="btn gold small"
           aria-label={`Push ${id}'s work to its remote`}
           onClick={() => {
             setError("");

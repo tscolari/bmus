@@ -46,23 +46,40 @@ type RepoDiff struct {
 	Truncated bool   `json:"truncated"`
 }
 
-// OrderDiff reads done order id's work in each of its repos, as `git diff
-// <base>...bmus/<order>` in the bridge's clone, each capped at limit
-// bytes. The order must exist and be done, and each repo be registered,
-// with a full commit id as its base (baseCommits) and bmus/<order> in its
-// clone; everything is checked before git runs. The diff takes no repo
-// lock: it only reads, and a fetch into the clone may take minutes.
+// OrderDiff reads done order id's work in each of its repos (doneOrder,
+// then orderDiff).
 func (d *Daemon) OrderDiff(ctx context.Context, id string, limit int) (OrderDiff, error) {
-	o, err := d.store.GetOrder(ctx, id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return OrderDiff{}, fmt.Errorf("order %s: %w", id, ErrNotFound)
-	}
+	o, err := d.doneOrder(ctx, id)
 	if err != nil {
 		return OrderDiff{}, err
 	}
-	if o.State != store.OrderDone {
-		return OrderDiff{}, badRequest("order %s is %s; only a done order's work has a diff", id, o.State)
+	return d.orderDiff(ctx, o, limit)
+}
+
+// doneOrder reads order id for its mission report: ErrNotFound if there
+// is none, a bad request unless it is done.
+func (d *Daemon) doneOrder(ctx context.Context, id string) (store.Order, error) {
+	o, err := d.store.GetOrder(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.Order{}, fmt.Errorf("order %s: %w", id, ErrNotFound)
 	}
+	if err != nil {
+		return store.Order{}, err
+	}
+	if o.State != store.OrderDone {
+		return store.Order{}, badRequest("order %s is %s; only a done order has a mission report", id, o.State)
+	}
+	return o, nil
+}
+
+// orderDiff reads done order o's work in each of its repos, as `git diff
+// <base>...bmus/<order>` in the bridge's clone, each capped at limit
+// bytes. Each repo must be registered, with a full commit id as its base
+// (baseCommits) and bmus/<order> in its clone; everything is checked
+// before git runs. The diff takes no repo lock: it only reads, and a
+// fetch into the clone may take minutes.
+func (d *Daemon) orderDiff(ctx context.Context, o store.Order, limit int) (OrderDiff, error) {
+	id := o.ID
 	bases, err := d.baseCommits(ctx, id)
 	if err != nil {
 		return OrderDiff{}, err

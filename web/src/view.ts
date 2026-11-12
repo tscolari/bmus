@@ -481,9 +481,9 @@ export function githubCompareURL(url: string, branch: string): string | undefine
   return `https://github.com/${owner}/${repo}/compare/${ref}?expand=1`;
 }
 
-/** The diff page's path for order id (#104): /diff/<order>, which the console serves as itself. */
-export function diffPath(id: string): string {
-  return `/diff/${encodeURIComponent(id)}`;
+/** The mission report's path for order id (#104): /report/<order>, which the console serves as itself. */
+export function reportPath(id: string): string {
+  return `/report/${encodeURIComponent(id)}`;
 }
 
 /** The branch order id's work was last pushed to, from its "repo <name> pushed to <branch> at <commit>" entries in the log; undefined if none. */

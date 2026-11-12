@@ -53,15 +53,16 @@ func TestEmbeddedIndexServed(t *testing.T) {
 	}
 }
 
-// The diff page (#104), /diff/<order>, is index.html under the same
-// headers as /; no other path under /diff/ serves anything.
-func TestDiffPageServed(t *testing.T) {
+// The mission report (#104), /report/<order>, is index.html under the
+// same headers as /; no other path under /report/ serves anything, nor
+// does the old /diff/<order>.
+func TestReportPageServed(t *testing.T) {
 	t.Parallel()
 	addr := serveAssets(t, fstest.MapFS{
 		"index.html": {Data: []byte("<!doctype html><title>index</title>")},
 		"app.js":     {Data: []byte("js")},
 	})
-	resp, body := get(t, addr, "/diff/ORD-0007")
+	resp, body := get(t, addr, "/report/ORD-0007")
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Contains(t, resp.Header.Get("Content-Type"), "text/html")
 	require.Equal(t, "default-src 'self'; connect-src 'self'", resp.Header.Get("Content-Security-Policy"))
@@ -69,7 +70,7 @@ func TestDiffPageServed(t *testing.T) {
 	require.Equal(t, "no-cache", resp.Header.Get("Cache-Control"))
 	require.Equal(t, "<!doctype html><title>index</title>", body)
 
-	for _, path := range []string{"/diff", "/diff/", "/diff/ORD-0007/", "/diff/ORD-0007/x", "/diff/app.js", "/diff/.ORD", "/diff/ORD%2F1", "/diffx/ORD-0007"} {
+	for _, path := range []string{"/report", "/report/", "/report/ORD-0007/", "/report/ORD-0007/x", "/report/app.js", "/report/.ORD", "/report/ORD%2F1", "/reportx/ORD-0007", "/diff/ORD-0007"} {
 		resp, _ := get(t, addr, path)
 		require.Equal(t, http.StatusNotFound, resp.StatusCode, path)
 	}
@@ -100,7 +101,7 @@ func TestAssetsBadHost(t *testing.T) {
 
 func TestMissingBuildPage(t *testing.T) {
 	addr := serveAssets(t, fstest.MapFS{".gitkeep": {}})
-	for _, path := range []string{"/", "/app.js", "/diff/ORD-0007"} {
+	for _, path := range []string{"/", "/app.js", "/report/ORD-0007"} {
 		resp, body := get(t, addr, path)
 		require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode, path)
 		require.Contains(t, resp.Header.Get("Content-Type"), "text/html")

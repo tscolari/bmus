@@ -367,15 +367,15 @@ func (c consoleSource) PushOrder(ctx context.Context, id string, args json.RawMe
 	})
 }
 
-// consoleDiffTimeout bounds the console's diff of an order (#104): the
-// page waits on the request.
-const consoleDiffTimeout = 30 * time.Second
+// consoleReportTimeout bounds the console's mission report of an order
+// (#104), its diff included: the page waits on the request.
+const consoleReportTimeout = 30 * time.Second
 
-// OrderDiff is done order id's diff, each repo's capped at
-// consoleDiffCap, read as readFor reads.
-func (c consoleSource) OrderDiff(ctx context.Context, id string) (any, error) {
-	return c.readFor(ctx, consoleDiffTimeout, "diff", func(ctx context.Context) (any, error) {
-		return c.d.OrderDiff(ctx, id, consoleDiffCap)
+// OrderReport is done order id's mission report, each repo's diff capped
+// at consoleDiffCap, read as readFor reads.
+func (c consoleSource) OrderReport(ctx context.Context, id string) (any, error) {
+	return c.readFor(ctx, consoleReportTimeout, "mission report", func(ctx context.Context) (any, error) {
+		return c.d.OrderReport(ctx, id, consoleDiffCap)
 	})
 }
 

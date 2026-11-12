@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from "preact/hooks";
-import { DiffPage, diffPageOrder } from "./diff.js";
+import { ReportPage, reportPageOrder } from "./report.js";
 import { browserFeedEnv, connectFeed, type Link } from "./feed.js";
 import {
   AwayPanel,
@@ -30,7 +30,7 @@ const clockTick = 15_000;
 
 /**
  * The console's root: the session exchange, then the bridge console, or
- * the diff page at /diff/<order> (#104).
+ * the mission report at /report/<order> (#104).
  */
 export function App() {
   const [session, setSession] = useState<SessionState>({ kind: "starting" });
@@ -40,8 +40,8 @@ export function App() {
       (err: unknown) => setSession({ kind: "failed", message: err instanceof Error ? err.message : String(err) }),
     );
   }, []);
-  const diffOrder = diffPageOrder(window.location.pathname);
-  if (session.kind === "ready") return diffOrder === undefined ? <Console csrf={session.csrf} /> : <DiffPage id={diffOrder} />;
+  const reportOrder = reportPageOrder(window.location.pathname);
+  if (session.kind === "ready") return reportOrder === undefined ? <Console csrf={session.csrf} /> : <ReportPage id={reportOrder} />;
   return (
     <main class="console">
       <h1 class="gate-title">BEAM ME UP, SCOTTY</h1>

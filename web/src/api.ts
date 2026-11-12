@@ -195,11 +195,24 @@ export interface RepoDiff {
   readonly truncated: boolean;
 }
 
-/** GET /api/orders/{id}/diff's reply: bridge.OrderDiff, a done order's work (#104). */
-export interface OrderDiff {
-  readonly id: string;
-  readonly title: string;
+/** A push of the order's work in GET /api/orders/{id}/report: bridge.ReportPush. */
+export interface ReportPush {
+  readonly repo: string;
   readonly branch: string;
+  readonly commit: string;
+  readonly force: boolean;
+  readonly at: string;
+}
+
+/** GET /api/orders/{id}/report's reply: bridge.OrderReport, a done order's mission report (#104). null and [] where the bridge has no record. */
+export interface OrderReport {
+  /** The order's view, with when it was created and done. */
+  readonly order: OrderView & { readonly created_at: string | null; readonly done_at: string | null };
+  readonly crew: CrewView | null;
+  /** The beams the order ran on, oldest first. */
+  readonly beams: readonly string[];
+  readonly report: { readonly summary: string; readonly artifacts: readonly string[] } | null;
+  readonly pushes: readonly ReportPush[];
   /** The bytes each repo's diff was capped at. */
   readonly cap: number;
   readonly repos: readonly RepoDiff[];
@@ -310,9 +323,9 @@ export function pushOrder(csrf: string, id: string, args: OrderPushArgs): Promis
   return postJSON<PushedRepo[]>(orderPath(id, "push"), csrf, args);
 }
 
-/** Reads a done order's work, one unified diff per repo. */
-export function orderDiff(id: string, f: typeof fetch = fetch): Promise<OrderDiff> {
-  return getJSON<OrderDiff>(orderPath(id, "diff"), f);
+/** Reads a done order's mission report, its diff included. */
+export function orderReport(id: string, f: typeof fetch = fetch): Promise<OrderReport> {
+  return getJSON<OrderReport>(orderPath(id, "report"), f);
 }
 
 /** Gives a crew member in sickbay a new tour and beam. */

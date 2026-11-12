@@ -44,8 +44,8 @@ type testSource struct {
 	// actions records the Actions calls; actErr, if set, fails them.
 	actions []actionCall
 	actErr  error
-	// diffErr, if set, fails OrderDiff.
-	diffErr error
+	// reportErr, if set, fails OrderReport.
+	reportErr error
 }
 
 // publish is the store's log hook: the feed's Publish, unless

@@ -303,11 +303,11 @@ describe("push (#4)", () => {
       }),
     });
 
-  it("a done order's record row offers Push and Show diff, and shows where it was pushed", () => {
+  it("a done order's record row offers Push and Mission report, and shows where it was pushed", () => {
     const html = renderToString(<RecordPanel state={record("done")} csrf="c" />);
     expect(html).toContain(`aria-label="Push ORD-0007's work to its remote"`);
     expect(html).toContain(
-      '<a class="btn ghost small" href="/diff/ORD-0007" target="_blank" rel="noopener noreferrer" aria-label="Show the diff of ORD-0007">Show diff</a>',
+      '<a class="btn ghost small" href="/report/ORD-0007" target="_blank" rel="noopener noreferrer" aria-label="Open the mission report of ORD-0007">Mission report</a>',
     );
     expect(html).not.toContain("Copy diff command");
     expect(html).toContain("pushed to bmus/ORD-0007");
@@ -318,15 +318,31 @@ describe("push (#4)", () => {
     for (const state of ["failed", "belayed", "withdrawn", "split"]) {
       const html = renderToString(<RecordPanel state={record(state)} csrf="c" />);
       expect(html, state).not.toContain(">Push</button>");
-      expect(html, state).not.toContain("Show diff");
+      expect(html, state).not.toContain("Mission report");
       expect(html, state).not.toContain("pushed to");
+    }
+  });
+
+  it("a row is the id and text on top, then a footer: crew and status on the left, the actions on the right", () => {
+    const html = renderToString(<RecordPanel state={record("done")} csrf="c" />);
+    expect(html).toMatch(
+      /<div class="record-row"><div class="record-main"><span class="mono order-id">ORD-0007<\/span><span class="record-title">[^<]*<span class="record-sum">over<\/span><\/span><\/div><div class="record-foot"><div class="record-who"><span class="record-crew">VANCE<\/span><span class="chip bg-green on-green">Complete<\/span><\/div><div class="record-acts">/,
+    );
+    const acts = html.slice(html.indexOf('<div class="record-acts">'));
+    expect(acts).toMatch(/<div class="record-btns"><button type="button" class="btn gold small"[^>]*>Push<\/button><a class="btn ghost small"/);
+    expect(acts).toContain('<button type="button" class="btn gold small" aria-label="Push ORD-0007\'s work to its remote">Push</button>');
+    expect(acts).toContain('<a class="btn ghost small" href="/report/ORD-0007"');
+    for (const state of ["failed", "belayed"]) {
+      const other = renderToString(<RecordPanel state={record(state)} csrf="c" />);
+      expect(other, state).toContain('<div class="record-foot"><div class="record-who"><span class="record-crew">VANCE</span>');
+      expect(other, state).not.toContain("record-acts");
     }
   });
 
   it("a done order without repos offers neither", () => {
     const html = renderToString(<RecordPanel state={record("done", false)} csrf="c" />);
     expect(html).not.toContain(">Push</button>");
-    expect(html).not.toContain("Show diff");
+    expect(html).not.toContain("Mission report");
   });
 
   const remotes = [{ name: "app", url: "git@github.com:o/app.git" }];

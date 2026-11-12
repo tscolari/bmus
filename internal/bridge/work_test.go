@@ -457,7 +457,7 @@ func TestMissionWorkComesBackAcrossRestart(t *testing.T) {
 	var p donePayload
 	require.NoError(t, json.Unmarshal(done[0].Payload, &p))
 	require.Equal(t, donePayload{Summary: "did it", Usage: report.Usage,
-		Repos: []landedRepo{{Name: "app", Branch: "bmus/" + id, Commit: commit, Bundle: bundle}}}, p)
+		Beam: "fake-1", Repos: []landedRepo{{Name: "app", Branch: "bmus/" + id, Commit: commit, Bundle: bundle}}}, p)
 }
 
 // A report or checkpoint that doesn't match the order's repos can't be

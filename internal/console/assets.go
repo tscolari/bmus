@@ -41,12 +41,13 @@ go build ./cmd/bmus</pre>
 </html>
 `
 
-// diffPageRE matches the diff page's path, /diff/<order> (#104): one
-// segment of an order id's characters, so no other path reaches it.
-var diffPageRE = regexp.MustCompile(`^/diff/[A-Za-z0-9-]+$`)
+// reportPageRE matches the mission report's path, /report/<order>
+// (#104): one segment of an order id's characters, so no other path
+// reaches it.
+var reportPageRE = regexp.MustCompile(`^/report/[A-Za-z0-9-]+$`)
 
 // assetsHandler serves the frontend from assets to GET and HEAD:
-// index.html at / and at the diff page's /diff/<order>, whose route the
+// index.html at / and at the mission report's /report/<order>, whose route the
 // page reads from its URL, and every other file at its path. Directory
 // listings and dotfiles are 404s. With no index.html in assets, every
 // path gets missingBuildPage with a 503.
@@ -69,7 +70,7 @@ func assetsHandler(assets fs.FS) http.Handler {
 			}
 			// File names carry no content hash: revalidate every time.
 			w.Header().Set("Cache-Control", "no-cache")
-			if diffPageRE.MatchString(p) {
+			if reportPageRE.MatchString(p) {
 				http.ServeFileFS(w, r, assets, "index.html")
 				return
 			}

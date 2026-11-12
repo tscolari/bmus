@@ -10,8 +10,9 @@
 // its record row withdraws its children. The order form's repo dropdown
 // (#211): the bridge's registered repos, and none. Push (#4): a done
 // order's work pushed to the bare remote from its record row, a diverged
-// target forced past a second confirm. The diff page (#104): a done
-// order's work in a new tab, copied to the clipboard.
+// target forced past a second confirm. The mission report (#104): a done
+// order, its crew, beam, report and diff in a new tab, the diff copied to
+// the clipboard.
 import { expect, test, type Page, type TestInfo } from "@playwright/test";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
@@ -695,7 +696,7 @@ test("belaying a split order from the page withdraws its open children", async (
   expect(errors).toEqual([]);
 });
 
-test("a done order's work is pushed from its record row, forced past a diverged target, and its diff shown and copied (#4, #104)", async ({ page, browser }) => {
+test("a done order's work is pushed from its record row, forced past a diverged target, and its mission report shown and its diff copied (#4, #104)", async ({ page, browser }) => {
   const errors = pageErrors(page);
   // Headless Chromium's clipboard needs a grant and a focused page: record
   // what the page writes instead. On the context, so the diff page's tab
@@ -757,16 +758,24 @@ test("a done order's work is pushed from its record row, forced past a diverged 
   expect(await gitOut(bridge.dir, "ls-remote", bare, "feature")).toBe(`${commit}\trefs/heads/feature`);
   await expect(row).toContainText("pushed to feature");
 
-  // Show diff opens the diff page in a new tab: the changed file, its
-  // added line, and Copy puts the raw diff on the clipboard.
+  // Mission report opens the order's report in a new tab: the crew
+  // member, the beam, the summary, the changed file and its added line;
+  // Copy puts the raw diff on the clipboard.
+  const beamText = (await page.getByRole("article", { name: "Lt. Sorell" }).locator(".crew-foot .muted-id").textContent()) ?? "";
+  const beam = /holodeck-\d+-\d+/.exec(beamText)?.[0] ?? "no beam";
   const popup = page.waitForEvent("popup");
-  await row.getByRole("link", { name: `Show the diff of ${orderId}` }).click();
+  await row.getByRole("link", { name: `Open the mission report of ${orderId}` }).click();
   const diffPage = await popup;
   const diffErrors = pageErrors(diffPage);
-  expect(new URL(diffPage.url()).pathname).toBe(`/diff/${orderId}`);
+  expect(new URL(diffPage.url()).pathname).toBe(`/report/${orderId}`);
   const added = `+${orderId} step 1: add retries to the webhook sender`;
-  await expect(diffPage.getByRole("heading", { level: 1 })).toHaveText(`${orderId} Add retries`);
-  await expect(diffPage.getByText(branch, { exact: true })).toBeVisible();
+  await expect(diffPage.getByRole("heading", { level: 1 })).toHaveText("MISSION REPORT");
+  await expect(diffPage.locator(".report-order")).toHaveText(`${orderId} Add retries`);
+  const crewPanel = diffPage.getByRole("region", { name: "Crew" });
+  await expect(crewPanel).toContainText("Lt. Sorell");
+  await expect(diffPage.getByRole("region", { name: "Beam" }).getByText(beam, { exact: true })).toBeVisible();
+  await expect(diffPage.getByRole("region", { name: "Report" })).toContainText("retries committed");
+  await expect(diffPage.getByRole("region", { name: "Pushes" })).toContainText(`app: feature at ${commit.slice(0, 12)}`);
   await expect(diffPage.getByRole("heading", { name: "holodeck.txt" })).toBeVisible();
   await expect(diffPage.getByText(added, { exact: true })).toBeVisible();
   await expect(diffPage.getByText(added, { exact: true })).toHaveClass("dl dl-add");

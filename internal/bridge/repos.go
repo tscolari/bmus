@@ -278,7 +278,7 @@ func shipRepos(ctx context.Context, d *Daemon, in MissionInput) (shipped, error)
 		out.Repos = append(out.Repos, comms.OrderRepo{Name: r.Name, BaseRef: r.BaseRef, BundlePath: remote})
 		if err := d.appendLog(ctx, logOrder, in.CrewID, in.OrderID,
 			fmt.Sprintf("repo %s shipped to the beam at %s (%s)", r.Name, commit[:min(len(commit), 12)], start),
-			map[string]string{"repo": r.Name, "base_ref": r.BaseRef, "commit": commit, "bundle_path": remote, "from": start}); err != nil {
+			map[string]string{"repo": r.Name, "base_ref": r.BaseRef, "commit": commit, "bundle_path": remote, "from": start, "beam": beam.Alias}); err != nil {
 			return shipped{}, err
 		}
 	}
