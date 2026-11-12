@@ -1,4 +1,4 @@
-# bmus
+# BEAM ME UP, SCOTTY
 
 A bridge that runs a crew of coding agents on Teleport Beams. Design and decisions live in [`spec/`](spec/).
 
