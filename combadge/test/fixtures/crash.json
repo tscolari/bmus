@@ -1,0 +1,6 @@
+[
+  { "at_pct": 10, "progress": "surveying the codebase" },
+  { "at_pct": 50, "request_handover": "checkpoint before the beam is lost" },
+  { "at_pct": 50, "sleep_ms": 60000 },
+  { "at_pct": 50, "crash": 137 }
+]

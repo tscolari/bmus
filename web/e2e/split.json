@@ -1,0 +1,18 @@
+[
+  { "at_pct": 10, "progress": "reading the RFC" },
+  {
+    "at_pct": 40,
+    "hail": {
+      "category": "order_split",
+      "question": "the agent's own words, which the bridge replaces",
+      "options": ["allow", "deny"],
+      "context": {
+        "children": [
+          { "title": "Relay API", "body": "Build the relay's API.", "division": "science" },
+          { "title": "Relay UI", "body": "Build the relay's UI.", "division": "science" }
+        ]
+      }
+    }
+  },
+  { "at_pct": 100, "report": { "summary": "RFC split into tickets", "artifacts": [] } }
+]

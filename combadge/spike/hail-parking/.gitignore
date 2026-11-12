@@ -1,0 +1,4 @@
+# Spike output; send it back, don't commit it.
+spike-results*.jsonl
+spike-stdout-*.log
+node_modules/

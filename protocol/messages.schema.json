@@ -1,0 +1,397 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tscolari/bmus/protocol/messages.schema.json",
+  "title": "bmus comms message",
+  "description": "One NDJSON line on the bridge<->combadge comms channel (spec/initial-plan-2026-10-16.md §6, D3). Every message shares this envelope; `type` selects the body shape via the if/then rules in `allOf`. Beam->bridge types: hello, heartbeat, progress, hail, checkpoint_ready, report, error, consult_reply. Bridge->beam types: ack, order, answer, consult, checkpoint, stand_down, recall, belay, correction. consult and consult_reply are Command-lane only (Phase 3) and are defined here for forward compatibility; nothing emits or handles them in Phase 1. Envelope and bodies reject unknown properties so drift between the Go bridge and the TypeScript combadge is caught by the golden tests; the only free-form object is a hail's `context`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "seq", "crew", "type", "ts", "body"],
+  "properties": {
+    "v": {
+      "description": "Protocol version. Bumped only on incompatible changes.",
+      "const": 1
+    },
+    "seq": {
+      "description": "Per-direction sequence; the two directions are independent. Beam->bridge: the combadge outbox seq. It starts at 1 and is monotonic for the life of the combadge's outbox file, not per process: a restarted combadge resumes from the outbox. The bridge dedups on (crew, seq) in the inbox table and acks; 0 is rejected for beam->bridge types so `ack` seq 0 can mean nothing recorded yet. Bridge->beam: the command id the combadge dedups on (D3), except for `ack`, which is idempotent and not deduped.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "crew": {
+      "description": "Crew member id the message is from (beam->bridge) or to (bridge->beam).",
+      "type": "string",
+      "minLength": 1
+    },
+    "order": {
+      "description": "Order id the message belongs to. Required and non-empty for order-bound types (progress, hail, checkpoint_ready, report, order, answer, checkpoint, recall, belay, correction); optional for hello, heartbeat, ack, error, stand_down, consult and consult_reply, which may be about the beam or tour rather than one order. Either absent or non-empty.",
+      "type": "string",
+      "minLength": 1
+    },
+    "type": {
+      "description": "Message type; selects the body shape.",
+      "enum": [
+        "hello", "heartbeat", "progress", "hail", "checkpoint_ready", "report", "error", "consult_reply",
+        "ack", "order", "answer", "consult", "checkpoint", "stand_down", "recall", "belay", "correction"
+      ]
+    },
+    "ts": {
+      "description": "Time the sender created the message, RFC 3339.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "body": {
+      "description": "Type-specific payload; see $defs.",
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {"if": {"$ref": "#/$defs/is_hello"}, "then": {"type": "object", "properties": {"body": {"$ref": "#/$defs/hello"}}}},
+    {"if": {"$ref": "#/$defs/is_heartbeat"}, "then": {"type": "object", "properties": {"body": {"$ref": "#/$defs/heartbeat"}}}},
+    {"if": {"$ref": "#/$defs/is_progress"}, "then": {"type": "object", "$ref": "#/$defs/order_bound", "properties": {"body": {"$ref": "#/$defs/progress"}}}},
+    {"if": {"$ref": "#/$defs/is_hail"}, "then": {"type": "object", "$ref": "#/$defs/order_bound", "properties": {"body": {"$ref": "#/$defs/hail"}}}},
+    {"if": {"$ref": "#/$defs/is_checkpoint_ready"}, "then": {"type": "object", "$ref": "#/$defs/order_bound", "properties": {"body": {"$ref": "#/$defs/checkpoint_ready"}}}},
+    {"if": {"$ref": "#/$defs/is_report"}, "then": {"type": "object", "$ref": "#/$defs/order_bound", "properties": {"body": {"$ref": "#/$defs/report"}}}},
+    {"if": {"$ref": "#/$defs/is_error"}, "then": {"type": "object", "properties": {"body": {"$ref": "#/$defs/error"}}}},
+    {"if": {"$ref": "#/$defs/is_consult_reply"}, "then": {"type": "object", "properties": {"body": {"$ref": "#/$defs/consult_reply"}}}},
+    {"if": {"$ref": "#/$defs/is_ack"}, "then": {"type": "object", "properties": {"body": {"$ref": "#/$defs/ack"}}}},
+    {"if": {"$ref": "#/$defs/is_order"}, "then": {"type": "object", "$ref": "#/$defs/order_bound", "properties": {"body": {"$ref": "#/$defs/order"}}}},
+    {"if": {"$ref": "#/$defs/is_answer"}, "then": {"type": "object", "$ref": "#/$defs/order_bound", "properties": {"body": {"$ref": "#/$defs/answer"}}}},
+    {"if": {"$ref": "#/$defs/is_consult"}, "then": {"type": "object", "properties": {"body": {"$ref": "#/$defs/consult"}}}},
+    {"if": {"$ref": "#/$defs/is_checkpoint"}, "then": {"type": "object", "$ref": "#/$defs/order_bound", "properties": {"body": {"$ref": "#/$defs/checkpoint"}}}},
+    {"if": {"$ref": "#/$defs/is_stand_down"}, "then": {"type": "object", "properties": {"body": {"$ref": "#/$defs/stand_down"}}}},
+    {"if": {"$ref": "#/$defs/is_recall"}, "then": {"type": "object", "$ref": "#/$defs/order_bound", "properties": {"body": {"$ref": "#/$defs/recall"}}}},
+    {"if": {"$ref": "#/$defs/is_belay"}, "then": {"type": "object", "$ref": "#/$defs/order_bound", "properties": {"body": {"$ref": "#/$defs/belay"}}}},
+    {"if": {"$ref": "#/$defs/is_correction"}, "then": {"type": "object", "$ref": "#/$defs/order_bound", "properties": {"body": {"$ref": "#/$defs/correction"}}}},
+    {"if": {"$ref": "#/$defs/is_beam_to_bridge"}, "then": {"type": "object", "properties": {"seq": {"type": "integer", "minimum": 1}}}}
+  ],
+  "$defs": {
+    "is_hello": {"type": "object", "required": ["type"], "properties": {"type": {"const": "hello"}}},
+    "is_heartbeat": {"type": "object", "required": ["type"], "properties": {"type": {"const": "heartbeat"}}},
+    "is_progress": {"type": "object", "required": ["type"], "properties": {"type": {"const": "progress"}}},
+    "is_hail": {"type": "object", "required": ["type"], "properties": {"type": {"const": "hail"}}},
+    "is_checkpoint_ready": {"type": "object", "required": ["type"], "properties": {"type": {"const": "checkpoint_ready"}}},
+    "is_report": {"type": "object", "required": ["type"], "properties": {"type": {"const": "report"}}},
+    "is_error": {"type": "object", "required": ["type"], "properties": {"type": {"const": "error"}}},
+    "is_consult_reply": {"type": "object", "required": ["type"], "properties": {"type": {"const": "consult_reply"}}},
+    "is_ack": {"type": "object", "required": ["type"], "properties": {"type": {"const": "ack"}}},
+    "is_order": {"type": "object", "required": ["type"], "properties": {"type": {"const": "order"}}},
+    "is_answer": {"type": "object", "required": ["type"], "properties": {"type": {"const": "answer"}}},
+    "is_consult": {"type": "object", "required": ["type"], "properties": {"type": {"const": "consult"}}},
+    "is_checkpoint": {"type": "object", "required": ["type"], "properties": {"type": {"const": "checkpoint"}}},
+    "is_stand_down": {"type": "object", "required": ["type"], "properties": {"type": {"const": "stand_down"}}},
+    "is_recall": {"type": "object", "required": ["type"], "properties": {"type": {"const": "recall"}}},
+    "is_belay": {"type": "object", "required": ["type"], "properties": {"type": {"const": "belay"}}},
+    "is_correction": {"type": "object", "required": ["type"], "properties": {"type": {"const": "correction"}}},
+    "is_beam_to_bridge": {
+      "description": "Matches beam->bridge types, whose seq (the outbox seq) starts at 1.",
+      "type": "object",
+      "required": ["type"],
+      "properties": {"type": {"enum": ["hello", "heartbeat", "progress", "hail", "checkpoint_ready", "report", "error", "consult_reply"]}}
+    },
+
+    "order_bound": {
+      "description": "Envelope constraint for messages that belong to one order: `order` must be present (the envelope's minLength makes it non-empty). `order` is redeclared here because ajv strict mode (strictRequired) wants required properties defined alongside.",
+      "type": "object",
+      "required": ["order"],
+      "properties": {"order": {"type": "string"}}
+    },
+
+    "hello": {
+      "description": "beam->bridge. Sent by the combadge at the start of each attach session.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "harness", "combadge_version"],
+      "properties": {
+        "protocol": {"description": "Highest protocol version the combadge speaks.", "type": "integer", "minimum": 1},
+        "harness": {"description": "Harness driving the agent, e.g. sdk or holodeck.", "type": "string", "minLength": 1},
+        "combadge_version": {"description": "Combadge build version.", "type": "string", "minLength": 1},
+        "model": {"description": "The harness's default model, the one an order without `model` runs on. Absent when the harness doesn't know it.", "type": "string", "minLength": 1}
+      }
+    },
+    "heartbeat": {
+      "description": "beam->bridge. Periodic beam health (every 10s in Phase 1); missing beats trigger the sickbay probe.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["disk_free_bytes", "mem_free_bytes", "outbox_depth"],
+      "properties": {
+        "disk_free_bytes": {"type": "integer", "minimum": 0},
+        "mem_free_bytes": {"type": "integer", "minimum": 0},
+        "outbox_depth": {"description": "Outbox entries not yet acked by the bridge.", "type": "integer", "minimum": 0}
+      }
+    },
+    "progress": {
+      "description": "beam->bridge. Agent-reported progress; goes straight to the captain's log, not into workflows.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pct", "note"],
+      "properties": {
+        "pct": {"type": "number", "minimum": 0, "maximum": 100},
+        "note": {"type": "string"}
+      }
+    },
+    "hail": {
+      "description": "beam->bridge. A question or permission request the agent is blocked on. Deliberate deviation from the spec §6 example: the bridge generates hail ids (H-0001, store.InsertHail), so this body carries no hail_id. It carries `ref`, the combadge's own id for the hail (unique per combadge process), which the bridge echoes in the `answer`. Conventions: a tool_approval hail carries options [\"allow\", \"deny\"]; a clarifying_question hail carries one question, with or without options.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "category", "question"],
+      "properties": {
+        "ref": {"description": "Combadge-local hail id, echoed back in the answer.", "type": "string", "minLength": 1},
+        "category": {"description": "Hail category: clarifying_question, tool_approval, order_split (Command splitting its order into child orders, #155), tracker_comment or tracker_close (a request to comment on or close a tracker item, #54); open so later categories (scope_change, destructive, egress, ...) fit.", "type": "string", "minLength": 1},
+        "question": {"type": "string", "minLength": 1},
+        "options": {"description": "Choices offered to the decider; absent or empty means free-text answer.", "type": "array", "items": {"type": "string"}},
+        "context": {"description": "Free-form context (files, diff stat, tool input...). The only open object in the protocol, except for an order_split hail's (order_split_context) and a tracker request's (tracker_comment_context, tracker_close_context).", "type": "object"}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["category"], "properties": {"category": {"const": "order_split"}}},
+          "then": {"required": ["options", "context"], "properties": {"options": {"const": ["allow", "deny"]}, "context": {"$ref": "#/$defs/order_split_context"}}}
+        },
+        {
+          "if": {"required": ["category"], "properties": {"category": {"const": "tracker_comment"}}},
+          "then": {"required": ["options", "context"], "properties": {"options": {"const": ["allow", "deny"]}, "context": {"$ref": "#/$defs/tracker_comment_context"}}}
+        },
+        {
+          "if": {"required": ["category"], "properties": {"category": {"const": "tracker_close"}}},
+          "then": {"required": ["options", "context"], "properties": {"options": {"const": ["allow", "deny"]}, "context": {"$ref": "#/$defs/tracker_close_context"}}}
+        }
+      ]
+    },
+    "tracker_comment_context": {
+      "description": "A tracker_comment hail's context (#54): the item to comment on and the comment. The bridge checks it again and runs an allowed request with its own credentials.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "body"],
+      "properties": {
+        "ref": {"description": "The item's tracker ref.", "type": "string", "minLength": 1},
+        "body": {"type": "string", "minLength": 1}
+      }
+    },
+    "tracker_close_context": {
+      "description": "A tracker_close hail's context (#54): the item to close and why. The bridge checks it again and runs an allowed request with its own credentials.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref"],
+      "properties": {
+        "ref": {"description": "The item's tracker ref.", "type": "string", "minLength": 1},
+        "reason": {"description": "Absent: completed.", "enum": ["completed", "not_planned"]}
+      }
+    },
+    "order_split_context": {
+      "description": "An order_split hail's context: the child orders Command asks to split its order into. The bridge checks it again (bridge.checkSplit). An allowed split is answered with option 0 and the new orders' ids, comma separated, as the decision.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["children"],
+      "properties": {
+        "parent": {"description": "The hailing order's id.", "type": "string", "minLength": 1},
+        "children": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["title", "body"],
+            "properties": {
+              "title": {"type": "string", "minLength": 1, "maxLength": 200},
+              "body": {"type": "string", "minLength": 1},
+              "division": {"description": "Absent: the parent order's.", "type": "string", "minLength": 1},
+              "priority": {"description": "0 routine, 1 yellow, 2 red. Absent: the parent order's.", "type": "integer", "minimum": 0, "maximum": 2}
+            }
+          }
+        }
+      }
+    },
+    "checkpoint_ready": {
+      "description": "beam->bridge. A checkpoint is on the beam's disk for the bridge to scp into the cargo bay. Paths are absolute on the beam.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repos", "transcript_path", "handover_path"],
+      "properties": {
+        "repos": {
+          "description": "One bundle per repo of the order, in the order's list order.",
+          "type": "array",
+          "items": {"$ref": "#/$defs/work_repo"}
+        },
+        "transcript_path": {"description": "Agent session transcript.", "type": "string", "minLength": 1},
+        "handover_path": {"description": "Handover note written by the agent.", "type": "string", "minLength": 1},
+        "stopping": {"description": "True on the checkpoint that answers a stand_down or recall: the harness stops after it and the order ends with no report or error. Absent means the order runs on.", "type": "boolean"}
+      }
+    },
+    "report": {
+      "description": "beam->bridge. Final result of the order. The bridge pulls every repo's bundle into the cargo bay, fetches it into its clone as `bmus/<order>`, then marks the order done.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "repos", "usage"],
+      "properties": {
+        "summary": {"type": "string"},
+        "repos": {
+          "description": "One bundle per repo of the order, in the order's list order.",
+          "type": "array",
+          "items": {"$ref": "#/$defs/work_repo"}
+        },
+        "artifacts": {"description": "Paths or references to produced artifacts.", "type": "array", "items": {"type": "string"}},
+        "usage": {"$ref": "#/$defs/usage"}
+      }
+    },
+    "work_repo": {
+      "description": "The work in one repo of an order, as a git bundle on the beam's disk.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "bundle_path", "commit", "branch"],
+      "properties": {
+        "name": {"description": "The order repo's name.", "$ref": "#/$defs/repo_name"},
+        "bundle_path": {"description": "Absolute path on the beam of a git bundle of `branch` minus the order's base commit, or of its whole history when the branch has no commits past it (git refuses an empty bundle).", "type": "string", "minLength": 1},
+        "commit": {"description": "The commit `branch` points at in the bundle.", "type": "string", "minLength": 1},
+        "branch": {"description": "The branch the bundle carries, `bmus/<order>`.", "type": "string", "minLength": 1}
+      }
+    },
+    "repo_name": {
+      "description": "A repo name in the bridge's registry, and a directory name on the bridge and the beam. `in`, `out` and all-digit names are reserved: `<work-dir>/<order>/in/` holds the bundles going in, `out/` the bundles coming back and numbered dirs the checkpoints.",
+      "type": "string", "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*$", "not": {"anyOf": [{"const": "in"}, {"const": "out"}, {"pattern": "^[0-9]+$"}]}
+    },
+    "usage": {
+      "description": "Token usage for the order.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_tokens", "output_tokens"],
+      "properties": {
+        "input_tokens": {"type": "integer", "minimum": 0},
+        "output_tokens": {"type": "integer", "minimum": 0}
+      }
+    },
+    "error": {
+      "description": "beam->bridge. Harness crash, tool failure, budget exceeded. With an order set it fails that order.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason"],
+      "properties": {
+        "reason": {"description": "Human-readable reason.", "type": "string", "minLength": 1},
+        "code": {"description": "Optional machine-readable code, e.g. budget_exceeded or exit_137.", "type": "string"}
+      }
+    },
+    "consult_reply": {
+      "description": "beam->bridge, Command lane only (Phase 3; unused in Phase 1). Command's structured decision on a consulted hail (spec D7). Regulations re-check it and low confidence escalates.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hail_id", "decision", "rationale", "confidence"],
+      "properties": {
+        "hail_id": {"description": "Bridge hail id from the consult.", "type": "string", "minLength": 1},
+        "decision": {"enum": ["answer", "escalate"]},
+        "option": {"description": "Index into the hail's options when answering with one.", "type": "integer", "minimum": 0},
+        "answer": {"description": "Free-text answer when the hail has no options.", "type": "string"},
+        "rationale": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "risk_flags": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+
+    "ack": {
+      "description": "bridge->beam. Lets the combadge trim its outbox. Idempotent: the combadge applies every ack and does not dedup acks by command id.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seq"],
+      "properties": {
+        "seq": {"description": "Highest contiguous beam->bridge seq the bridge has recorded; 0 means none yet.", "type": "integer", "minimum": 0}
+      }
+    },
+    "order": {
+      "description": "bridge->beam. Assigns the mission named by the envelope's `order`.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "body", "repos", "budget_tokens"],
+      "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "body": {"description": "Order spec (markdown).", "type": "string"},
+        "repos": {
+          "description": "Repos the order works on, each shipped onto the beam as a git bundle before the order (D6). The combadge clones each into `<work-dir>/<order>/<name>` and checks out `bmus/<order>` before the harness starts. A list from the start; a Phase 1 bridge sends exactly one.",
+          "type": "array",
+          "items": {"$ref": "#/$defs/order_repo"}
+        },
+        "budget_tokens": {"description": "Token budget; 0 means no budget.", "type": "integer", "minimum": 0},
+        "dossier": {"description": "Crew dossier of learned conventions (markdown).", "type": "string"},
+        "model": {"description": "Model to run the order on: the order's own, else the crew member's, else its division's default. Opaque to the bridge; the harness checks it when the order starts and fails the order if it is unknown. Absent means the harness's default.", "type": "string", "minLength": 1},
+        "handover": {"description": "Handover note of the checkpoint the order resumes from; each repo's bundle then carries that checkpoint's commits. Absent on a fresh order.", "type": "string"}
+      }
+    },
+    "order_repo": {
+      "description": "One repo of an order.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "base_ref", "bundle_path"],
+      "properties": {
+        "name": {"description": "Repo name in the bridge's registry, and the checkout's directory name.", "$ref": "#/$defs/repo_name"},
+        "base_ref": {"description": "Git ref the work starts from, as the captain gave it.", "type": "string", "minLength": 1},
+        "bundle_path": {"description": "Absolute path on the beam of a git bundle holding branch `bmus/<order>` at base_ref's commit, with its full history.", "type": "string", "minLength": 1}
+      }
+    },
+    "answer": {
+      "description": "bridge->beam. Decision on a hail. Echoes the hail's `ref` so the combadge can resume the waiting callback, and adds the bridge-generated `hail_id`. For a tool_approval hail, `option` 0 (\"allow\") allows the tool; any other option, or none, denies it with `decision` as the deny message. For a clarifying_question hail, `decision` is the answer text and `option` is set when a listed option was picked.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "hail_id", "decided_by", "decision"],
+      "properties": {
+        "ref": {"description": "The hail body's ref.", "type": "string", "minLength": 1},
+        "hail_id": {"description": "Bridge hail id (H-0001, ...).", "type": "string", "minLength": 1},
+        "decided_by": {"enum": ["policy", "command", "captain"]},
+        "decision": {"description": "The answer text (the chosen option's text when one was picked).", "type": "string"},
+        "option": {"description": "Index into the hail's options, when one was picked.", "type": "integer", "minimum": 0},
+        "rationale": {"type": "string"}
+      }
+    },
+    "consult": {
+      "description": "bridge->beam, Command lane only (Phase 3; unused in Phase 1). A hail plus the context Command cannot see on its own (spec D7).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hail_id", "crew", "order", "category", "question"],
+      "properties": {
+        "hail_id": {"type": "string", "minLength": 1},
+        "crew": {"description": "Crew member who hailed.", "type": "string", "minLength": 1},
+        "order": {"description": "Order the hail belongs to (not Command's own).", "type": "string", "minLength": 1},
+        "category": {"type": "string", "minLength": 1},
+        "question": {"type": "string", "minLength": 1},
+        "options": {"type": "array", "items": {"type": "string"}},
+        "context": {"description": "The hail's free-form context, passed through.", "type": "object"},
+        "order_spec": {"type": "string"},
+        "recent_log": {"description": "Recent captain's-log lines for the order.", "type": "array", "items": {"type": "string"}},
+        "guidance": {"description": "Captain's standing guidance.", "type": "string"},
+        "regulations": {"description": "Relevant Regulations excerpt.", "type": "string"},
+        "model": {"description": "Model Command answers on: its crew member's, else its division's default. Opaque to the bridge. Absent means the harness's default.", "type": "string", "minLength": 1}
+      }
+    },
+    "checkpoint": {
+      "description": "bridge->beam. Reach a safe point and checkpoint; answered by checkpoint_ready.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {"reason": {"type": "string"}}
+    },
+    "stand_down": {
+      "description": "bridge->beam. End the tour on this beam (watch change); checkpoint first if an order is in progress.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {"reason": {"type": "string"}}
+    },
+    "recall": {
+      "description": "bridge->beam. Checkpoint and give the order back to the pool.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {"reason": {"type": "string"}}
+    },
+    "belay": {
+      "description": "bridge->beam. Abandon the order without checkpointing.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {"reason": {"type": "string"}}
+    },
+    "correction": {
+      "description": "bridge->beam. The captain countermanded a decision made without them (Command's, or a captain timeout's default_option) after the agent already had the first answer (phase 3 plan section 6). Not a second answer: a running session is told of it; with no run for the order it is logged and dropped.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hail_id", "ref", "note"],
+      "properties": {
+        "hail_id": {"description": "Bridge hail id (H-0001, ...) of the countermanded decision.", "type": "string", "minLength": 1},
+        "ref": {"description": "The order the hail belongs to, as the envelope's order.", "type": "string", "minLength": 1},
+        "note": {"description": "The new decision and the captain's reason.", "type": "string", "minLength": 1},
+        "question": {"description": "The hail's question, so a run that never got the first answer (one resumed after a park) can name what was overridden. Optional.", "type": "string", "minLength": 1}
+      }
+    }
+  }
+}

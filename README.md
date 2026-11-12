@@ -1,0 +1,207 @@
+# bmus
+
+A bridge that runs a crew of coding agents on Teleport Beams. Design and decisions live in [`spec/`](spec/).
+
+![Bridge](https://github.com/tscolari/bmus/blob/images/screenshots/1.png?raw=true)
+
+## Roadmap
+
+A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026-10-16.md`](spec/initial-plan-2026-10-16.md#9-delivery-plan) and [`spec/campaigns-plan-2026-11-03.md`](spec/campaigns-plan-2026-11-03.md#6-stages).
+
+### Phase 1: one crew member, end to end
+
+- [x] Run a crew member on a real beam over `tsh`
+- [x] Give an order to a named crew member
+- [x] Ship the order's repo into the beam and get the finished work back as a local branch
+- [x] Answer the crew's hails from the CLI
+- [x] Follow everything in the captain's log
+- [x] Check the ship's condition with `bmus status`
+- [x] Pick the harness and model per crew member
+- [x] Restart the bridge mid-mission and the mission completes
+- [x] Lose a beam and the crew member lands in sickbay with a checkpoint
+- [x] Run the whole ship locally on holodeck beams
+
+### Phase 2: fleet and console ([#55](https://github.com/tscolari/bmus/issues/55))
+
+- [x] Define divisions and their default harness and model in a roster
+- [x] Pool orders by division, with priorities, claimed under standing orders
+- [x] Cap beams, concurrent provisioning and the provisioning rate
+- [x] Swap a crew member's beam before its TTL and resume from a checkpoint
+- [x] Recall, belay, withdraw and re-route orders
+- [x] Push a done order's branch from the bridge
+- [x] Hold work through a `tsh` login expiry and resume after `tsh login`
+- [x] Run the ship from a web console with live updates and hail notifications
+
+### Phase 3: chain of command ([#56](https://github.com/tscolari/bmus/issues/56))
+
+- [x] Set which hails are auto-allowed, go to Command or stay with the captain in `regs.yaml`
+- [x] Command answers routed hails for you, steered by your guidance
+- [x] Countermand a Command or timeout decision within its window
+- [x] Command splits an order into child orders once you approve
+- [x] Park a hail for long waits and resume the session on the answer
+- [x] Measure the auto-resolved share, captain overrides and time-to-answer
+- [x] Read orders from an issue tracker, GitHub Issues first ([#54](https://github.com/tscolari/bmus/issues/54))
+
+### Phase 4: hardening
+
+- [ ] Native API transporter with restricted egress and egress hails
+- [ ] Reconcile the ship's records with the beams that exist
+- [ ] Token and turn budgets per order
+- [ ] Hardened console
+- [ ] Nightly backups
+- [ ] Scoped permissions per division
+
+### Phase 5: drawing board
+
+- [ ] Redshirts: a beam for one order, destroyed on return
+- [ ] Away teams: several crew on one parent order, led by Command
+- [ ] Rank breaks ties when crew claim pool orders
+- [ ] Shore leave: idle crew give up their beam and return on a fresh one
+- [ ] An always-on bridge on another machine, with hails reaching you by push or Slack
+
+### Campaigns
+
+- [ ] Stage 1: chain orders, so one waits for another and starts from its work
+- [ ] Stage 2: crew file findings as issues, and you discard the ones you don't want
+- [ ] Stage 3: `bmus campaign run --issue <ref>` implements, reviews, fixes and lands one task
+- [ ] Stage 4: run a campaign over a backlog query with an in-flight limit, respecting blockers
+- [ ] Stage 5: land as a pull request or a merge on green CI, with stacked tasks
+
+## Running the bridge locally with holodeck
+
+Holodeck beams are local processes, so you need neither `tsh` nor a network. You do need Go and Node 22 or later.
+
+```sh
+(cd combadge && npm ci && npm run build)        # builds combadge/dist/combadge.mjs
+go build -o bmus ./cmd/bmus
+
+export BMUS_HOME=/tmp/bmus-dev                  # default ~/.bmus; keep it short (Unix socket paths)
+./bmus bridge run --transporter holodeck \
+  --holodeck-script combadge/test/fixtures/default.json \
+  --repo bmus="$PWD" &                          # any URL git can fetch; cloned into $BMUS_HOME/repos/bmus
+
+./bmus crew add sorell --name Sorell --rank Lieutenant --division science
+cat > order.yaml <<'EOF'
+title: holodeck run
+assignee: sorell
+repos:                                          # exactly one in Phase 1
+  - name: bmus
+    base_ref: main
+body: Walk the script.                          # holodeck only; real beams need a real task (below)
+EOF
+./bmus order create order.yaml                  # prints ORD-0001
+./bmus log tail --follow                        # Ctrl-C to stop
+./bmus hails list                               # in another shell, once the crew hails
+./bmus hails answer H-0001 --option 0
+```
+
+The bridge runs in the background of that shell. To stop it, run `kill %1`, or `fg` and then Ctrl-C. A graceful shutdown can take about a minute, and a second signal kills it at once.
+
+Holodeck beams keep running after the bridge stops, as real beams would, and the next `bridge run` on the same home attaches to them again. To get rid of them, stop the bridge, then:
+
+```sh
+for f in "$BMUS_HOME"/holodeck/*/serve.pid; do kill -- "-$(cat "$f")"; done
+rm -rf "$BMUS_HOME"
+```
+
+## Running on real beams
+
+Build as above and run from the repo root (or pass `--combadge`). You need a `tsh` login to a cluster with Beams. The bridge runs `tsh` as you, and `--transporter tsh` is the default. Crew members run the sdk harness, which is Claude Code on the beam.
+
+```sh
+./bmus bridge run --repo bmus=git@github.com:you/bmus.git &
+./bmus crew add sorell --name Sorell --rank Lieutenant --division science
+cat > order.yaml <<'EOF'
+title: README greeting
+assignee: sorell
+repos:
+  - name: bmus
+    base_ref: main
+body: Add a one-line greeting at the end of README.md and commit it.
+EOF
+./bmus order create order.yaml
+```
+
+The body is the agent's task, so give it real work. The agent commits on `bmus/<order>` on the beam and never pushes. When the order is done, the bridge fetches that branch into `$BMUS_HOME/repos/<name>` (default `~/.bmus`), and pushing it is up to you. Follow it with `log tail` and `hails` as above.
+
+The bridge needs your `tsh` login to stay valid. `bmus status` turns yellow 30 minutes before the login expires (`tsh login expires in <n>m`). From 2 minutes before the expiry (`tsh login expired`), the bridge runs no new `tsh` command until you run `tsh login`. Crew members stay on deck and claim no new orders. Provisioning and an order's transfers to and from its beam wait. A crew member whose connection was already open can still report back, and the bridge pulls its work once you log in. Work resumes within a minute or two of logging in.
+
+To push a done order's work, run `./bmus order push ORD-0001`. The bridge pushes `bmus/<order>` from its clone to the repo's registered URL with your own git config and credentials, to `bmus/<order>` or `--target-branch <name>`. It refuses an order that isn't done or whose work wasn't fetched at the reported commit. `--force` overwrites a target branch that has diverged. Each push goes into the captain's log.
+
+An order may name a `division` instead of an `assignee`. It then waits in that division's pool, and while standing orders are on, the next idle crew member of the division claims it. `priority: routine|yellow|red` (default routine) decides which order is claimed first, and `bmus status` stays red while a red order is open.
+
+```yaml
+title: Fix the flaky build
+division: ops                 # no assignee: a pool order
+priority: red
+repos:
+  - name: bmus
+    base_ref: main
+body: Find out why CI fails one run in ten and fix it.
+```
+
+```sh
+./bmus crew add tuvok --name Tuvok --division ops
+./bmus standing-orders on
+./bmus order create pool.yaml
+```
+
+To change course on an order:
+
+```sh
+./bmus order belay ORD-0001 --reason "not needed"    # abandon it; its beam stops without a checkpoint
+./bmus order recall ORD-0001                         # checkpoint and return it to its division's pool
+./bmus order withdraw ORD-0002                       # take back an order nobody has claimed yet
+./bmus order route ORD-0002 --assignee tuvok         # or --division ops; only before a claim
+```
+
+A recalled order resumes from its checkpoint on whichever crew member of the division claims it next. Recall needs a division, and an order parked by beam loss can be recalled only while its crew member is in sickbay.
+
+## Roster
+
+`bridge run` reads an optional roster from `$BMUS_HOME/roster.yaml` (or `--roster <path>`). Unknown keys are an error. Without divisions in it, `--division` and an order's `division` take any name.
+
+```yaml
+divisions:                # crew add and order create refuse any other division
+  science: {}
+  ops: {harness: echo, model: some-model}   # defaults for the division's crew members
+standing_orders: false    # only the default; `bmus standing-orders on|off` keeps its value across restarts
+transporter:              # zero or missing: the default
+  max_beams: 18
+  max_provisioning: 3
+  rate_per_minute: 5
+```
+
+A crew member's own `--harness` and `--model` override its division's; an order's `model` overrides both. With none, serve runs sdk and the harness its default model. The harness is resolved when a tour provisions its beam, the model when an order is sent. `bmus crew list` shows each resolved value and its source: `(crew)`, `(division)` or `(default)`. If the roster changed since a crew member's beam was provisioned, HARNESS shows what its next tour will get.
+
+## Regulations
+
+`bridge run` also reads an optional `$BMUS_HOME/regs.yaml` (or `--regs <path>`): which hails are auto-allowed, which go to Command and which only the captain may answer. Unknown keys and bad regexes fail startup. `bmus regs init` writes a commented starting point there and never overwrites an existing file. Without it, every hail goes to the captain.
+
+`bmus command guidance set "<text>"` sets free text that Command's consults will carry, at most 4096 bytes; `bmus command guidance show` prints it, or nothing when none is set, and `set ""` clears it.
+
+## Issue tracker
+
+`bridge run` also reads an optional `$BMUS_HOME/tracker.yaml` (or `--tracker <path>`). GitHub Issues is the only adapter so far, for one repository:
+
+```yaml
+adapter: github
+github:
+  repo: you/bmus
+  token_env: GITHUB_TOKEN   # optional; without it, or with it empty, the bridge runs `gh auth token`
+  # api_url: https://github.example.com/api/v3
+```
+
+The token is the bridge's own and never reaches a beam. With a GitHub Enterprise `api_url`, `gh auth token` is asked for that host. With a tracker, an order may name an issue as its `source`; the bridge reads it when the order is created and adds its text to the body, after the order's own, quoted so the agent reads it as the issue author's words. The order's title defaults to the issue's, as `Tracker <ref>: <title>`.
+
+```yaml
+source: tracker:#54   # or tracker:you/bmus#54
+division: science
+repos:
+  - name: bmus
+    base_ref: main
+```
+
+Crew ask the bridge to comment on or close an issue with the `tracker_comment` and `tracker_close` tools. Each is a hail the bridge runs once it is allowed, and with the default `regs.yaml` both are yours to answer: a comment is published outside the ship, like a push. If you drop `tracker_comment` from `captain_only` to let Command answer comments, the bridge posts an allowed one only once its countermand window has passed. Without a tracker, both requests and a `tracker:` source are refused with "no tracker configured", and nothing else changes.
+
+Run `bmus <command> --help` for each command's flags. The list commands take `--json`. `bmus` exits 3 when the bridge isn't running and 1 on any other error.

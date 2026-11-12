@@ -1,0 +1,1 @@
+{"v":1,"seq":311,"crew":"kirkland","type":"consult_reply","ts":"2026-10-16T09:12:30Z","body":{"hail_id":"H-0091","decision":"answer","option":1,"rationale":"The order names lib/raft only; widening is a scope change for the captain.","confidence":0.82,"risk_flags":["scope_change"]}}

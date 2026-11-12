@@ -1,0 +1,7 @@
+[
+  { "at_pct": 10, "progress": "surveying the codebase" },
+  { "at_pct": 40, "hail": { "category": "tool_approval", "question": "Run make deploy?", "options": ["allow", "deny"], "context": { "tool": "Bash", "command": "make deploy" } } },
+  { "at_pct": 60, "request_handover": "mid-mission checkpoint" },
+  { "at_pct": 80, "progress": "tests passing" },
+  { "at_pct": 100, "report": { "summary": "holodeck mission complete", "artifacts": ["README.md"] } }
+]

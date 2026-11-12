@@ -1,0 +1,123 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['spec/**', '**.md']
+  pull_request:
+    paths-ignore: ['spec/**', '**.md']
+
+# A new push to a PR cancels its older run. Runs on main all finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      # The holodeck transporter tests run the real combadge bundle. With
+      # BMUS_COMBADGE set they fail, rather than skip, if it or node is missing.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: combadge/package-lock.json
+      - name: build combadge
+        working-directory: combadge
+        run: npm ci && npm run build
+      - run: go build ./...
+      - run: go vet ./...
+      # Most tests wait on polls and retries rather than the CPU: run more of
+      # them at once than the runner's GOMAXPROCS.
+      - run: go test -race -parallel 8 -timeout 20m ./...
+        env:
+          BMUS_COMBADGE: ${{ github.workspace }}/combadge/dist/combadge.mjs
+
+  combadge:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: combadge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: combadge/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      # Run the process tests (bundle.test.ts copies the bundle alone into a
+      # clean temp dir) against the dist/combadge.mjs just built.
+      - run: npm test
+        env:
+          COMBADGE_BIN: dist/combadge.mjs
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      # The build output is committed and embedded in the binary: fail when
+      # it is stale, i.e. building changed, added or removed a file.
+      - name: committed build is fresh
+        run: |
+          git status --porcelain -- ../internal/console/assets
+          test -z "$(git status --porcelain -- ../internal/console/assets)"
+
+  # The console end to end (#77): Playwright in Chromium against a holodeck
+  # bridge. The suite's global setup builds bmus.
+  console-e2e:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            combadge/package-lock.json
+            web/package-lock.json
+      - name: build combadge
+        working-directory: combadge
+        run: npm ci && npm run build
+      - name: install
+        working-directory: web
+        run: npm ci && npx playwright install --with-deps --only-shell chromium
+      - name: e2e
+        working-directory: web
+        run: npm run e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: console-e2e-report
+          path: |
+            web/e2e/playwright-report/
+            web/e2e/test-results/
+          retention-days: 7
