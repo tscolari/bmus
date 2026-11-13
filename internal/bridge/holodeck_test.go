@@ -388,7 +388,8 @@ func stepLogEntries(t *testing.T, path string) []map[string]any {
 	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 		var e map[string]any
 		require.NoError(t, json.Unmarshal([]byte(line), &e))
-		if e["action"] != "consult" && e["action"] != "correction" { // neither is a step of an order
+		// None of these is a step of an order: a budget hail precedes the step of its index (#119).
+		if e["action"] != "consult" && e["action"] != "correction" && e["action"] != "budget" {
 			key := fmt.Sprintf("%v/%v", e["order"], e["index"])
 			require.False(t, seen[key], "step %s ran twice", key)
 			seen[key] = true

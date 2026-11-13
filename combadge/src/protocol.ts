@@ -28,6 +28,37 @@ export const CATEGORY_ORDER_SPLIT = "order_split";
  */
 export const CATEGORY_TRACKER_COMMENT = "tracker_comment";
 export const CATEGORY_TRACKER_CLOSE = "tracker_close";
+/**
+ * The harness is over its order's budget (#119): options extend/stop and a
+ * BudgetContext. Only the captain answers it. Option 0 extends, and the
+ * answer's `budget` carries the new limit; any other option stops the order,
+ * which ends with an error coded CODE_BUDGET_EXCEEDED. The bridge writes the
+ * question.
+ */
+export const CATEGORY_BUDGET = "budget";
+/** Options of a budget hail, in this order. */
+export const OPTION_EXTEND = "extend";
+export const OPTION_STOP = "stop";
+/** The error code of an order the captain stopped at its budget hail. */
+export const CODE_BUDGET_EXCEEDED = "budget_exceeded";
+
+/**
+ * A budget hail's context: tokens (input, cache reads and writes, output) and
+ * main-loop turns, used and limit. Used counts the usage on the order's other
+ * beams plus the harness's own; a zero limit is unlimited.
+ */
+export interface BudgetContext {
+  used: number;
+  limit: number;
+  turns_used: number;
+  turns_limit: number;
+}
+
+/** An order's limit, as an extended budget hail's answer carries it: 0 is unlimited. */
+export interface BudgetLimit {
+  tokens: number;
+  turns: number;
+}
 
 /** A tracker_comment hail's context. */
 export interface TrackerCommentContext {
@@ -231,6 +262,8 @@ export interface AnswerBody {
   decision: string;
   option?: number;
   rationale?: string;
+  /** The order's new limit, on a budget hail's answer that extends it (#119). An extend without it (an older bridge) keeps the old limit. */
+  budget?: BudgetLimit;
 }
 
 /** A hail plus fleet context for Command. Command lane only (phase 3 plan §5). */

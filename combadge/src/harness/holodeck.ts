@@ -41,6 +41,19 @@
  *       and emits nothing. This is the point: it simulates the beam's agent
  *       dying, and serve with it.
  *
+ * Budget (#119): before every step but `usage` and `crash`, the holodeck
+ * checks the order's budget as the sdk harness does at a tool call: over it
+ * when the order's `used_tokens`/`used_turns` plus its own usage (the latest
+ * usage step's counts, else Order.usage's) pass `budget_tokens`/`budget_turns`.
+ * Over budget it emits a `budget` hail (ref `holodeck-<order>-<index>-budget`,
+ * options extend/stop, context {used, limit, turns_used, turns_limit}) and
+ * waits. The step log records it as `{"order","index","action":"budget",
+ * "ts","decision","decided_by","delivery"}`, with the step's index. extend
+ * takes the answer's `budget` as the new limit and runs the step; stop writes
+ * a placeholder checkpoint into `<work-dir>/<order>/<script length>/`, emits
+ * it as an ordinary checkpoint_ready and rejects the run with BudgetExceeded,
+ * which serve emits as an error coded budget_exceeded.
+ *
  * The script must end in exactly one terminal step. It is validated when serve
  * starts, not when an order arrives, so a bad script fails fast. The same
  * script runs for every order serve receives.
@@ -101,9 +114,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { AnswerBody, ConsultReplyBody, HailBody, ReportBody, Usage, UsageBody } from "../protocol.js";
+import type { AnswerBody, ConsultReplyBody, HailBody, ReportBody, UsageBody } from "../protocol.js";
 import { git } from "../repos.js";
-import { abortable, orderDir, Stopped, writePlaceholderCheckpoint } from "./common.js";
+import { abortable, Budget, BudgetExceeded, orderDir, Stopped, writePlaceholderCheckpoint } from "./common.js";
 import type { Harness, HarnessOptions, HarnessReport, Inbound, Order } from "./types.js";
 
 type HailSpec = Omit<HailBody, "ref">;
@@ -215,19 +228,49 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
         ...((order.body.used_tokens ?? 0) > 0 && { used_tokens: order.body.used_tokens }),
         ...((order.body.used_turns ?? 0) > 0 && { used_turns: order.body.used_turns }),
       };
-      /** The tokens the report carries: the latest usage step's, else the order's earlier runs'. */
-      let tokens: Usage = { input_tokens: order.usage?.input_tokens ?? 0, output_tokens: order.usage?.output_tokens ?? 0 };
+      /** The order's usage on this beam: the latest usage step's, else the order's earlier runs', else zero. */
+      let own: UsageBody = { input_tokens: order.usage?.input_tokens ?? 0, output_tokens: order.usage?.output_tokens ?? 0, turns: order.usage?.turns ?? 0 };
+      /** The order's budget (#119), checked before each step but usage and crash. */
+      const budget = new Budget(order.body);
+      /**
+       * The order is over budget: raises a budget hail and waits for its answer, logged as a
+       * "budget" step at index: extend raises the limit and the walk goes on;
+       * stop writes a checkpoint into `<work-dir>/<order>/<script length>/`,
+       * emits it and ends the run with BudgetExceeded.
+       */
+      const checkBudget = async (index: number) => {
+        const ref = `holodeck-${order.id}-${index}-budget`;
+        const answer = abortable(new Promise<Delivered<AnswerBody>>((resolve) => answers.set(ref, resolve)), signal);
+        emit({ type: "hail", body: { ref, ...budget.hail(order.id, own) } });
+        const { body: a, delivery } = await answer;
+        signal.throwIfAborted();
+        stepLog &&
+          appendStep(stepLog, { order: order.id, index, action: "budget", ts: new Date().toISOString(), ...recorded, decision: a.decision, decided_by: a.decided_by, delivery });
+        if (budget.answer(a)) return;
+        const stopped = new BudgetExceeded(order.id, budget.context(own));
+        const body = await writePlaceholderCheckpoint(
+          path.join(orderDir(workDir, order), String(steps.length)),
+          order,
+          { holodeck: true, order: order.id, stopped: "budget" },
+          `Order ${order.id}: ${stopped.message}. The holodeck stopped its script here.`,
+        );
+        signal.throwIfAborted();
+        emit({ type: "checkpoint_ready", body });
+        throw stopped;
+      };
       const walk = async (): Promise<HarnessReport> => {
         for (const [index, step] of steps.entries()) {
           signal.throwIfAborted();
           const log = (extra: Record<string, unknown> = {}) =>
             stepLog && appendStep(stepLog, { order: order.id, index, action: actionOf(step), ts: new Date().toISOString(), ...recorded, ...extra });
+          // Only awaited when over budget: a walk under it reaches its first await where it did before.
+          if (!("usage" in step) && !("crash" in step) && budget.over(own)) await checkBudget(index);
           if ("progress" in step) {
             emit({ type: "progress", body: { pct: step.at_pct, note: step.progress } });
             log();
           } else if ("usage" in step) {
             const { input_tokens, output_tokens, turns } = step.usage;
-            tokens = { input_tokens, output_tokens };
+            own = { input_tokens, output_tokens, turns };
             emit({ type: "usage", body: { input_tokens, output_tokens, turns } });
             log();
           } else if ("hail" in step) {
@@ -258,7 +301,7 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
           } else if ("report" in step) {
             log();
             finished = true;
-            return { ...step.report, usage: tokens };
+            return { ...step.report, usage: { input_tokens: own.input_tokens, output_tokens: own.output_tokens } };
           } else {
             log();
             process.exit(step.crash);

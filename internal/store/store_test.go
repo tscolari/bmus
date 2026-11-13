@@ -1626,3 +1626,55 @@ func TestRecordUsage(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, none)
 }
+
+// ExtendBudget (#119) grants one extension per budget hail: a re-run for
+// the same hail writes nothing, another hail extends again, and a missing
+// order writes nothing at all.
+func TestExtendBudget(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := openTest(t)
+	require.NoError(t, s.InsertCrew(ctx, Crew{ID: "a", Name: "A"}, testEntry))
+	id, err := s.InsertOrder(ctx, Order{Title: "t", Assignee: "a", BudgetTurns: 10}, testEntry)
+	require.NoError(t, err)
+	hail := func() string {
+		t.Helper()
+		h, err := s.InsertHail(ctx, Hail{OrderID: id, CrewID: "a", Category: "budget", Question: "extend?"}, testEntry)
+		require.NoError(t, err)
+		_, err = s.db.ExecContext(ctx, `UPDATE hails SET status = ? WHERE id = ?`, HailDecided, h)
+		require.NoError(t, err)
+		return h
+	}
+	logged := func() int {
+		t.Helper()
+		var n int
+		require.NoError(t, s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM log WHERE text = 'extended'`).Scan(&n))
+		return n
+	}
+	entry := func(o Order) (LogEntry, error) {
+		return LogEntry{Kind: "order", OrderID: o.ID, Text: "extended"}, nil
+	}
+
+	first := hail()
+	o, wrote, err := s.ExtendBudget(ctx, id, first, entry)
+	require.NoError(t, err)
+	require.True(t, wrote)
+	require.Equal(t, int64(1), o.BudgetExtended)
+	o, wrote, err = s.ExtendBudget(ctx, id, first, entry)
+	require.NoError(t, err)
+	require.False(t, wrote, "a re-run for the same hail")
+	require.Equal(t, int64(1), o.BudgetExtended)
+	require.Equal(t, 1, logged())
+
+	o, wrote, err = s.ExtendBudget(ctx, id, hail(), entry)
+	require.NoError(t, err)
+	require.True(t, wrote)
+	require.Equal(t, int64(2), o.BudgetExtended)
+	require.Equal(t, 2, logged())
+
+	_, _, err = s.ExtendBudget(ctx, "ORD-9999", hail(), entry)
+	require.Error(t, err)
+	var n int
+	require.NoError(t, s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM budget_extensions`).Scan(&n))
+	require.Equal(t, 2, n, "a failed extension records nothing")
+}

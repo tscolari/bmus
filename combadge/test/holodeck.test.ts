@@ -239,6 +239,56 @@ describe("holodeck harness", () => {
     await b.close();
   });
 
+  it("hails at the step past a 10-turn budget: extend lets it finish, stop checkpoints and ends budget_exceeded (#119)", async () => {
+    const dir = tempDir();
+    const script = path.join(dir, "budget.json");
+    fs.writeFileSync(script, JSON.stringify([
+      { at_pct: 10, usage: { input_tokens: 1000, output_tokens: 100, turns: 10 } },
+      { at_pct: 20, progress: "ten turns in" },
+      { at_pct: 30, usage: { input_tokens: 1100, output_tokens: 110, turns: 11 } },
+      { at_pct: 40, progress: "turn eleven" },
+      { at_pct: 100, report: { summary: "done" } },
+    ]));
+    await startServe(dir, 60_000, holodeck(script, dir));
+    const a = new Attach(dir, 0);
+    const body = { ...orderBody, budget_turns: 10 };
+    a.send({ seq: 1, order: ORDER, type: "order", body });
+    expect(await a.next(ofOrder)).toMatchObject({ type: "usage", body: { turns: 10 } });
+    expect(await a.next(ofOrder)).toMatchObject({ type: "progress", body: { note: "ten turns in" } });
+    expect(await a.next(ofOrder)).toMatchObject({ type: "usage", body: { turns: 11 } });
+    const hail = await a.next(ofOrder);
+    expect(hail).toMatchObject({
+      type: "hail",
+      body: { ref: `holodeck-${ORDER}-3-budget`, category: "budget", options: ["extend", "stop"], context: { used: 1210, limit: 0, turns_used: 11, turns_limit: 10 } },
+    });
+    await expect(a.next(ofOrder, 300)).rejects.toThrow("timed out"); // held at the step
+    a.send({ seq: 2, order: ORDER, type: "answer", body: { ref: `holodeck-${ORDER}-3-budget`, hail_id: "H-0001", decided_by: "captain", decision: "extend", option: 0, budget: { tokens: 0, turns: 20 } } });
+    expect(await a.next(ofOrder)).toMatchObject({ type: "progress", body: { note: "turn eleven" } });
+    expect(await a.next(ofOrder)).toMatchObject({ type: "report", body: { summary: "done" } });
+    expect(stepLog(dir).filter((e) => e.order === ORDER).map((e) => [e.index, e.action, e.decision])).toEqual([
+      [0, "usage", undefined], [1, "progress", undefined], [2, "usage", undefined], [3, "budget", "extend"], [3, "progress", undefined], [4, "report", undefined],
+    ]);
+
+    // An order sent with 12 turns used on other beams: it hails at its first step past the usage, and stop ends it.
+    const other = "ORD-0002";
+    a.send({ seq: 3, order: other, type: "order", body: { ...body, used_turns: 12 } });
+    expect(await a.next((m) => m.order === other)).toMatchObject({ type: "usage" });
+    const first = await a.next((m) => m.order === other);
+    expect(first).toMatchObject({ type: "hail", body: { ref: `holodeck-${other}-1-budget`, context: { turns_used: 22, turns_limit: 10 } } });
+    a.send({ seq: 4, order: other, type: "answer", body: { ref: `holodeck-${other}-1-budget`, hail_id: "H-0002", decided_by: "captain", decision: "stop", option: 1 } });
+    const cp = await a.next((m) => m.order === other);
+    if (cp.type !== "checkpoint_ready") throw new Error(`expected checkpoint_ready, got ${cp.type}`);
+    expect(cp.body.stopping).toBeUndefined();
+    expect(cp.body.handover_path).toBe(path.join(dir, "work", other, "5", "handover.md"));
+    expect(fs.readFileSync(cp.body.handover_path, "utf8")).toContain(`budget exceeded: the captain stopped ${other}`);
+    expect(await a.next((m) => m.order === other)).toMatchObject({ type: "error", body: { code: "budget_exceeded", reason: expect.stringContaining("budget exceeded") } });
+    // serve emits the error before it records the order completed.
+    await expect
+      .poll(() => (JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8")) as Record<string, unknown>).completed)
+      .toEqual([ORDER, other]);
+    await a.close();
+  });
+
   it("keeps a stopped order's usage in state.json across a restart and hands it to its next run (#117)", async () => {
     const dir = tempDir();
     const script = path.join(dir, "usage-pause.json");

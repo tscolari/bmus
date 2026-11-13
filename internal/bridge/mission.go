@@ -105,7 +105,7 @@ type openHail struct {
 	Ref string // combadge's ref, echoed in the answer
 	// Category is the hail's: an order_split answered with option 0
 	// runs create-children (#155), a tracker request tracker-request
-	// (#54).
+	// (#54), a budget hail budget-extend (#119).
 	Category string
 }
 
@@ -261,12 +261,16 @@ func syntheticMessage(typ string, body any, crewID, orderID string) (comms.Messa
 //     order belayed (from away or hailing, or unclaimed and parked: a
 //     recalled order), cascading to its child orders (#146); a running mission whose order is on the beam then
 //     sends the beam the belay (send-belay). Returns belayed; a failed send
-//     tells the tour StaleBeam. An order the tour's backstop failed first
+//     tells the tour StaleBeam. The budget backstop's belay first drains
+//     what is queued behind it (drainReport, #119): a report from the beam
+//     completes the order instead. An order the tour's backstop failed first
 //     returns failed.
 //
 // While running:
 //   - hail: record-hail (insert, crew hailing, log), then start the hail's
-//     workflow (hail.go) without waiting on it.
+//     workflow (hail.go) without waiting on it. A hail with another ref
+//     while one is open is queued, and recorded once the open one's answer
+//     is sent (#119); a park or recall drops the queue.
 //   - answer for the open hail: decide-hail (confirm the decision its
 //     sender recorded, crew away, log), then send-answer, relaying its
 //     decided_by. An order_split hail answered with option 0 runs
@@ -275,7 +279,9 @@ func syntheticMessage(typ string, body any, crewID, orderID string) (comms.Messa
 //     created (option deny). A tracker request answered with option 0
 //     runs tracker-window, tracker-request and tracker-record there
 //     instead (runTrackerRequest, #54): the answer's decision says what
-//     the bridge did, or why it didn't (option deny).
+//     the bridge did, or why it didn't (option deny). A budget hail
+//     answered extend (option 0) runs budget-extend there (extendBudget,
+//     #119), and the answer carries the order's new limit.
 //   - correction (CountermandHail; also while parked): send-correction
 //     passes it to the beam. Parked, stopping (a stand_down or recall went
 //     out) or off the beam, it is held, the latest per hail, and sent
@@ -311,8 +317,10 @@ func syntheticMessage(typ string, body any, crewID, orderID string) (comms.Messa
 //     queued meanwhile (belayAfterSplit, #146). Returns done. A report
 //     that beats a stand_down or a recall completes the order all the
 //     same.
-//   - error: code dismissed fails the order (order-failed: close an open
-//     hail, mark failed, log reason and code). Code beam_lost (the tour's)
+//   - error: code dismissed or budget_exceeded fails the order
+//     (order-failed: close an open hail, mark failed, log reason and code);
+//     a budget stop with a stand_down or recall pending logs "<stop>
+//     superseded by the budget stop" first. Code beam_lost (the tour's)
 //     parks the mission on the checkpoints already pulled, or recalls it
 //     while recalling; so does any error while parking or recalling (the
 //     harness couldn't checkpoint). Any other fails the order. A
@@ -341,7 +349,11 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 	d := daemonFrom(ctx)
 	cur := in
 	var (
-		hail      *openHail
+		hail *openHail
+		// queued are hails that arrived while another was open, recorded
+		// in turn once it is answered (#119): the store keeps one open
+		// hail per order.
+		queued    []comms.HailBody
 		start     = true // ship the repos and send the order next
 		onBeam    bool   // the order went out to the current beam
 		beam      string // that beam, where its checkpoints and work come from
@@ -357,7 +369,7 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 		if err != nil || res != nil {
 			return res, err
 		}
-		hail, parking, recalling, parked = nil, false, false, true
+		hail, queued, parking, recalling, parked = nil, nil, false, false, true
 		return nil, nil
 	}
 	// recall recalls the order and parks the mission with no crew member,
@@ -369,9 +381,27 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 		if err := notifyTour(ctx, cur.CrewID, parkedSignal(cur, stale)); err != nil {
 			return nil, err
 		}
-		hail, parking, recalling, parked = nil, false, false, true
+		hail, queued, parking, recalling, parked = nil, nil, false, false, true
 		cur.CrewID, cur.TourID = "", ""
 		return nil, nil
+	}
+	// raise records hail body (record-hail) and starts its workflow
+	// without waiting on it, then waits on it.
+	raise := func(body comms.HailBody) error {
+		id, err := dbos.RunAsStep(ctx, func(c context.Context) (string, error) {
+			return recordHail(c, daemonFrom(c), cur, body)
+		}, append([]dbos.StepOption{dbos.WithStepName("record-hail")}, storeRetries...)...)
+		if err != nil {
+			return err
+		}
+		// Started, not awaited, under the hail's id: a replay, or a
+		// hail InsertHail found open already, starts nothing new.
+		if _, err := dbos.RunWorkflow(ctx, hailWorkflow, HailInput{HailID: id},
+			dbos.WithWorkflowID(hailWorkflowID(id))); err != nil {
+			return err
+		}
+		hail = &openHail{ID: id, Ref: body.Ref, Category: body.Category}
+		return nil
 	}
 	for {
 		if start {
@@ -487,6 +517,19 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 		case comms.TypeBelay:
 			var body comms.BelayBody
 			_ = json.Unmarshal(msg.Body, &body)
+			if body.Reason == budgetCeilingReason && onBeam && !parked {
+				// The backstop's belay follows a usage report, and the
+				// run's report may be right behind it: finished work is
+				// kept (#119).
+				report, err := drainReport(ctx, cur)
+				if err != nil {
+					return MissionResult{}, cur.CrewID, err
+				}
+				if report != nil {
+					res, err := completeMission(ctx, cur, beam, hail, *report)
+					return res, cur.CrewID, err
+				}
+			}
 			return belayMission(ctx, cur, onBeam && !parked, body.Reason)
 
 		case comms.TypeCorrection:
@@ -638,19 +681,19 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 				d.logger.Warn("mission: ignoring hail with a bad body", "order", in.OrderID, "seq", msg.Seq, "err", err)
 				continue
 			}
-			id, err := dbos.RunAsStep(ctx, func(c context.Context) (string, error) {
-				return recordHail(c, daemonFrom(c), cur, body)
-			}, append([]dbos.StepOption{dbos.WithStepName("record-hail")}, storeRetries...)...)
-			if err != nil {
+			// Another hail is open: this one waits its turn, so the open
+			// hail keeps its own category and ref (#119).
+			if hail != nil && body.Ref != hail.Ref {
+				if !slices.ContainsFunc(queued, func(q comms.HailBody) bool { return q.Ref == body.Ref }) {
+					d.logger.Info("mission: hail queued behind the open one", "order", in.OrderID, "ref", body.Ref,
+						"category", body.Category, "open", hail.ID)
+					queued = append(queued, body)
+				}
+				continue
+			}
+			if err := raise(body); err != nil {
 				return MissionResult{}, cur.CrewID, err
 			}
-			// Started, not awaited, under the hail's id: a replay, or a
-			// hail InsertHail found open already, starts nothing new.
-			if _, err := dbos.RunWorkflow(ctx, hailWorkflow, HailInput{HailID: id},
-				dbos.WithWorkflowID(hailWorkflowID(id))); err != nil {
-				return MissionResult{}, cur.CrewID, err
-			}
-			hail = &openHail{ID: id, Ref: body.Ref, Category: body.Category}
 
 		case comms.TypeAnswer:
 			var body comms.AnswerBody
@@ -686,6 +729,18 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 					body.Option = &deny
 				}
 			}
+			// An extension raises the order's limit before the answer goes
+			// out, so the answer can carry it (#119). Keyed by the hail: a
+			// re-run extends nothing more.
+			if hail.Category == comms.CategoryBudget && body.Option != nil && *body.Option == 0 {
+				limit, err := dbos.RunAsStep(ctx, func(c context.Context) (comms.BudgetLimit, error) {
+					return daemonFrom(c).extendBudget(c, cur, body.HailID)
+				}, append([]dbos.StepOption{dbos.WithStepName("budget-extend")}, storeRetries...)...)
+				if err != nil {
+					return MissionResult{}, cur.CrewID, err
+				}
+				body.Budget = &limit
+			}
 			// An allowed tracker request runs before the answer goes out,
 			// so the answer can say what the bridge did (#54).
 			if isTrackerRequest(hail.Category) && body.Option != nil && *body.Option == 0 {
@@ -713,6 +768,13 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 					return MissionResult{}, cur.CrewID, err
 				}
 				return failMission(ctx, cur, nil, fmt.Sprintf("could not send the answer to hail %s: %v", body.HailID, err), CodeSendFailed)
+			}
+			if len(queued) > 0 {
+				next := queued[0]
+				queued = queued[1:]
+				if err := raise(next); err != nil {
+					return MissionResult{}, cur.CrewID, err
+				}
 			}
 
 		case comms.TypeCheckpointReady:
@@ -744,7 +806,7 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 				if err != nil || res != nil {
 					return deref(res), cur.CrewID, err
 				}
-				hail, parking, recalling = nil, false, false
+				hail, queued, parking, recalling = nil, nil, false, false
 			}
 			var (
 				err error
@@ -807,7 +869,21 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 
 		case comms.TypeError:
 			body := errorBody(msg)
-			if body.Code != CodeDismissed && (body.Code == CodeBeamLost || parking || recalling) {
+			// A budget stop is the captain's answer: it fails the order
+			// even with a stand_down or recall pending (#119).
+			if body.Code == CodeBudgetExceeded && (parking || recalling) {
+				what := comms.TypeStandDown
+				if recalling {
+					what = comms.TypeRecall
+				}
+				if err := storeStep(ctx, "log-stop-superseded", func(c context.Context, d *Daemon) error {
+					return d.appendLog(c, logOrder, cur.CrewID, in.OrderID, what+" superseded by the budget stop",
+						map[string]any{"code": body.Code, "stop": what})
+				}); err != nil {
+					return MissionResult{}, cur.CrewID, err
+				}
+			}
+			if body.Code != CodeDismissed && body.Code != CodeBudgetExceeded && (body.Code == CodeBeamLost || parking || recalling) {
 				stop := park
 				if recalling {
 					stop = recall
@@ -822,6 +898,38 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 		default:
 			d.logger.Warn("mission: ignoring message", "order", in.OrderID, "type", msg.Type, "seq", msg.Seq)
 		}
+	}
+}
+
+// backstopDrainWait is how long the backstop's belay waits for the
+// run's report that may follow the usage report that passed the ceiling.
+const backstopDrainWait = 2 * time.Second
+
+// drainReport reads the messages queued behind the budget backstop's belay
+// (#119), waiting at most backstopDrainWait for each, and returns the
+// order's report from in.CrewID if one comes. Anything else is dropped with
+// a log line: the belay ends the order.
+func drainReport(ctx dbos.Context, in MissionInput) (*comms.Message, error) {
+	d := daemonFrom(ctx)
+	for {
+		msg, err := dbos.Recv[comms.Message](ctx, fromCrewTopic, backstopDrainWait)
+		switch {
+		case errors.Is(err, dbos.ErrTimeout):
+			return nil, nil
+		case err != nil && (ctx.Err() != nil || !isRecvDecodeError(err)):
+			return nil, err
+		case err != nil:
+			continue
+		case msg.Type == comms.TypeReport && msg.Crew == in.CrewID:
+			if err := storeStep(ctx, "log-ceiling-report", func(c context.Context, d *Daemon) error {
+				return d.appendLog(c, logOrder, in.CrewID, in.OrderID, "budget ceiling belay set aside: the order's report came in first",
+					map[string]any{"reason": budgetCeilingReason})
+			}); err != nil {
+				return nil, err
+			}
+			return &msg, nil
+		}
+		d.logger.Info("mission: dropping a message behind the budget ceiling's belay", "order", in.OrderID, "type", msg.Type, "seq", msg.Seq)
 	}
 }
 
@@ -1599,7 +1707,9 @@ func sendOrder(ctx context.Context, d *Daemon, in MissionInput, ship shipped) (u
 // tour's sickbay or dismissed alone (#43), and the next tour's status on
 // another order too (#48). An order_split hail is stored with the bridge's
 // question (splitQuestion), not the agent's (#155), and so is a tracker
-// request (trackerQuestion, #54).
+// request (trackerQuestion, #54). A budget hail is stored with the
+// bridge's question (budgetQuestion), its context's four counts and the
+// options extend and stop (#119).
 func recordHail(ctx context.Context, d *Daemon, in MissionInput, body comms.HailBody) (string, error) {
 	if body.Category == comms.CategoryOrderSplit {
 		o, err := d.store.GetOrder(ctx, in.OrderID)
@@ -1611,6 +1721,12 @@ func recordHail(ctx context.Context, d *Daemon, in MissionInput, body comms.Hail
 	if isTrackerRequest(body.Category) {
 		body.Context = d.canonTrackerContext(body.Category, body.Context)
 		body.Question = d.trackerQuestion(body.Category, body.Context)
+	}
+	if body.Category == comms.CategoryBudget {
+		var c comms.BudgetContext
+		body.Context, c = canonBudgetContext(body.Context)
+		body.Question = budgetQuestion(in.OrderID, c)
+		body.Options = []string{comms.OptionExtend, comms.OptionStop}
 	}
 	entry, err := logEntry(logHail, in.CrewID, in.OrderID, body.Question, map[string]any{
 		"category": body.Category, "options": body.Options, "ref": body.Ref,

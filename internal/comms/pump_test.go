@@ -285,6 +285,7 @@ type fakeSink struct {
 	toHail     []string // hail ids ToHail delivered to
 	// hailErr, if set, is ToHail's error for a hail id (nil delivers it).
 	hailErr func(string) error
+	usages  []string // orders UsageRecorded was called for
 }
 
 func (s *fakeSink) ToMission(ctx context.Context, tx *sql.Tx, msg Message) error {
@@ -345,6 +346,16 @@ func (s *fakeSink) hellos() []Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]Message(nil), s.crewHellos...)
+}
+
+func (s *fakeSink) UsageRecorded(ctx context.Context, tx store.InboxTx, order string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if tx.SQL() == nil {
+		return errors.New("UsageRecorded called without the inbox transaction")
+	}
+	s.usages = append(s.usages, order)
+	return nil
 }
 
 func (s *fakeSink) HeartbeatMissed(ctx context.Context) error {
@@ -562,7 +573,8 @@ func TestPumpProgressOnTheOrder(t *testing.T) {
 // A usage report is upserted into order_usage for (order, beam) (#118),
 // keeping the row with the highest envelope seq: one recorded after a later
 // seq, and a replay, change nothing. One for an unknown order, without an
-// order or with a bad body is recorded in the inbox and dropped.
+// order or with a bad body is recorded in the inbox and dropped. The
+// Sink's UsageRecorded runs only for a report that changed the row.
 func TestPumpUsageRecorded(t *testing.T) {
 	t.Parallel()
 	st := openStore(t)
@@ -611,6 +623,9 @@ func TestPumpUsageRecorded(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, none)
 	require.Empty(t, sink.missions(), "usage never reaches a mission")
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	require.Equal(t, []string{id, id}, sink.usages, "the backstop runs for each report that changed the row (#119)")
 }
 
 func TestPumpErrorRouting(t *testing.T) {

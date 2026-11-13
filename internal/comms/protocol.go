@@ -72,7 +72,37 @@ const (
 	// it couldn't.
 	CategoryTrackerComment = "tracker_comment"
 	CategoryTrackerClose   = "tracker_close"
+	// CategoryBudget is a harness over its order's budget (#119): Options
+	// {OptionExtend, OptionStop} and a BudgetContext. The captain alone
+	// answers it. Option 0 extends the budget, and the answer's Budget
+	// carries the new limit; any other option stops the order, which
+	// ends with an error coded budget_exceeded.
+	CategoryBudget = "budget"
 )
+
+// Options of a budget hail, in this order.
+const (
+	OptionExtend = "extend"
+	OptionStop   = "stop"
+)
+
+// BudgetContext is a budget hail's context: the order's usage and limit
+// in tokens (input, cache reads and writes, and output) and in main-loop
+// turns. Used counts the usage recorded on the order's other beams plus
+// the harness's own; a zero limit is unlimited.
+type BudgetContext struct {
+	Used       uint64 `json:"used"`
+	Limit      uint64 `json:"limit"`
+	TurnsUsed  uint64 `json:"turns_used"`
+	TurnsLimit uint64 `json:"turns_limit"`
+}
+
+// BudgetLimit is an order's current limit, as an extended budget hail's
+// answer carries it: tokens and main-loop turns, 0 for unlimited.
+type BudgetLimit struct {
+	Tokens uint64 `json:"tokens"`
+	Turns  uint64 `json:"turns"`
+}
 
 // TrackerCommentContext is a tracker_comment hail's context: the item's
 // ref and the comment.
@@ -388,6 +418,10 @@ type AnswerBody struct {
 	Decision  string `json:"decision"`
 	Option    *int   `json:"option,omitempty"` // index into the hail's options, if one was picked
 	Rationale string `json:"rationale,omitempty"`
+	// Budget is the order's new limit, set only on a budget hail's answer
+	// that extends it (#119). A harness given an extend without it (from
+	// an older bridge) keeps its old limit.
+	Budget *BudgetLimit `json:"budget,omitempty"`
 }
 
 // ConsultBody is a hail plus the context Command cannot see on its own

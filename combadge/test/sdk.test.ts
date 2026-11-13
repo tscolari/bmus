@@ -10,7 +10,7 @@ import type { HookCallbackMatcher, HookInput, Options, PermissionResult, SDKMess
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, beforeEach, describe, expect, inject, it, vi } from "vitest";
-import { Stopped } from "../src/harness/common.js";
+import { BudgetExceeded, Stopped } from "../src/harness/common.js";
 import { checkFailReason, classifyGitPush, gitPushPolicy, GRANT_TTL_MS, RESULT_GRACE_MS, sdkHarness, WIND_DOWN_MS, type PushKind, type QueryFn } from "../src/harness/sdk.js";
 import type { HarnessReport, Inbound, Outbound, Role } from "../src/harness/types.js";
 import { onLines } from "../src/lines.js";
@@ -1227,6 +1227,241 @@ describe("sdk harness usage (#117)", () => {
     run.send({ type: "belay", body: { reason: "wrong repo" } });
     await expect(run.result).rejects.toThrow("belayed: wrong repo");
     expect(run.usages).toEqual([{ input_tokens: 50, output_tokens: 5, turns: 2 }]);
+  });
+});
+
+describe("sdk harness budget (#119)", () => {
+  const ASK = { hookSpecificOutput: expect.objectContaining({ permissionDecision: "ask" }) };
+  /** The budget hail the run emitted at n, its options and context checked. */
+  const budgetHail = async (run: ReturnType<typeof start>, n: number) => {
+    const m = await run.nth(n);
+    if (m.type !== "hail") throw new Error(`message ${n} is ${m.type}, not a hail`);
+    expect(m.body).toMatchObject({ category: "budget", options: ["extend", "stop"] });
+    return m.body;
+  };
+  const answerBudget = (run: ReturnType<typeof start>, ref: string, option: number, budget?: { tokens: number; turns: number }) =>
+    run.send({
+      type: "answer",
+      body: { ref, hail_id: `H-${ref}`, decided_by: "captain", decision: option === 0 ? "extend" : "stop", option, ...(budget && { budget }) },
+    });
+
+  it("hails at the first tool call past a 10-turn budget; extend raises the limit and lets the call through", async () => {
+    const dir = tempDir();
+    const decided: unknown[] = [];
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      for (let i = 1; i <= 10; i++) yield assistant(`m${i}`, { input: 100, output: 10 });
+      expect(await agent.preToolUse("Bash", { command: "make" })).not.toContainEqual(ASK); // turn 10: within the budget
+      yield assistant("m11", { input: 100, output: 10 });
+      expect(await agent.preToolUse("Bash", { command: "make" })).toContainEqual(ASK);
+      decided.push(await agent.canUseTool("Bash", { command: "make" }));
+      expect(await agent.preToolUse("Bash", { command: "make test" })).not.toContainEqual(ASK); // 11 of 20
+      yield resultWith(1100, 110);
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { budget_turns: 10, used_tokens: 500 } });
+    const hail = await budgetHail(run, 0);
+    expect(hail.context).toEqual({ used: 500 + 1100 + 110, limit: 0, turns_used: 11, turns_limit: 10 });
+    answerBudget(run, hail.ref, 0, { tokens: 0, turns: 20 });
+    await run.result;
+    expect(decided).toEqual([{ behavior: "allow", updatedInput: { command: "make" } }]);
+    expect(run.emitted.map((m) => m.type)).toEqual(["hail"]);
+  });
+
+  it("checks tokens too, counting the usage on the order's other beams; under budget nothing is asked", async () => {
+    const dir = tempDir();
+    const asked: boolean[] = [];
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      yield assistant("m1", { input: 400, output: 50 });
+      asked.push((await agent.preToolUse("Read", {})).some((o) => JSON.stringify(o).includes('"ask"')));
+      yield assistant("m2", { input: 100, output: 0 });
+      asked.push((await agent.preToolUse("Read", {})).some((o) => JSON.stringify(o).includes('"ask"')));
+      yield resultWith(500, 50);
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { budget_tokens: 1000, used_tokens: 500 } });
+    await run.result;
+    expect(asked).toEqual([false, true]); // 950, then 1050 of 1000
+  });
+
+  it("an order sent already over budget hails at its first tool call", async () => {
+    const dir = tempDir();
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      expect(await agent.preToolUse("Read", { file_path: "a" })).toContainEqual(ASK);
+      await agent.canUseTool("Read", { file_path: "a" });
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { budget_turns: 10, used_turns: 12 } });
+    const hail = await budgetHail(run, 0);
+    expect(hail.context).toEqual({ used: 0, limit: 0, turns_used: 12, turns_limit: 10 });
+    answerBudget(run, hail.ref, 0, { tokens: 0, turns: 20 });
+    await run.result;
+  });
+
+  it("concurrent calls wait on one budget hail; a question goes on to its own hail after the extension", async () => {
+    const dir = tempDir();
+    const results: unknown[] = [];
+    const question = { questions: [{ question: "Which way?", options: [{ label: "left" }, { label: "right" }] }] };
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      yield assistant("m1", { input: 10, output: 1 });
+      yield assistant("m2", { input: 10, output: 1 });
+      await agent.preToolUse("Read", { file_path: "a" }, "/nonexistent", { tool_use_id: "a" });
+      await agent.preToolUse("Read", { file_path: "b" }, "/nonexistent", { tool_use_id: "b" });
+      await agent.preToolUse("AskUserQuestion", question, "/nonexistent", { tool_use_id: "q" });
+      results.push(...(await Promise.all([agent.hold("Read", { file_path: "a" }, "a"), agent.hold("Read", { file_path: "b" }, "b"), agent.hold("AskUserQuestion", question, "q")])));
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { budget_turns: 1 } });
+    const hail = await budgetHail(run, 0);
+    answerBudget(run, hail.ref, 0, { tokens: 0, turns: 2 });
+    const q = await run.nth(1);
+    expect(q).toMatchObject({ type: "hail", body: { category: "clarifying_question", question: "Which way?" } });
+    run.answer((q.body as { ref: string }).ref, "left", 0);
+    await run.result;
+    expect(results).toEqual([
+      { behavior: "allow", updatedInput: { file_path: "a" } },
+      { behavior: "allow", updatedInput: { file_path: "b" } },
+      { behavior: "allow", updatedInput: { ...question, answers: { "Which way?": "left" } } },
+    ]);
+    expect(run.emitted).toHaveLength(2);
+  });
+
+  it("checks a turn whose hook request comes before the harness has taken its message", async () => {
+    const dir = tempDir();
+    let asked: unknown[] = [];
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      yield assistant("m1", { input: 10, output: 1 });
+      // The hook starts before the consumer takes m2: it waits for pending messages first.
+      const hook = agent.preToolUse("Read", {});
+      yield assistant("m2", { input: 10, output: 1 });
+      asked = await hook;
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { budget_turns: 1 } });
+    await run.result;
+    expect(asked).toContainEqual(ASK);
+  });
+
+  it("waits for an outstanding hail before raising the budget hail", async () => {
+    const dir = tempDir();
+    const question = { questions: [{ question: "Which way?", options: [{ label: "left" }, { label: "right" }] }] };
+    const results: unknown[] = [];
+    let entered!: () => void;
+    const gated = new Promise<void>((r) => (entered = r));
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      yield assistant("m1", { input: 10, output: 1 });
+      const asking = agent.hold("AskUserQuestion", question, "q"); // under budget: its own hail
+      yield assistant("m2", { input: 10, output: 1 }); // now over
+      await agent.preToolUse("Bash", { command: "make" }, "/nonexistent", { tool_use_id: "b" });
+      const making = agent.hold("Bash", { command: "make" }, "b");
+      entered();
+      results.push(...(await Promise.all([asking, making])));
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { budget_turns: 1 } });
+    const q = await run.nth(0);
+    expect(q).toMatchObject({ type: "hail", body: { category: "clarifying_question" } });
+    await gated;
+    await new Promise<void>((r) => setImmediate(r));
+    expect(run.emitted).toHaveLength(1); // the budget hail waits for the question's answer
+    run.answer((q.body as { ref: string }).ref, "left", 0);
+    const hail = await budgetHail(run, 1);
+    answerBudget(run, hail.ref, 0, { tokens: 0, turns: 5 });
+    await run.result;
+    expect(results).toEqual([
+      { behavior: "allow", updatedInput: { ...question, answers: { "Which way?": "left" } } },
+      { behavior: "allow", updatedInput: { command: "make" } },
+    ]);
+  });
+
+  it("parks a later hail once the budget is extended", async () => {
+    const dir = tempDir();
+    const run = start(async function* (agent) {
+      if (agent.options.resume !== undefined) {
+        await agent.nextInput();
+        yield success;
+        return;
+      }
+      await agent.nextInput();
+      yield init;
+      yield assistant("m1", { input: 10, output: 1 });
+      yield assistant("m2", { input: 10, output: 1 });
+      await agent.preToolUse("Read", {}, "/nonexistent", { tool_use_id: "r" });
+      await agent.hold("Read", {}, "r");
+      await agent.postToolUse("Read", {}, "r"); // the allowed call ran: nothing holds off a park
+      void agent.hold("Bash", { command: "make deploy" }, "d"); // under the new limit: a tool_approval, parked
+      await agent.aborted();
+      throw new Error("Claude Code process aborted by user");
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { budget_turns: 1 }, hailParkAfterMs: 50 });
+    const hail = await budgetHail(run, 0);
+    answerBudget(run, hail.ref, 0, { tokens: 0, turns: 10 });
+    const deploy = await run.nth(1);
+    expect(deploy).toMatchObject({ type: "hail", body: { category: "tool_approval" } });
+    await run.query(0).then((a) => a.aborted()); // parked
+    run.answer((deploy.body as { ref: string }).ref, "allow", 0);
+    await run.query(1);
+    await run.result;
+    expect(run.queries).toHaveLength(2);
+  });
+
+  it("stop denies the call, asks for a handover, and ends the run budget_exceeded after an ordinary checkpoint", async () => {
+    const dir = tempDir();
+    const repo = gitRepo(dir);
+    const transcript = path.join(dir, "t.jsonl");
+    fs.writeFileSync(transcript, "{}\n");
+    let denied: PermissionResult | null | undefined;
+    let request: string | undefined;
+    let handover: unknown[] = [];
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      yield assistant("m1", { input: 10, output: 1 });
+      yield assistant("m2", { input: 10, output: 1 });
+      expect(await agent.preToolUse("Bash", { command: "make" }, transcript)).toContainEqual(ASK);
+      denied = await agent.canUseTool("Bash", { command: "make" });
+      request = await agent.nextInput();
+      // A stop is under way: the handover isn't held.
+      handover = await agent.preToolUse("mcp__combadge__request_handover", { note: "x" }, transcript);
+      const res = await agent.callTool("request_handover", { note: "stopped at the budget" });
+      expect(res.isError).toBeUndefined();
+      yield success;
+    }, { dir, repo, claudePath: fakeClaude(dir), body: { budget_turns: 1 } });
+    const hail = await budgetHail(run, 0);
+    answerBudget(run, hail.ref, 1);
+    const err: unknown = await run.result.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(BudgetExceeded);
+    expect((err as BudgetExceeded).code).toBe("budget_exceeded");
+    expect((err as BudgetExceeded).message).toBe(`budget exceeded: the captain stopped ${ORDER} at 22 tokens and 2 turns of 1`);
+    expect(denied).toMatchObject({ behavior: "deny", message: expect.stringMatching(/^The captain stopped this order: it is over its budget\./) });
+    expect(request).toMatch(/^The captain stopped this order: it is over its budget\. .*mcp__combadge__request_handover/);
+    expect(handover).not.toContainEqual(ASK);
+    const cp = run.emitted[1];
+    expect(cp).toMatchObject({ type: "checkpoint_ready" });
+    expect(cp?.type === "checkpoint_ready" && cp.body.stopping).toBeUndefined();
+    expect(fs.readFileSync(path.join(dir, "work", ORDER, "1", "handover.md"), "utf8")).toBe("stopped at the budget\n");
+    expect(run.options().abortController?.signal.aborted).toBe(true);
+  });
+
+  it("a stop with no checkpoint in time gets the harness's own, and still ends budget_exceeded", async () => {
+    const dir = tempDir();
+    const repo = gitRepo(dir);
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      yield assistant("m1", { input: 10, output: 1 });
+      await agent.preToolUse("Bash", { command: "make" });
+      await agent.canUseTool("Bash", { command: "make" });
+      await agent.aborted();
+    }, { dir, repo, claudePath: fakeClaude(dir), body: { budget_tokens: 5 }, stopTimeoutMs: 50 });
+    const hail = await budgetHail(run, 0);
+    expect(hail.context).toEqual({ used: 11, limit: 5, turns_used: 1, turns_limit: 0 });
+    answerBudget(run, hail.ref, 1);
+    await expect(run.result).rejects.toBeInstanceOf(BudgetExceeded);
+    expect(run.emitted[1]).toMatchObject({ type: "checkpoint_ready", body: { handover_path: path.join(dir, "work", ORDER, "1", "handover.md") } });
+    expect(fs.readFileSync(path.join(dir, "work", ORDER, "1", "handover.md"), "utf8")).toMatch(/budget exceeded/);
   });
 });
 

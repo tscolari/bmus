@@ -84,7 +84,7 @@ type Link interface {
 // Sink receives what the pump forwards out of comms. The bridge implements it
 // with dbos.Send.
 //
-// ToMission, ToHail, CrewError and CrewHello are called inside the store transaction that
+// ToMission, ToHail, CrewError, CrewHello and UsageRecorded are called inside the store transaction that
 // records the message in the inbox, and get that transaction: an
 // implementation that writes on tx (dbos.WithSendTransaction) commits
 // atomically with the inbox row, so a crash can neither lose the message (it
@@ -107,6 +107,10 @@ type Sink interface {
 	// serve sends one on every attach, so it comes again after each
 	// reconnect (#173).
 	CrewHello(ctx context.Context, tx *sql.Tx, msg Message) error
+	// UsageRecorded runs in the inbox transaction of a usage report that
+	// changed order's usage row (#119): the bridge's budget backstop. It
+	// gets the transaction to read and write in.
+	UsageRecorded(ctx context.Context, tx store.InboxTx, order string) error
 	// HeartbeatMissed tells the crew member's tour that heartbeats stopped
 	// and the beam failed its probe. The pump calls it at most once.
 	HeartbeatMissed(ctx context.Context) error
@@ -766,7 +770,10 @@ func (p *Pump) dispatch(ctx context.Context, tx store.InboxTx, msg Message) erro
 		}
 		p.log.Debug("comms: usage", "seq", msg.Seq, "order", msg.Order, "input_tokens", b.InputTokens,
 			"output_tokens", b.OutputTokens, "turns", b.Turns, "recorded", ok)
-		return nil
+		if !ok {
+			return nil
+		}
+		return p.cfg.Sink.UsageRecorded(ctx, tx, msg.Order)
 	case TypeHail, TypeCheckpointReady, TypeReport:
 		if msg.Order == "" {
 			p.log.Error("comms: dropping order message without an order", "type", msg.Type, "seq", msg.Seq)

@@ -31,7 +31,8 @@ func tableColumns(t *testing.T, db *sql.DB, table string) map[string]string {
 // A database made with the schema from before #111
 // (testdata/schema-before-111.sql, schema.sql as it was) opens, keeps its
 // rows, and gains the beams and orders columns and the order_usage,
-// order_egress and backups tables, the same as a new database has them.
+// order_egress, backups and budget_extensions (#119) tables, the same as
+// a new database has them.
 // Opening it again changes nothing.
 func TestOpenAddsPhase4Schema(t *testing.T) {
 	t.Parallel()
@@ -54,7 +55,7 @@ func TestOpenAddsPhase4Schema(t *testing.T) {
 	for range 2 {
 		s, err := Open(ctx, path)
 		require.NoError(t, err)
-		for _, table := range []string{"beams", "orders", "order_usage", "order_egress", "backups"} {
+		for _, table := range []string{"beams", "orders", "order_usage", "order_egress", "backups", "budget_extensions"} {
 			require.Equal(t, tableColumns(t, fresh.db, table), tableColumns(t, s.db, table), table)
 		}
 

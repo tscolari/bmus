@@ -148,10 +148,10 @@
       "required": ["ref", "category", "question"],
       "properties": {
         "ref": {"description": "Combadge-local hail id, echoed back in the answer.", "type": "string", "minLength": 1},
-        "category": {"description": "Hail category: clarifying_question, tool_approval, order_split (Command splitting its order into child orders, #155), tracker_comment or tracker_close (a request to comment on or close a tracker item, #54); open so later categories (scope_change, destructive, egress, ...) fit.", "type": "string", "minLength": 1},
+        "category": {"description": "Hail category: clarifying_question, tool_approval, order_split (Command splitting its order into child orders, #155), tracker_comment or tracker_close (a request to comment on or close a tracker item, #54), budget (the harness is over its order's budget, #119); open so later categories (scope_change, destructive, egress, ...) fit.", "type": "string", "minLength": 1},
         "question": {"type": "string", "minLength": 1},
         "options": {"description": "Choices offered to the decider; absent or empty means free-text answer.", "type": "array", "items": {"type": "string"}},
-        "context": {"description": "Free-form context (files, diff stat, tool input...). The only open object in the protocol, except for an order_split hail's (order_split_context) and a tracker request's (tracker_comment_context, tracker_close_context).", "type": "object"}
+        "context": {"description": "Free-form context (files, diff stat, tool input...). The only open object in the protocol, except for an order_split hail's (order_split_context), a tracker request's (tracker_comment_context, tracker_close_context) and a budget hail's (budget_context).", "type": "object"}
       },
       "allOf": [
         {
@@ -165,8 +165,24 @@
         {
           "if": {"required": ["category"], "properties": {"category": {"const": "tracker_close"}}},
           "then": {"required": ["options", "context"], "properties": {"options": {"const": ["allow", "deny"]}, "context": {"$ref": "#/$defs/tracker_close_context"}}}
+        },
+        {
+          "if": {"required": ["category"], "properties": {"category": {"const": "budget"}}},
+          "then": {"required": ["options", "context"], "properties": {"options": {"const": ["extend", "stop"]}, "context": {"$ref": "#/$defs/budget_context"}}}
         }
       ]
+    },
+    "budget_context": {
+      "description": "A budget hail's context (#119): the order's usage and limit in tokens (input, cache reads and writes, and output) and in main-loop turns. Used counts the usage recorded on the order's other beams plus the harness's own; a zero limit is unlimited. The bridge writes the hail's question from it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["used", "limit", "turns_used", "turns_limit"],
+      "properties": {
+        "used": {"type": "integer", "minimum": 0},
+        "limit": {"type": "integer", "minimum": 0},
+        "turns_used": {"type": "integer", "minimum": 0},
+        "turns_limit": {"type": "integer", "minimum": 0}
+      }
     },
     "tracker_comment_context": {
       "description": "A tracker_comment hail's context (#54): the item to comment on and the comment. The bridge checks it again and runs an allowed request with its own credentials.",
@@ -350,7 +366,17 @@
         "decided_by": {"enum": ["policy", "command", "captain"]},
         "decision": {"description": "The answer text (the chosen option's text when one was picked).", "type": "string"},
         "option": {"description": "Index into the hail's options, when one was picked.", "type": "integer", "minimum": 0},
-        "rationale": {"type": "string"}
+        "rationale": {"type": "string"},
+        "budget": {
+          "description": "The order's new limit, on a budget hail's answer that extends it (#119): tokens and main-loop turns, 0 for unlimited. A harness given an extend without it (from an older bridge) keeps its old limit.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tokens", "turns"],
+          "properties": {
+            "tokens": {"type": "integer", "minimum": 0},
+            "turns": {"type": "integer", "minimum": 0}
+          }
+        }
       }
     },
     "consult": {

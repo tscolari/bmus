@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
 	"github.com/tscolari/bmus/internal/store"
 )
@@ -76,6 +77,8 @@ func neverAutoAnswered() []tableCase {
 	for _, cat := range []string{"order_split", "tracker_create", "tracker_close", "tracker_comment"} {
 		captain(cat, Hail{Category: cat, Question: "Go ahead?", Options: []string{"approve", "reject"}})
 	}
+	// Fixed to the captain whatever regs.yaml says (#119): no config lists it.
+	captain("budget", Hail{Category: CategoryBudget, Question: "Extend or stop?", Options: []string{"extend", "stop"}})
 
 	// The tags, through every spelling found.
 	for _, c := range [][2]string{
@@ -674,6 +677,42 @@ func TestNeverAutoAnswered(t *testing.T) {
 			require.True(t, fired[want], "%s: no case exercises %s", name, want)
 		}
 	}
+}
+
+// A budget hail (#119) is the captain's whatever regs.yaml says: with no
+// rule for it, with a captain_only rule for it dropped or added, under an
+// auto_allow that allows any command, and unchecked. auto_allow can't name
+// it, and no answer passes CheckAnswer.
+func TestBudgetFixedToCaptain(t *testing.T) {
+	t.Parallel()
+	h := Hail{Category: CategoryBudget, Question: "ORD-0001 has used 1.2M of 1M tokens. Extend by its budget again, or stop?",
+		Options: []string{"extend", "stop"}}
+	const why = "category budget is fixed to the captain"
+	docs := map[string]string{
+		"listed":     "captain_only:\n  - category: budget\n",
+		"dropped":    "captain_only:\n  - category: order_split\n",
+		"none":       "",
+		"permissive": "classify:\n  - {tag: any, match: '.'}\nauto_allow:\n  - tag: any\n  - match: '.*'\ncommand_may_answer:\n  min_confidence: 0\n",
+	}
+	for name, doc := range docs {
+		c := load(t, writeRegs(t, doc))
+		route, _, rule := c.Classify(h)
+		require.Equal(t, RouteCaptain, route, name)
+		require.Equal(t, why, rule, name)
+		for _, opt := range []int{0, 1} {
+			ok, reason := c.CheckAnswer(h, Reply{Decision: DecisionAnswer, Option: intp(opt), Confidence: 1})
+			require.False(t, ok, name)
+			require.Equal(t, "captain-only hail: "+why, reason, name)
+		}
+	}
+	route, _, rule := Config{}.Classify(h)
+	require.Equal(t, [2]string{RouteCaptain, why}, [2]string{route, rule}, "unchecked")
+	require.Equal(t, why, CaptainFixed(CategoryBudget))
+	require.Empty(t, CaptainFixed(CategoryToolApproval))
+
+	var c Config
+	require.NoError(t, yaml.Unmarshal([]byte("auto_allow:\n  - {category: budget, match: '.*'}\n"), &c))
+	require.ErrorContains(t, CheckRegs(&c), `auto_allow[0]: category "budget": only tool_approval hails are auto-allowed`)
 }
 
 // The default lists what #148 requires under captain_only.
