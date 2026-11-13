@@ -744,6 +744,17 @@ func (p *Pump) dispatch(ctx context.Context, tx store.InboxTx, msg Message) erro
 			Text: b.Note, Payload: payload,
 		})
 		return err
+	case TypeUsage:
+		// Recorded in the inbox and acked; nothing reads it yet (#118
+		// records it per order and beam).
+		var b UsageBody
+		if err := json.Unmarshal(msg.Body, &b); err != nil {
+			p.log.Warn("comms: dropping usage with a bad body", "seq", msg.Seq, "err", err)
+			return nil
+		}
+		p.log.Debug("comms: usage", "seq", msg.Seq, "order", msg.Order, "input_tokens", b.InputTokens,
+			"output_tokens", b.OutputTokens, "turns", b.Turns)
+		return nil
 	case TypeHail, TypeCheckpointReady, TypeReport:
 		if msg.Order == "" {
 			p.log.Error("comms: dropping order message without an order", "type", msg.Type, "seq", msg.Seq)

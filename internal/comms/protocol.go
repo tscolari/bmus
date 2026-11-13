@@ -25,6 +25,7 @@ const (
 	TypeHello           = "hello"
 	TypeHeartbeat       = "heartbeat"
 	TypeProgress        = "progress"
+	TypeUsage           = "usage"
 	TypeHail            = "hail"
 	TypeCheckpointReady = "checkpoint_ready"
 	TypeReport          = "report"
@@ -136,6 +137,7 @@ var bodyTypes = map[string]reflect.Type{
 	TypeHello:           reflect.TypeFor[HelloBody](),
 	TypeHeartbeat:       reflect.TypeFor[HeartbeatBody](),
 	TypeProgress:        reflect.TypeFor[ProgressBody](),
+	TypeUsage:           reflect.TypeFor[UsageBody](),
 	TypeHail:            reflect.TypeFor[HailBody](),
 	TypeCheckpointReady: reflect.TypeFor[CheckpointReadyBody](),
 	TypeReport:          reflect.TypeFor[ReportBody](),
@@ -210,6 +212,19 @@ type HeartbeatBody struct {
 type ProgressBody struct {
 	Pct  float64 `json:"pct"` // 0-100
 	Note string  `json:"note"`
+}
+
+// UsageBody is the running usage of an order on this beam (#117),
+// cumulative over every run and query of the order on this beam, combadge
+// restarts included. InputTokens counts cache reads and writes. Turns
+// counts main-loop turns only. Counts never decrease, and the latest report
+// for (order, beam) is the one with the highest envelope Seq, which is
+// monotonic across combadge restarts. The harness sends one every 10 turns
+// and at every checkpoint, stop and report.
+type UsageBody struct {
+	InputTokens  uint64 `json:"input_tokens"`
+	OutputTokens uint64 `json:"output_tokens"`
+	Turns        uint64 `json:"turns"`
 }
 
 // HailBody is a question or permission request the agent is blocked on.

@@ -6,7 +6,7 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { holodeckHarness, loadScript, parseScript, validateScript } from "../src/harness/holodeck.js";
-import type { Inbound } from "../src/harness/types.js";
+import type { Inbound, Outbound } from "../src/harness/types.js";
 import { onLines } from "../src/lines.js";
 import type { BeamToBridgeMessage, ConsultBody, OrderBody } from "../src/protocol.js";
 import { git, orderBundle } from "./gitfix.js";
@@ -239,6 +239,37 @@ describe("holodeck harness", () => {
     await b.close();
   });
 
+  it("keeps a stopped order's usage in state.json across a restart and hands it to its next run (#117)", async () => {
+    const dir = tempDir();
+    const script = path.join(dir, "usage-pause.json");
+    fs.writeFileSync(script, JSON.stringify([
+      { at_pct: 10, usage: { input_tokens: 700, output_tokens: 60, turns: 5 } },
+      { at_pct: 50, sleep_ms: 60_000 },
+      { at_pct: 100, report: { summary: "done" } },
+    ]));
+    const serve = await startServe(dir, 60_000, holodeck(script, dir));
+    const a = new Attach(dir, 0);
+    a.send({ seq: 1, order: ORDER, type: "order", body: orderBody });
+    expect(await a.next(ofOrder)).toMatchObject({ type: "usage", body: { input_tokens: 700, output_tokens: 60, turns: 5 } });
+    a.send({ seq: 2, order: ORDER, type: "stand_down", body: {} });
+    expect(await a.next(ofOrder)).toMatchObject({ type: "checkpoint_ready", body: { stopping: true } });
+    const readState = () => JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8")) as { usage: Record<string, unknown> };
+    expect(readState().usage).toEqual({ [ORDER]: { input_tokens: 700, output_tokens: 60, turns: 5 } });
+    await a.close();
+    serve.kill("SIGKILL");
+    await exited(serve);
+
+    // The resent order's run starts from the kept counts: a script with no usage step reports them.
+    const plain = path.join(dir, "plain.json");
+    fs.writeFileSync(plain, JSON.stringify([{ at_pct: 100, report: { summary: "done" } }]));
+    await startServe(dir, 60_000, holodeck(plain, dir));
+    const b = new Attach(dir, 0);
+    b.send({ seq: 3, order: ORDER, type: "order", body: orderBody });
+    expect(await b.next(ofType("report"))).toMatchObject({ body: { usage: { input_tokens: 700, output_tokens: 60 } } });
+    await vi.waitFor(() => expect(readState().usage).toEqual({})); // a completed order's usage is dropped
+    await b.close();
+  });
+
   it("after a stand_down, an order command for the same id runs again on a fresh checkout from the new in/ bundle", async () => {
     const dir = tempDir();
     const script = path.join(dir, "long.json");
@@ -394,6 +425,10 @@ describe("validateScript", () => {
     ["hail no question", [{ at_pct: 0, hail: { category: "c" } }, report], "step 0: hail.question must be a non-empty string"],
     ["hail bad options", [{ at_pct: 0, hail: { category: "c", question: "q", options: [1] } }, report], "step 0: hail.options must be an array of strings"],
     ["hail bad context", [{ at_pct: 0, hail: { category: "c", question: "q", context: [] } }, report], "step 0: hail.context must be an object"],
+    ["usage not an object", [{ at_pct: 0, usage: 5 }, report], "step 0: usage must be an object"],
+    ["usage unknown key", [{ at_pct: 0, usage: { input_tokens: 1, output_tokens: 1, turns: 1, seq: 1 } }, report], "step 0: unknown usage key seq"],
+    ["usage without turns", [{ at_pct: 0, usage: { input_tokens: 1, output_tokens: 1 } }, report], "step 0: usage.turns must be a non-negative integer"],
+    ["usage negative tokens", [{ at_pct: 0, usage: { input_tokens: -1, output_tokens: 1, turns: 1 } }, report], "step 0: usage.input_tokens must be a non-negative integer"],
     ["report unknown key", [{ at_pct: 100, report: { summary: "x", usage: {} } }], "step 0: unknown report key usage"],
     ["report with branch", [{ at_pct: 100, report: { summary: "x", branch: "b" } }], "step 0: unknown report key branch"],
     ["report no summary", [{ at_pct: 100, report: {} }], "step 0: report.summary must be a string"],
@@ -420,6 +455,32 @@ describe("holodeck run (in process)", () => {
       [ORDER, "model-x", "pick up here"], [ORDER, "model-x", "pick up here"],
       ["ORD-0002", undefined, undefined], ["ORD-0002", undefined, undefined],
     ]);
+  });
+
+  it("emits a usage step's counts, and reports the run's latest tokens, else the order's earlier ones (#117)", async () => {
+    const dir = tempDir();
+    const script = path.join(dir, "usage.json");
+    fs.writeFileSync(script, JSON.stringify([
+      { at_pct: 10, usage: { input_tokens: 100, output_tokens: 20, turns: 1 } },
+      { at_pct: 50, usage: { input_tokens: 900, output_tokens: 70, turns: 3 } },
+      { at_pct: 100, report: { summary: "done" } },
+    ]));
+    const h = holodeckHarness({ script, stepLog: path.join(dir, "steps.ndjson"), workDir: path.join(dir, "work") });
+    const emitted: Outbound[] = [];
+    const first = await h.run({ id: ORDER, body: orderBody, repos: [] }, (m) => emitted.push(m), () => {});
+    expect(emitted).toEqual([
+      { type: "usage", body: { input_tokens: 100, output_tokens: 20, turns: 1 } },
+      { type: "usage", body: { input_tokens: 900, output_tokens: 70, turns: 3 } },
+    ]);
+    expect(first.usage).toEqual({ input_tokens: 900, output_tokens: 70 });
+    expect(stepLog(dir).map((e) => e.action)).toEqual(["usage", "usage", "report"]);
+
+    const plain = path.join(dir, "plain.json");
+    fs.writeFileSync(plain, JSON.stringify([{ at_pct: 100, report: { summary: "done" } }]));
+    const p = holodeckHarness({ script: plain, workDir: path.join(dir, "work") });
+    const usage = { input_tokens: 5, output_tokens: 1, turns: 1 };
+    expect((await p.run({ id: ORDER, body: orderBody, repos: [], usage }, () => {}, () => {})).usage).toEqual({ input_tokens: 5, output_tokens: 1 });
+    expect((await p.run({ id: ORDER, body: orderBody, repos: [] }, () => {}, () => {})).usage).toEqual({ input_tokens: 0, output_tokens: 0 });
   });
 
   it("records each repo's checkout dir in the step log", async () => {
