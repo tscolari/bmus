@@ -21,7 +21,7 @@ A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026
 - [x] Lose a beam and the crew member lands in sickbay with a checkpoint
 - [x] Run the whole ship locally on holodeck beams
 
-### Phase 2: fleet and console ([#55](https://github.com/tscolari/bmus/issues/55))
+### Phase 2: fleet and console ([#2](https://github.com/tscolari/bmus/issues/2))
 
 - [x] Define divisions and their default harness and model in a roster
 - [x] Pool orders by division, with priorities, claimed under standing orders
@@ -34,7 +34,7 @@ A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026
 - [x] Hold work through a `tsh` login expiry and resume after `tsh login`
 - [x] Run the ship from a web console with live updates and hail notifications
 
-### Phase 3: chain of command ([#56](https://github.com/tscolari/bmus/issues/56))
+### Phase 3: chain of command ([#3](https://github.com/tscolari/bmus/issues/3))
 
 - [x] Set which hails are auto-allowed, go to Command or stay with the captain in `regs.yaml`
 - [x] Command answers routed hails for you, steered by your guidance
@@ -42,16 +42,18 @@ A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026
 - [x] Command splits an order into child orders once you approve
 - [x] Park a hail for long waits and resume the session on the answer
 - [x] Measure the auto-resolved share, captain overrides and time-to-answer
-- [x] Read orders from an issue tracker, GitHub Issues first ([#54](https://github.com/tscolari/bmus/issues/54))
+- [x] Read orders from an issue tracker, GitHub Issues first ([#33](https://github.com/tscolari/bmus/issues/33))
 
-### Phase 4: hardening
+### Phase 4: hardening ([#109](https://github.com/tscolari/bmus/issues/109))
 
-- [ ] Native API transporter with restricted egress and egress hails
-- [ ] Reconcile the ship's records with the beams that exist
-- [ ] Token and turn budgets per order
-- [ ] Hardened console
-- [ ] Nightly backups
-- [ ] Scoped permissions per division
+- [ ] Create beams through the Beams API, with restricted egress per division
+- [ ] Grant a crew member's beam an extra domain through an egress hail
+- [ ] Reap orphan beams and catch lost ones with a reconcile pass
+- [ ] Cap an order's tokens and turns, and extend or stop it when it runs over
+- [ ] Hardened console: CSRF on every request, one-time launch codes, session expiry, rate limits
+- [ ] Nightly backups, and an offline restore
+- [ ] Survive a chaos run of beam loss, sleep, login expiry and crashes with zero lost orders
+- [ ] Scoped permissions per division, once Beams supports them
 
 ### Phase 5: drawing board
 
