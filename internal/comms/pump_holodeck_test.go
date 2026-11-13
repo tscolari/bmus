@@ -517,6 +517,10 @@ func TestPumpHolodeckUsage(t *testing.T) {
 	t.Parallel()
 	b := startHolodeckBeamScript(t, "usage.json")
 	st := b.openStore(t)
+	id, err := st.InsertOrder(t.Context(), store.Order{Title: "holodeck", Assignee: "crew-1"},
+		store.LogEntry{Kind: "order", Text: "order created: holodeck"})
+	require.NoError(t, err)
+	require.Equal(t, "ORD-0001", id)
 	logger, records := newRecordingLogger()
 	link, sink := b.link(), &fakeSink{}
 	cfg := holodeckPumpConfig(st, link, sink)
@@ -526,7 +530,7 @@ func TestPumpHolodeckUsage(t *testing.T) {
 
 	order, err := NewMessage(TypeOrder, OrderBody{Title: "holodeck", Body: "count it"})
 	require.NoError(t, err)
-	order.Order = "ORD-0001"
+	order.Order = id
 	_, err = p.Send(order)
 	require.NoError(t, err)
 
@@ -579,11 +583,19 @@ func TestPumpHolodeckUsage(t *testing.T) {
 		require.True(t, seen, "usage seq %d not recorded", seq)
 	}
 
+	// The latest report is the order's usage on this beam (#118).
+	rows, err := st.OrderUsage(t.Context(), "ORD-0001")
+	require.NoError(t, err)
+	require.Equal(t, []store.Usage{{Beam: "holodeck", InputTokens: 5400, OutputTokens: 910, Turns: 10, Seq: usageSeqs[1]}}, rows)
+
 	require.Len(t, sink.missions(), 1, "usage never reaches a mission")
 	require.Empty(t, sink.errors())
 	entries, err := st.ListLog(t.Context(), 0)
 	require.NoError(t, err)
-	require.Len(t, entries, 1, "only the progress step is logged")
-	require.Equal(t, "surveying the codebase", entries[0].Text)
+	var texts []string
+	for _, e := range entries {
+		texts = append(texts, e.Text)
+	}
+	require.Equal(t, []string{"order created: holodeck", "surveying the codebase"}, texts, "only the progress step is logged")
 	requireInboxContiguous(t, st, b.dbPath, p)
 }

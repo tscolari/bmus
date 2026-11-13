@@ -41,10 +41,27 @@ type RosterConfig struct {
 // DivisionConfig is a division's defaults for its crew members (#59): a
 // crew member's own harness or model overrides them, and an order's model
 // overrides both (resolveHarness, resolveModel). Harness is empty or one of
-// Harnesses.
+// Harnesses. Budget is the default budget of the division's orders: an
+// order's own value overrides it (resolveBudget).
 type DivisionConfig struct {
 	Harness string `yaml:"harness"`
 	Model   string `yaml:"model"`
+	Budget  Budget `yaml:"budget"`
+}
+
+// Budget caps what an order may spend (spec/phase-4-plan-2026-11-12.md
+// section 6): tokens (input, cache reads and writes included, and output)
+// and main-loop turns. Zero means unlimited.
+type Budget struct {
+	Tokens int64 `yaml:"tokens" json:"tokens"`
+	Turns  int64 `yaml:"turns" json:"turns"`
+}
+
+// BudgetSource says where each of a resolved budget's fields comes from:
+// SourceOrder, SourceDivision or SourceDefault (none, unlimited).
+type BudgetSource struct {
+	Tokens string `json:"tokens"`
+	Turns  string `json:"turns"`
 }
 
 // TransporterLimits pace beam creation and cap the beams the bridge holds.
@@ -90,7 +107,8 @@ func LoadRoster(path string) (RosterConfig, error) {
 }
 
 // CheckRoster validates r and fills in its defaults: each division name
-// must match divisionNameRE and its harness be empty or one of Harnesses,
+// must match divisionNameRE, its harness be empty or one of Harnesses and
+// its budget not negative,
 // the limits must not be negative, and a zero limit takes its default.
 func CheckRoster(r *RosterConfig) error {
 	for _, name := range slices.Sorted(maps.Keys(r.Divisions)) {
@@ -99,6 +117,9 @@ func CheckRoster(r *RosterConfig) error {
 		}
 		if h := r.Divisions[name].Harness; h != "" && !slices.Contains(Harnesses, h) {
 			return fmt.Errorf("division %s: unknown harness %q (want one of %s)", name, h, strings.Join(Harnesses, ", "))
+		}
+		if b := r.Divisions[name].Budget; b.Tokens < 0 || b.Turns < 0 {
+			return fmt.Errorf("division %s: budget tokens and turns must not be negative", name)
 		}
 	}
 	t := &r.Transporter
@@ -138,10 +159,10 @@ func (d *Daemon) checkDivision(division string) error {
 // Where a crew member's harness or an order's model comes from
 // (CrewView.HarnessSource and ModelSource, resolveHarness, resolveModel).
 const (
-	SourceOrder    = "order"    // the order's own model
+	SourceOrder    = "order"    // the order's own model or budget
 	SourceCrew     = "crew"     // the crew member's own setting
-	SourceDivision = "division" // the crew member's division's default
-	SourceDefault  = "default"  // none: serve's default harness (sdk), the harness's default model
+	SourceDivision = "division" // the crew member's (for a budget, the order's) division's default
+	SourceDefault  = "default"  // none: serve's default harness (sdk), the harness's default model, no budget
 )
 
 // resolveHarness is the harness crew member c's beams run (#59): c's own,
@@ -173,6 +194,51 @@ func (d *Daemon) resolveModel(o store.Order, c store.Crew) (model, source string
 		return m, SourceDivision
 	}
 	return "", SourceDefault
+}
+
+// resolveBudget is order o's budget when crew member c takes it (#118),
+// each field on its own: the order's own value, else its division's
+// default, else 0 (unlimited), with where each came from. The division is
+// the order's, else c's for an order with none (a directed order). A split
+// child or any other order created without a budget so takes its
+// division's. budget_extended is not applied here (remainingBudget).
+func (d *Daemon) resolveBudget(o store.Order, c store.Crew) (Budget, BudgetSource) {
+	div := d.divisions[cmp.Or(o.Division, c.Division)].Budget
+	pick := func(own, def int64) (int64, string) {
+		switch {
+		case own > 0:
+			return own, SourceOrder
+		case def > 0:
+			return def, SourceDivision
+		}
+		return 0, SourceDefault
+	}
+	var b Budget
+	var src BudgetSource
+	b.Tokens, src.Tokens = pick(o.BudgetTokens, div.Tokens)
+	b.Turns, src.Turns = pick(o.BudgetTurns, div.Turns)
+	return b, src
+}
+
+// remainingBudget is what order o may still spend under budget b, for the
+// order command (#118): each limited field of b times 1 + o.BudgetExtended,
+// less usage summed over every beam's row. An unlimited field stays 0. A
+// limited field with nothing left is 1, the smallest value that still
+// reads as a limit, since 0 means unlimited on the wire: the harness's
+// first budget check (#119) then finds it spent.
+func remainingBudget(o store.Order, b Budget, usage []store.Usage) Budget {
+	var tokens, turns int64
+	for _, u := range usage {
+		tokens += u.InputTokens + u.OutputTokens
+		turns += u.Turns
+	}
+	left := func(limit, used int64) int64 {
+		if limit <= 0 {
+			return 0
+		}
+		return max(limit*(1+max(o.BudgetExtended, 0))-used, 1)
+	}
+	return Budget{Tokens: left(b.Tokens, tokens), Turns: left(b.Turns, turns)}
 }
 
 // checkHarness fails with a bad request when this bridge can't run crew

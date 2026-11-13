@@ -444,16 +444,17 @@ describe("validateScript", () => {
 });
 
 describe("holodeck run (in process)", () => {
-  it("records the order's model and handover in the step log, and nothing without them", async () => {
+  it("records the order's model, handover and budget in the step log, and nothing without them", async () => {
     const dir = tempDir();
     const script = path.join(dir, "short.json");
     fs.writeFileSync(script, JSON.stringify([{ at_pct: 10, progress: "p" }, { at_pct: 100, report: { summary: "done" } }]));
     const h = holodeckHarness({ script, stepLog: path.join(dir, "steps.ndjson"), workDir: path.join(dir, "work") });
-    await h.run({ id: ORDER, body: { ...orderBody, model: "model-x", handover: "pick up here" }, repos: [] }, () => {}, () => {});
+    const body = { ...orderBody, model: "model-x", handover: "pick up here", budget_tokens: 6500, budget_turns: 42 };
+    await h.run({ id: ORDER, body, repos: [] }, () => {}, () => {});
     await h.run({ id: "ORD-0002", body: orderBody, repos: [] }, () => {}, () => {});
-    expect(stepLog(dir).map((e) => [e.order, e.model, e.handover])).toEqual([
-      [ORDER, "model-x", "pick up here"], [ORDER, "model-x", "pick up here"],
-      ["ORD-0002", undefined, undefined], ["ORD-0002", undefined, undefined],
+    expect(stepLog(dir).map((e) => [e.order, e.model, e.handover, e.budget_tokens, e.budget_turns])).toEqual([
+      [ORDER, "model-x", "pick up here", 6500, 42], [ORDER, "model-x", "pick up here", 6500, 42],
+      ["ORD-0002", undefined, undefined, undefined, undefined], ["ORD-0002", undefined, undefined, undefined, undefined],
     ]);
   });
 

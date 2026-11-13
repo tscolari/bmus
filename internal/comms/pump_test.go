@@ -559,6 +559,60 @@ func TestPumpProgressOnTheOrder(t *testing.T) {
 	require.Equal(t, []string{"surveying", "testing", "building"}, notes, "every report is logged")
 }
 
+// A usage report is upserted into order_usage for (order, beam) (#118),
+// keeping the row with the highest envelope seq: one recorded after a later
+// seq, and a replay, change nothing. One for an unknown order, without an
+// order or with a bad body is recorded in the inbox and dropped.
+func TestPumpUsageRecorded(t *testing.T) {
+	t.Parallel()
+	st := openStore(t)
+	ctx := t.Context()
+	id, err := st.InsertOrder(ctx, store.Order{Title: "t", Assignee: "crew-1"}, store.LogEntry{Kind: "order"})
+	require.NoError(t, err)
+	link, sink := newFakeLink(), &fakeSink{}
+	startTestPump(t, testPumpConfig(st, link, sink))
+	s := link.nextSession(t)
+	usage := func() []store.Usage {
+		t.Helper()
+		u, err := st.OrderUsage(ctx, id)
+		require.NoError(t, err)
+		return u
+	}
+
+	s.emit(t, beamMsg(t, 1, TypeUsage, id, UsageBody{InputTokens: 100, OutputTokens: 20, Turns: 1}))
+	require.Equal(t, uint64(1), s.nextAck(t))
+	require.Equal(t, []store.Usage{{Beam: "fake", InputTokens: 100, OutputTokens: 20, Turns: 1, Seq: 1}}, usage())
+
+	// Seq 3 before seq 2: 2 arrives late and is kept out.
+	s.emit(t, beamMsg(t, 3, TypeUsage, id, UsageBody{InputTokens: 900, OutputTokens: 80, Turns: 10}))
+	s.noCmd(t)
+	s.emit(t, beamMsg(t, 2, TypeUsage, id, UsageBody{InputTokens: 500, OutputTokens: 40, Turns: 5}))
+	require.Equal(t, uint64(3), s.nextAck(t))
+	want := []store.Usage{{Beam: "fake", InputTokens: 900, OutputTokens: 80, Turns: 10, Seq: 3}}
+	require.Equal(t, want, usage())
+
+	// A replay after a reconnect is dropped by the inbox.
+	s.end()
+	s = link.nextSession(t)
+	s.emit(t, beamMsg(t, 2, TypeUsage, id, UsageBody{InputTokens: 500, OutputTokens: 40, Turns: 5}))
+	require.Equal(t, uint64(3), s.nextAck(t))
+	require.Equal(t, want, usage())
+
+	s.emit(t, beamMsg(t, 4, TypeUsage, "ORD-9999", UsageBody{InputTokens: 1}))
+	s.emit(t, beamMsg(t, 5, TypeUsage, "", UsageBody{InputTokens: 1}))
+	bad := beamMsg(t, 6, TypeUsage, id, UsageBody{})
+	bad.Body = json.RawMessage(`{"turns":"many"}`)
+	s.emit(t, bad)
+	require.Equal(t, uint64(4), s.nextAck(t))
+	require.Equal(t, uint64(5), s.nextAck(t))
+	require.Equal(t, uint64(6), s.nextAck(t))
+	require.Equal(t, want, usage())
+	none, err := st.OrderUsage(ctx, "ORD-9999")
+	require.NoError(t, err)
+	require.Empty(t, none)
+	require.Empty(t, sink.missions(), "usage never reaches a mission")
+}
+
 func TestPumpErrorRouting(t *testing.T) {
 	st := openStore(t)
 	link, sink := newFakeLink(), &fakeSink{}

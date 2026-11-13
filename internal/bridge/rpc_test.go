@@ -114,10 +114,16 @@ func TestRPCCommands(t *testing.T) {
 		Repos: []OrderRepo{{Name: "web", BaseRef: "main"}}}, nil), CodeBadRequest)
 	require.Equal(t, `unknown repo "web" (repos: app)`, re.Message)
 	requireRPCError(t, call(t, home, "order.create", OrderCreateArgs{Title: "t", Assignee: "sorell"}, nil), CodeBadRequest)
+	re = requireRPCError(t, call(t, home, "order.create", OrderCreateArgs{Title: "t", Assignee: "sorell",
+		Repos: []OrderRepo{{Name: "app", BaseRef: "main"}}, BudgetTurns: -1}, nil), CodeBadRequest)
+	require.Equal(t, "budget_turns must not be negative", re.Message)
 	require.NoError(t, call(t, home, "order.create", OrderCreateArgs{Title: "survey", Body: "look around", Division: "science",
 		Assignee: "sorell", Priority: store.PriorityYellow, Repos: []OrderRepo{{Name: "app", BaseRef: "main"}}, BudgetTokens: 1000,
-		Model: "model-x"}, &created))
+		BudgetTurns: 40, Model: "model-x"}, &created))
 	require.Equal(t, "ORD-0001", created.ID)
+	stored, err := r.d.store.GetOrder(t.Context(), created.ID)
+	require.NoError(t, err)
+	require.Equal(t, [2]int64{1000, 40}, [2]int64{stored.BudgetTokens, stored.BudgetTurns})
 	var orders OrderListResult
 	require.NoError(t, call(t, home, "order.list", nil, &orders))
 	require.Len(t, orders.Orders, 1)
@@ -136,7 +142,7 @@ func TestRPCCommands(t *testing.T) {
 	// the fake beam discards, and waits, logging nothing for minutes. The
 	// first read of the standing orders switch logs its
 	// roster default: make it here rather than in the background.
-	_, err := r.d.StandingOrders(t.Context())
+	_, err = r.d.StandingOrders(t.Context())
 	require.NoError(t, err)
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
 		_, shipped := stepOutput(c, r.d, missionWorkflowID(created.ID), "ship-repos")

@@ -21,7 +21,7 @@ func writeRoster(t *testing.T, doc string) string {
 func TestLoadRoster(t *testing.T) {
 	t.Parallel()
 	r, err := LoadRoster(writeRoster(t, `divisions:
-  ops: {harness: echo, model: m1}
+  ops: {harness: echo, model: m1, budget: {tokens: 1000000, turns: 150}}
   science: {}
 standing_orders: true
 transporter:
@@ -29,7 +29,10 @@ transporter:
 `))
 	require.NoError(t, err)
 	require.Equal(t, RosterConfig{
-		Divisions:      map[string]DivisionConfig{"ops": {Harness: "echo", Model: "m1"}, "science": {}},
+		Divisions: map[string]DivisionConfig{
+			"ops":     {Harness: "echo", Model: "m1", Budget: Budget{Tokens: 1000000, Turns: 150}},
+			"science": {},
+		},
 		StandingOrders: true,
 		Transporter:    TransporterLimits{MaxBeams: 10, MaxProvisioning: 3, RatePerMinute: 5},
 	}, r)
@@ -50,6 +53,8 @@ transporter:
 		"bad division name": {"divisions:\n  ops/x: {}\n", `division name "ops/x"`},
 		"unknown harness":   {"divisions:\n  ops: {harness: codex}\n", `division ops: unknown harness "codex" (want one of sdk, holodeck, echo)`},
 		"negative limit":    {"transporter:\n  rate_per_minute: -1\n", "transporter.rate_per_minute must not be negative"},
+		"negative budget":   {"divisions:\n  ops: {budget: {turns: -1}}\n", "division ops: budget tokens and turns must not be negative"},
+		"unknown budget":    {"divisions:\n  ops: {budget: {dollars: 5}}\n", "field dollars not found"},
 		"bad type":          {"standing_orders: maybe\n", "cannot unmarshal"},
 		"two documents":     {"standing_orders: true\n---\nstanding_orders: false\n", "one YAML document"},
 	} {
@@ -171,6 +176,66 @@ func TestResolveHarnessAndModel(t *testing.T) {
 	} {
 		m, src := d.resolveModel(store.Order{Model: tc.order}, store.Crew{Model: tc.crew, Division: tc.division})
 		require.Equal(t, [2]string{tc.model, tc.source}, [2]string{m, src}, "%+v", tc)
+	}
+}
+
+// An order's budget is its own, else its division's (the order's, else
+// the crew member's), else none, field by field (#118).
+func TestResolveBudget(t *testing.T) {
+	t.Parallel()
+	d := &Daemon{divisions: map[string]DivisionConfig{
+		"ops":     {Budget: Budget{Tokens: 1000, Turns: 50}},
+		"science": {Budget: Budget{Tokens: 2000}},
+		"medical": {},
+	}}
+	order, div, none := SourceOrder, SourceDivision, SourceDefault
+	for name, tc := range map[string]struct {
+		order  store.Order
+		crew   string
+		budget Budget
+		source BudgetSource
+	}{
+		"order":                 {store.Order{BudgetTokens: 7, BudgetTurns: 3, Division: "ops"}, "ops", Budget{7, 3}, BudgetSource{order, order}},
+		"division":              {store.Order{Division: "ops"}, "", Budget{1000, 50}, BudgetSource{div, div}},
+		"mixed":                 {store.Order{BudgetTurns: 9, Division: "ops"}, "", Budget{1000, 9}, BudgetSource{div, order}},
+		"division tokens only":  {store.Order{Division: "science"}, "", Budget{2000, 0}, BudgetSource{div, none}},
+		"crew's division":       {store.Order{}, "ops", Budget{1000, 50}, BudgetSource{div, div}},
+		"order's division wins": {store.Order{Division: "science"}, "ops", Budget{2000, 0}, BudgetSource{div, none}},
+		"none":                  {store.Order{Division: "medical"}, "medical", Budget{}, BudgetSource{none, none}},
+		"no division":           {store.Order{}, "", Budget{}, BudgetSource{none, none}},
+		"unknown division":      {store.Order{Division: "gone"}, "", Budget{}, BudgetSource{none, none}},
+		"split child":           {store.Order{Division: "ops", ParentID: "ORD-0001"}, "science", Budget{1000, 50}, BudgetSource{div, div}},
+	} {
+		b, src := d.resolveBudget(tc.order, store.Crew{Division: tc.crew})
+		require.Equal(t, tc.budget, b, name)
+		require.Equal(t, tc.source, src, name)
+	}
+}
+
+// What remains is the budget times 1 + budget_extended less the usage on
+// every beam; unlimited stays 0 and a spent budget is 1 (#118).
+func TestRemainingBudget(t *testing.T) {
+	t.Parallel()
+	usage := []store.Usage{
+		{Beam: "a", InputTokens: 300, OutputTokens: 100, Turns: 4},
+		{Beam: "b", InputTokens: 50, OutputTokens: 50, Turns: 1},
+	}
+	for name, tc := range map[string]struct {
+		budget   Budget
+		extended int64
+		usage    []store.Usage
+		want     Budget
+	}{
+		"no usage":      {Budget{1000, 10}, 0, nil, Budget{1000, 10}},
+		"two beams":     {Budget{1000, 10}, 0, usage, Budget{500, 5}},
+		"extended":      {Budget{1000, 10}, 1, usage, Budget{1500, 15}},
+		"unlimited":     {Budget{}, 3, usage, Budget{}},
+		"turns only":    {Budget{0, 10}, 0, usage, Budget{0, 5}},
+		"exactly spent": {Budget{500, 5}, 0, usage, Budget{1, 1}},
+		"overspent":     {Budget{100, 2}, 0, usage, Budget{1, 1}},
+	} {
+		got := remainingBudget(store.Order{BudgetExtended: tc.extended}, tc.budget, tc.usage)
+		require.Equal(t, tc.want, got, name)
 	}
 }
 

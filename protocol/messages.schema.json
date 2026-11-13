@@ -319,7 +319,8 @@
           "type": "array",
           "items": {"$ref": "#/$defs/order_repo"}
         },
-        "budget_tokens": {"description": "Token budget; 0 means no budget.", "type": "integer", "minimum": 0},
+        "budget_tokens": {"description": "Tokens that remain of the order's budget for this beam: the resolved budget times 1 + budget_extended, less the usage the bridge recorded on every beam. 0 means no budget; a spent budget is 1.", "type": "integer", "minimum": 0},
+        "budget_turns": {"description": "Main-loop turns that remain of the order's budget for this beam, as budget_tokens. Absent or 0 means no budget; a spent budget is 1.", "type": "integer", "minimum": 0},
         "dossier": {"description": "Crew dossier of learned conventions (markdown).", "type": "string"},
         "model": {"description": "Model to run the order on: the order's own, else the crew member's, else its division's default. Opaque to the bridge; the harness checks it when the order starts and fails the order if it is unknown. Absent means the harness's default.", "type": "string", "minLength": 1},
         "handover": {"description": "Handover note of the checkpoint the order resumes from; each repo's bundle then carries that checkpoint's commits. Absent on a fresh order.", "type": "string"}

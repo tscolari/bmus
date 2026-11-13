@@ -170,6 +170,8 @@ A recalled order resumes from its checkpoint on whichever crew member of the div
 divisions:                # crew add and order create refuse any other division
   science: {}
   ops: {harness: echo, model: some-model}   # defaults for the division's crew members
+  research:
+    budget: {tokens: 1000000, turns: 150}   # default budget of the division's orders; 0 or missing: unlimited
 standing_orders: false    # only the default; `bmus standing-orders on|off` keeps its value across restarts
 transporter:              # zero or missing: the default
   max_beams: 18
@@ -178,6 +180,8 @@ transporter:              # zero or missing: the default
 ```
 
 A crew member's own `--harness` and `--model` override its division's; an order's `model` overrides both. With none, serve runs sdk and the harness its default model. The harness is resolved when a tour provisions its beam, the model when an order is sent. `bmus crew list` shows each resolved value and its source: `(crew)`, `(division)` or `(default)`. If the roster changed since a crew member's beam was provisioned, HARNESS shows what its next tour will get.
+
+An order's `budget_tokens` and `budget_turns` (in the order file or `order.create`) override its division's budget, field by field; a directed order without a division takes its crew member's division's. Tokens count input, cache reads and writes, and output. The bridge records the usage each beam reports for an order, and each order it sends carries what remains: the budget, times one plus the extensions granted, less the usage on every beam so far.
 
 ## Regulations
 

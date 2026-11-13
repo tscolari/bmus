@@ -194,8 +194,10 @@ export interface OrderBody {
   body: string;
   /** Repos shipped onto the beam for the order; serve checks each out before the harness starts. */
   repos: OrderRepo[];
-  /** 0 means no budget. */
+  /** Tokens that remain of the order's budget for this beam (the resolved budget times 1 + budget_extended, less the usage recorded on every beam). 0 means no budget; a spent budget is 1. */
   budget_tokens: number;
+  /** Main-loop turns that remain, as budget_tokens. Absent or 0 means no budget. */
+  budget_turns?: number;
   dossier?: string;
   /** Model to run the order on (the order's, else the crew member's, else its division's default); opaque to the bridge. Absent means the harness's default. */
   model?: string;
