@@ -77,10 +77,13 @@ func (d *Daemon) doneOrder(ctx context.Context, id string) (store.Order, error) 
 // orderDiff reads done order o's work in each of its repos, as `git diff
 // <base>...bmus/<order>` in the bridge's clone, each capped at limit
 // bytes. Each repo must be registered, with a full commit id as its base
-// (baseCommits); everything is checked before git runs. A repo whose
-// clone has no bmus/<order> is Jettisoned: the order has ended, and only
-// bmus jettison deletes its branch (#108). The diff takes no repo lock: it
-// only reads, and a fetch into the clone may take minutes.
+// (baseCommits) and bmus/<order> in its clone; everything is checked
+// before git runs. A repo whose branch bmus jettison deleted (#108) is
+// Jettisoned instead: its readable clone has no bmus/<order> and the
+// order's log has the jettison entry (branchJettisoned). That is checked
+// again when a diff fails, for a jettison that lands between the check
+// and the diff. The diff takes no repo lock: it only reads, and a fetch
+// into the clone may take minutes.
 func (d *Daemon) orderDiff(ctx context.Context, o store.Order, limit int) (OrderDiff, error) {
 	id := o.ID
 	bases, err := d.baseCommits(ctx, id)
@@ -98,6 +101,13 @@ func (d *Daemon) orderDiff(ctx context.Context, o store.Order, limit int) (Order
 			return OrderDiff{}, ctx.Err()
 		}
 		if err != nil {
+			_, ok, jerr := d.branchJettisoned(ctx, id, r.Name, err)
+			if jerr != nil {
+				return OrderDiff{}, jerr
+			}
+			if !ok {
+				return OrderDiff{}, badRequest("repo %s: %s is missing from the bridge's clone", r.Name, branch)
+			}
 			jettisoned[r.Name] = true
 			continue
 		}
@@ -114,6 +124,11 @@ func (d *Daemon) orderDiff(ctx context.Context, o store.Order, limit int) (Order
 		}
 		diff, truncated, err := repoDiff(ctx, d.repoDir(r.Name), base, branch, limit)
 		if err != nil {
+			_, rerr := runGit(ctx, d.repoDir(r.Name), "rev-parse", "--verify", "--quiet", "--end-of-options", "refs/heads/"+branch+"^{commit}")
+			if _, ok, jerr := d.branchJettisoned(ctx, id, r.Name, rerr); jerr == nil && ok {
+				out.Repos = append(out.Repos, RepoDiff{Name: r.Name, Base: base, Jettisoned: true})
+				continue
+			}
 			return OrderDiff{}, fmt.Errorf("repo %s: %w", r.Name, err)
 		}
 		out.Repos = append(out.Repos, RepoDiff{Name: r.Name, Base: base, Diff: diff, Truncated: truncated})

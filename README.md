@@ -30,7 +30,6 @@ A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026
 - [x] Recall, belay, withdraw and re-route orders
 - [x] Push a done order's branch from the bridge
 - [x] Read a done order's mission report, with its diff, in the console
-- [x] Jettison the branches of orders that ended a while ago with `bmus jettison`
 - [x] Hold work through a `tsh` login expiry and resume after `tsh login`
 - [x] Run the ship from a web console with live updates and hail notifications
 
@@ -43,6 +42,7 @@ A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026
 - [x] Park a hail for long waits and resume the session on the answer
 - [x] Measure the auto-resolved share, captain overrides and time-to-answer
 - [x] Read orders from an issue tracker, GitHub Issues first ([#33](https://github.com/tscolari/bmus/issues/33))
+- [x] Jettison the branches of orders that ended a while ago with `bmus jettison`
 
 ### Phase 4: hardening ([#109](https://github.com/tscolari/bmus/issues/109))
 

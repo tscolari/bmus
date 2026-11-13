@@ -10,10 +10,12 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -27,9 +29,13 @@ import (
 // to take its branches when no --older-than is given.
 const DefaultJettisonAge = "7d"
 
-// jettisonTimeout bounds bridge.jettison: deleting waits for each repo's
-// lock, which a fetch may hold for up to gitFetchTimeout.
+// jettisonTimeout bounds bridge.jettison.
 const jettisonTimeout = 10 * time.Minute
+
+// jettisonLockWait bounds the wait for one repo's lock, which a fetch may
+// hold for minutes: past it the repo is skipped, so one busy repo doesn't
+// take the whole of jettisonTimeout.
+const jettisonLockWait = 2 * time.Minute
 
 // ParseAge reads an age for --older-than: a Go duration ("36h", "90m") or
 // a whole number of days ("7d"). It must not be negative.
@@ -69,15 +75,28 @@ type JettisonBranch struct {
 	Commit  string    `json:"commit"`
 }
 
+// JettisonSkip is a branch, or a whole repo (Branch empty), that jettison
+// left alone for Reason.
+type JettisonSkip struct {
+	Repo   string `json:"repo"`
+	Order  string `json:"order,omitempty"`
+	Branch string `json:"branch,omitempty"`
+	Reason string `json:"reason"`
+}
+
 // JettisonResult is bridge.jettison's result. Branches are the branches
 // jettisoned, or that would be on a dry run (Deleted false), by repo then
 // order. Kept counts the other branches of orders the store knows: open,
-// ended too recently, or named as an open order's base_ref.
+// ended too recently, or named by an open order's base_ref. Skipped are
+// the branches and repos left alone for another reason: a branch that
+// moved since it was listed, a repo whose clone git can't read or whose
+// lock stayed busy.
 type JettisonResult struct {
 	OlderThan string           `json:"older_than"`
 	Deleted   bool             `json:"deleted"`
 	Branches  []JettisonBranch `json:"branches"`
 	Kept      int              `json:"kept"`
+	Skipped   []JettisonSkip   `json:"skipped"`
 }
 
 // Jettison finds the bmus/<order> branches in the bridge's clones
@@ -87,13 +106,15 @@ type JettisonResult struct {
 //
 // When an order ended is the time of its latest captain's log entry
 // (store.LatestOrderLogTS): every move to an ended state logs one, so it
-// is never before the order ended. A branch an open order names as its
-// base_ref stays: a re-run of that order's ship-repos resolves it again.
+// is never before the order ended. A branch an open order's base_ref
+// resolves to in the clone stays (protectedBranches): a re-run of that
+// order's ship-repos resolves it again.
 //
-// Each deletion is `git update-ref -d` of the branch at the commit it was
-// listed at, under the repo's lock, and is logged on the order.
+// With yes, each repo's branches are deleted under its lock
+// (jettisonRepo). On an error the result holds the branches deleted
+// before it, and the error names how many.
 func (d *Daemon) Jettison(ctx context.Context, olderThan time.Duration, yes bool) (JettisonResult, error) {
-	out := JettisonResult{Deleted: yes, Branches: []JettisonBranch{}}
+	out := JettisonResult{Deleted: yes, Branches: []JettisonBranch{}, Skipped: []JettisonSkip{}}
 	ents, err := os.ReadDir(filepath.Join(d.home, "repos"))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return out, err
@@ -103,17 +124,11 @@ func (d *Daemon) Jettison(ctx context.Context, olderThan time.Duration, yes bool
 		return out, err
 	}
 	orders := make(map[string]store.Order, len(all))
-	baseOf := map[string]bool{} // branches open orders name as base_ref
 	for _, o := range all {
 		orders[o.ID] = o
-		if store.OrderEnded(o.State) {
-			continue
-		}
-		for _, r := range o.Repos {
-			baseOf[r.Name+"\x00"+strings.TrimPrefix(r.BaseRef, "refs/heads/")] = true
-		}
 	}
 	cutoff := time.Now().Add(-olderThan)
+	var found []JettisonBranch
 	for _, ent := range ents {
 		name := ent.Name()
 		dir := d.repoDir(name)
@@ -124,6 +139,14 @@ func (d *Daemon) Jettison(ctx context.Context, olderThan time.Duration, yes bool
 			continue // not a clone
 		}
 		refs, err := runGit(ctx, dir, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/bmus/")
+		if ctx.Err() != nil {
+			return out, ctx.Err()
+		}
+		if err != nil {
+			out.Skipped = append(out.Skipped, JettisonSkip{Repo: name, Reason: firstLine(err.Error())})
+			continue
+		}
+		protected, err := protectedBranches(ctx, dir, name, all)
 		if err != nil {
 			return out, fmt.Errorf("repo %s: %w", name, err)
 		}
@@ -134,7 +157,7 @@ func (d *Daemon) Jettison(ctx context.Context, olderThan time.Duration, yes bool
 			if !ok || branch != orderBranch(o.ID) {
 				continue
 			}
-			if !store.OrderEnded(o.State) || baseOf[name+"\x00"+branch] {
+			if !store.OrderEnded(o.State) || protected[ref] {
 				out.Kept++
 				continue
 			}
@@ -146,36 +169,244 @@ func (d *Daemon) Jettison(ctx context.Context, olderThan time.Duration, yes bool
 				out.Kept++
 				continue
 			}
-			out.Branches = append(out.Branches, JettisonBranch{Repo: name, Order: o.ID, Branch: branch, State: o.State, EndedAt: ended, Commit: commit})
+			found = append(found, JettisonBranch{Repo: name, Order: o.ID, Branch: branch, State: o.State, EndedAt: ended, Commit: commit})
 		}
 	}
-	slices.SortFunc(out.Branches, func(a, b JettisonBranch) int {
+	slices.SortFunc(found, func(a, b JettisonBranch) int {
 		return cmp.Or(cmp.Compare(a.Repo, b.Repo), cmp.Compare(a.Order, b.Order))
 	})
 	if !yes {
+		out.Branches = append(out.Branches, found...)
 		return out, nil
 	}
-	for i, b := range out.Branches {
-		if err := d.jettisonBranch(ctx, b, orders[b.Order].Assignee); err != nil {
-			out.Branches = out.Branches[:i]
-			return out, fmt.Errorf("repo %s: jettison %s: %w", b.Repo, b.Branch, err)
+	for repo := range slices.Values(compactRepos(found)) {
+		var batch []JettisonBranch
+		for _, b := range found {
+			if b.Repo == repo {
+				batch = append(batch, b)
+			}
+		}
+		deleted, skipped, kept, err := d.jettisonRepo(ctx, repo, batch, orders, jettisonLockWait)
+		out.Branches = append(out.Branches, deleted...)
+		out.Skipped = append(out.Skipped, skipped...)
+		out.Kept += kept
+		if err != nil {
+			return out, fmt.Errorf("repo %s: %w (%s jettisoned before it)", repo, err, branchCount(len(out.Branches)))
 		}
 	}
 	return out, nil
 }
 
-// jettisonBranch deletes b's branch from its clone, if it is still at b's
-// commit, and logs it on the order.
-func (d *Daemon) jettisonBranch(ctx context.Context, b JettisonBranch, crewID string) error {
-	unlock, err := d.lockRepo(ctx, b.Repo)
-	if err != nil {
-		return err
+// compactRepos is the repos of bs, sorted by repo, each once.
+func compactRepos(bs []JettisonBranch) []string {
+	var repos []string
+	for _, b := range bs {
+		if len(repos) == 0 || repos[len(repos)-1] != b.Repo {
+			repos = append(repos, b.Repo)
+		}
 	}
-	_, err = runGit(ctx, d.repoDir(b.Repo), "update-ref", "-d", "refs/heads/"+b.Branch, b.Commit)
-	unlock()
-	if err != nil {
-		return err
+	return repos
+}
+
+// branchCount is "1 branch" or "n branches".
+func branchCount(n int) string {
+	if n == 1 {
+		return "1 branch"
 	}
-	return d.appendLog(ctx, logOrder, crewID, b.Order, fmt.Sprintf("branch %s jettisoned from repo %s", b.Branch, b.Repo),
-		map[string]string{"repo": b.Repo, "branch": b.Branch, "commit": b.Commit})
+	return fmt.Sprintf("%d branches", n)
+}
+
+// jettisonRepo deletes batch, branches of repo, under the repo's lock,
+// waiting at most wait for it (past it the batch is skipped).
+// Under the lock it reads the open orders' base_refs again and keeps the
+// branches they name (kept), drops each branch that moved from its listed
+// commit (skipped), then deletes the rest in one `git update-ref --stdin`
+// transaction of "delete <ref> <old>". If the transaction fails, each
+// branch is deleted on its own, and one whose old-value check fails is
+// skipped as moved. Each deletion is logged on its order. deleted holds
+// what was deleted, also on an error.
+func (d *Daemon) jettisonRepo(ctx context.Context, repo string, batch []JettisonBranch, orders map[string]store.Order, wait time.Duration) (deleted []JettisonBranch, skipped []JettisonSkip, kept int, err error) {
+	lctx, cancel := context.WithTimeout(ctx, wait)
+	unlock, err := d.lockRepo(lctx, repo)
+	cancel()
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, nil, 0, ctx.Err()
+		}
+		for _, b := range batch {
+			skipped = append(skipped, JettisonSkip{Repo: repo, Order: b.Order, Branch: b.Branch,
+				Reason: fmt.Sprintf("the repo's clone stayed busy for %s", wait)})
+		}
+		return nil, skipped, 0, nil
+	}
+	defer unlock()
+	dir := d.repoDir(repo)
+
+	all, err := d.store.ListOrders(ctx)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	protected, err := protectedBranches(ctx, dir, repo, all)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	refs, err := runGit(ctx, dir, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/bmus/")
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	now := map[string]string{}
+	for line := range strings.Lines(refs) {
+		commit, ref, _ := strings.Cut(strings.TrimSpace(line), " ")
+		now[ref] = commit
+	}
+	var todo []JettisonBranch
+	for _, b := range batch {
+		ref := "refs/heads/" + b.Branch
+		switch {
+		case protected[ref]:
+			kept++
+		case now[ref] != b.Commit:
+			skipped = append(skipped, movedSkip(b))
+		default:
+			todo = append(todo, b)
+		}
+	}
+	if len(todo) == 0 {
+		return nil, skipped, kept, nil
+	}
+
+	var stdin strings.Builder
+	for _, b := range todo {
+		fmt.Fprintf(&stdin, "delete refs/heads/%s %s\n", b.Branch, b.Commit)
+	}
+	if _, err := runGitStdin(ctx, dir, strings.NewReader(stdin.String()), "update-ref", "--stdin"); err == nil {
+		deleted = todo
+	} else {
+		if ctx.Err() != nil {
+			return nil, skipped, kept, ctx.Err()
+		}
+		// One at a time: a branch that moved fails only its own delete.
+		for _, b := range todo {
+			ref := "refs/heads/" + b.Branch
+			_, err := runGit(ctx, dir, "update-ref", "-d", ref, b.Commit)
+			if err == nil {
+				deleted = append(deleted, b)
+				continue
+			}
+			if ctx.Err() != nil {
+				return deleted, skipped, kept, d.logJettisoned(ctx, deleted, orders, ctx.Err())
+			}
+			cur, rerr := runGit(ctx, dir, "rev-parse", "--verify", "--quiet", "--end-of-options", ref)
+			if (rerr != nil && refMissing(rerr)) || (rerr == nil && cur != b.Commit) {
+				skipped = append(skipped, movedSkip(b))
+				continue
+			}
+			return deleted, skipped, kept, d.logJettisoned(ctx, deleted, orders, err)
+		}
+	}
+	return deleted, skipped, kept, d.logJettisoned(ctx, deleted, orders, nil)
+}
+
+// movedSkip is the skip of b, which moved from its listed commit.
+func movedSkip(b JettisonBranch) JettisonSkip {
+	return JettisonSkip{Repo: b.Repo, Order: b.Order, Branch: b.Branch, Reason: "moved from " + b.Commit[:min(len(b.Commit), 12)] + " since it was listed"}
+}
+
+// jettisonText is the captain's log text of order id's branch jettisoned
+// from repo.
+func jettisonText(id, repo string) string {
+	return fmt.Sprintf("branch %s jettisoned from repo %s", orderBranch(id), repo)
+}
+
+// logJettisoned logs each of deleted on its order, and returns cause or
+// the first logging error.
+func (d *Daemon) logJettisoned(ctx context.Context, deleted []JettisonBranch, orders map[string]store.Order, cause error) error {
+	for _, b := range deleted {
+		if err := d.appendLog(ctx, logOrder, orders[b.Order].Assignee, b.Order, jettisonText(b.Order, b.Repo),
+			map[string]string{"repo": b.Repo, "branch": b.Branch, "commit": b.Commit}); err != nil && cause == nil {
+			cause = err
+		}
+	}
+	return cause
+}
+
+// refMissing reports whether err is `git rev-parse --verify --quiet`
+// finding no such ref in a readable repository: exit status 1. A missing
+// or broken repository exits 128, or fails before git runs.
+func refMissing(err error) bool {
+	var ee *exec.ExitError
+	return errors.As(err, &ee) && ee.ExitCode() == 1
+}
+
+// protectedBranches is the refs/heads/bmus/* branches of the clone dir of
+// repo that an open order's base_ref names. A base_ref is resolved as git
+// would in the clone, after its ~, ^ and @{...} suffixes are stripped,
+// with `git rev-parse --symbolic-full-name`; one that resolves to nothing
+// protects nothing.
+func protectedBranches(ctx context.Context, dir, repo string, orders []store.Order) (map[string]bool, error) {
+	out := map[string]bool{}
+	seen := map[string]bool{}
+	for _, o := range orders {
+		if store.OrderEnded(o.State) {
+			continue
+		}
+		for _, r := range o.Repos {
+			if r.Name != repo {
+				continue
+			}
+			ref := r.BaseRef
+			if i := strings.IndexAny(ref, "~^"); i >= 0 {
+				ref = ref[:i]
+			}
+			if i := strings.Index(ref, "@{"); i >= 0 {
+				ref = ref[:i]
+			}
+			if ref == "" || seen[ref] {
+				continue
+			}
+			seen[ref] = true
+			full, err := runGit(ctx, dir, "rev-parse", "--symbolic-full-name", "--end-of-options", ref)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			for line := range strings.Lines(full) {
+				if line = strings.TrimSpace(line); strings.HasPrefix(line, "refs/heads/bmus/") {
+					out[line] = true
+				}
+			}
+			_ = err // a base_ref the clone can't resolve names no branch
+		}
+	}
+	return out, nil
+}
+
+// jettisonedAt reports when order id's branch was jettisoned from repo:
+// the time of its latest "branch bmus/<id> jettisoned from repo <repo>"
+// entry. ok is false when it has none.
+func (d *Daemon) jettisonedAt(ctx context.Context, id, repo string) (at time.Time, ok bool, err error) {
+	entries, err := d.store.ListOrderLogKind(ctx, id, logOrder)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	text := jettisonText(id, repo)
+	for _, e := range slices.Backward(entries) {
+		var p struct {
+			Repo string `json:"repo"`
+		}
+		if e.Text == text && json.Unmarshal(e.Payload, &p) == nil && p.Repo == repo {
+			return e.TS, true, nil
+		}
+	}
+	return time.Time{}, false, nil
+}
+
+// branchJettisoned reports whether order id's branch is gone from repo's
+// clone because jettison deleted it: rev-parse's err says the ref is
+// missing from a readable clone (refMissing), and the order's log has
+// the jettison entry. at is when.
+func (d *Daemon) branchJettisoned(ctx context.Context, id, repo string, revParseErr error) (at time.Time, ok bool, err error) {
+	if revParseErr == nil || !refMissing(revParseErr) {
+		return time.Time{}, false, nil
+	}
+	return d.jettisonedAt(ctx, id, repo)
 }

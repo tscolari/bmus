@@ -148,7 +148,8 @@ func (d *Daemon) PushOrder(ctx context.Context, id, target string, force bool) (
 }
 
 // checkOrderBranch refuses repo r when bmus/<order> in the bridge's clone
-// is missing or not at r's recorded commit.
+// is missing or not at r's recorded commit. A branch bmus jettison
+// deleted (branchJettisoned) is refused saying so (#108).
 func (d *Daemon) checkOrderBranch(ctx context.Context, orderID string, r landedRepo) error {
 	branch := "refs/heads/" + orderBranch(orderID)
 	got, err := runGit(ctx, d.repoDir(r.Name), "rev-parse", "--verify", "--quiet", "--end-of-options", branch+"^{commit}")
@@ -157,6 +158,14 @@ func (d *Daemon) checkOrderBranch(ctx context.Context, orderID string, r landedR
 	}
 	if err == nil && got == r.Commit {
 		return nil
+	}
+	at, jettisoned, jerr := d.branchJettisoned(ctx, orderID, r.Name, err)
+	if jerr != nil {
+		return jerr
+	}
+	if jettisoned {
+		return badRequest("%s was jettisoned from repo %s on %s; its work is no longer on the bridge",
+			orderBranch(orderID), r.Name, at.UTC().Format(time.DateOnly))
 	}
 	state := "missing"
 	if err == nil {

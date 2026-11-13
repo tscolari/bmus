@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,4 +61,14 @@ func TestJettisonSummary(t *testing.T) {
 		jettisonSummary(bridge.JettisonResult{OlderThan: "7d", Deleted: true, Branches: b, Kept: 1}))
 	require.Equal(t, "would jettison 3 branches of 2 orders that ended over 36h ago; 0 branches kept; run with --yes to delete them",
 		jettisonSummary(bridge.JettisonResult{OlderThan: "36h", Branches: b}))
+
+	var out strings.Builder
+	require.NoError(t, printJettison(&out, bridge.JettisonResult{OlderThan: "7d", Deleted: true, Branches: b[:1], Skipped: []bridge.JettisonSkip{
+		{Repo: "app", Order: "ORD-0002", Branch: "bmus/ORD-0002", Reason: "moved from 0123456789ab since it was listed"},
+		{Repo: "broken", Reason: "git for-each-ref: exit status 128"},
+	}}))
+	require.Regexp(t, `^REPO +ORDER +BRANCH +ENDED\napp +ORD-0001 +.*\n`+
+		regexp.QuoteMeta("skipped app bmus/ORD-0002: moved from 0123456789ab since it was listed\n"+
+			"skipped repo broken: git for-each-ref: exit status 128\n"+
+			"jettisoned 1 branch of 1 order that ended over 7d ago; 0 branches kept, 2 skipped\n")+`$`, out.String())
 }

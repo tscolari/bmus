@@ -49,7 +49,8 @@ shows "branch jettisoned" in place of its diff.`,
 	return cmd
 }
 
-// printJettison writes res's branches as a table, then a summary line.
+// printJettison writes res's branches as a table, a line per skipped
+// branch or repo, then a summary line.
 func printJettison(w io.Writer, res bridge.JettisonResult) error {
 	if len(res.Branches) > 0 {
 		tw := newTable(w)
@@ -60,6 +61,13 @@ func printJettison(w io.Writer, res bridge.JettisonResult) error {
 		if err := tw.Flush(); err != nil {
 			return err
 		}
+	}
+	for _, sk := range res.Skipped {
+		what := "repo " + sk.Repo
+		if sk.Branch != "" {
+			what = sk.Repo + " " + sk.Branch
+		}
+		fmt.Fprintf(w, "skipped %s: %s\n", what, sk.Reason)
 	}
 	_, err := fmt.Fprintln(w, jettisonSummary(res))
 	return err
@@ -73,6 +81,9 @@ func jettisonSummary(res bridge.JettisonResult) string {
 	}
 	n := fmt.Sprintf("%s of %s", plural(len(res.Branches), "branch", "branches"), plural(len(orders), "order", "orders"))
 	kept := fmt.Sprintf("%s kept", plural(res.Kept, "branch", "branches"))
+	if len(res.Skipped) > 0 {
+		kept += fmt.Sprintf(", %d skipped", len(res.Skipped))
+	}
 	switch {
 	case len(res.Branches) == 0:
 		return fmt.Sprintf("nothing to jettison: no order ended over %s ago has a branch; %s", res.OlderThan, kept)
