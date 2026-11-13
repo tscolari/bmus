@@ -283,6 +283,10 @@ func provisionBeam(ctx context.Context, d *Daemon, in TransporterInput) (provisi
 			beam = last
 		} else {
 			d.logger.Info("provision: recorded beam is gone; creating another", "crew", crewID, "beam", last.Alias)
+			// Marked before Create, so a new beam reusing the alias stays unmarked.
+			if err := d.store.SetBeamRemoved(ctx, crewID, last.Alias, time.Now()); err != nil {
+				return provisionAttempt{}, err
+			}
 		}
 	}
 	if beam.Alias == "" {

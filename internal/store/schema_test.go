@@ -1,7 +1,6 @@
 package store
 
 import (
-	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
@@ -110,7 +109,7 @@ func TestOpenAddsPhase4Schema(t *testing.T) {
 // row and an unknown alias are untouched.
 func TestSetBeamRemoved(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
+	ctx := t.Context()
 	s := openTest(t)
 	require.NoError(t, s.InsertCrew(ctx, Crew{ID: "sorell", Name: "Sorell"}, testEntry))
 	require.NoError(t, s.InsertCrew(ctx, Crew{ID: "tuvok", Name: "Tuvok"}, testEntry))
