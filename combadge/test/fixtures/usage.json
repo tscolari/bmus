@@ -1,0 +1,6 @@
+[
+  { "at_pct": 10, "progress": "surveying the codebase" },
+  { "at_pct": 30, "usage": { "input_tokens": 1200, "output_tokens": 300, "turns": 4 } },
+  { "at_pct": 60, "usage": { "input_tokens": 5400, "output_tokens": 910, "turns": 10 } },
+  { "at_pct": 100, "report": { "summary": "holodeck mission complete" } }
+]

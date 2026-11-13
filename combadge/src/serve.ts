@@ -19,6 +19,7 @@ import {
   type ConsultReplyBody,
   type Message,
   type ReportBody,
+  type UsageBody,
 } from "./protocol.js";
 import { State } from "./state.js";
 import { VERSION } from "./version.js";
@@ -123,6 +124,9 @@ async function start(opts: ServeOptions, release: () => void): Promise<Server> {
   let exitTimer: NodeJS.Timeout | undefined;
 
   function emit<T extends BeamToBridgeType>(type: T, body: BeamToBridgeBodies[T], order?: string): void {
+    // Kept before the outbox line: a crash in between leaves state ahead of
+    // the outbox, never behind it, so the counts never go back (#117).
+    if (type === "usage" && order !== undefined) state.record({ usage: { order, counts: body as UsageBody } });
     const msg = { v: PROTOCOL_VERSION, crew: opts.crew, order, type, ts: new Date().toISOString(), body };
     let line: string;
     try {
@@ -191,9 +195,10 @@ async function start(opts: ServeOptions, release: () => void): Promise<Server> {
     // was stopped runs again from a clean order dir (see clearStopped).
     const result = (async (): Promise<ReportBody> => {
       if (resumed) await clearStopped(opts.workDir, id);
+      const earlier = state.usageOf(id);
       const repos = await checkoutRepos(opts.workDir, id, Array.isArray(msg.body.repos) ? msg.body.repos : []);
       const started = opts.harness.run(
-        { id, body: msg.body, repos },
+        { id, body: msg.body, repos, ...(earlier !== undefined && { usage: earlier }) },
         (m) => (done ? warn(`dropping ${m.type} emitted after ${id} ended`) : emit(m.type, m.body, id)),
         (fn) => current.listeners.push(fn),
       );
