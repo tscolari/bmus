@@ -61,6 +61,7 @@ func newRootCmd() *cobra.Command {
 		newConsoleCmd(a),
 		newRegsCmd(a),
 		newCommandCmd(a),
+		newJettisonCmd(a),
 	)
 	return root
 }

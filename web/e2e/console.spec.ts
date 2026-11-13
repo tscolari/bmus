@@ -787,12 +787,23 @@ test("a done order's work is pushed from its record row, forced past a diverged 
   expect(await diffPage.evaluate(() => window.__csp)).toEqual([]);
   expect(diffErrors).toEqual([]);
 
+  // Once `bmus jettison` deletes the order's branch, the report says so
+  // in place of the diff (#108).
+  expect(await bridge.bmus("jettison", "--older-than", "0s", "--yes")).toContain("jettisoned 1 branch of 1 order");
+  await diffPage.reload();
+  const appRepo = diffPage.getByRole("region", { name: /^app/ });
+  await expect(appRepo.getByRole("note")).toContainText(`Branch jettisoned: ${branch} was deleted from the bridge's clone of app`);
+  await expect(diffPage.getByText(added, { exact: true })).toHaveCount(0);
+  await expect(diffPage.getByRole("alert")).toHaveCount(0);
+  await expect(diffPage.getByRole("region", { name: "Report" })).toContainText("retries committed");
+  expect(diffErrors).toEqual([]);
+
   // Without a session the page says so, and shows no diff.
   const fresh = await browser.newContext();
   const stranger = await fresh.newPage();
   await stranger.goto(diffPage.url());
   await expect(stranger.getByText("No session. Open the console with `bmus console`.")).toBeVisible();
-  await expect(stranger.getByText(added)).toHaveCount(0);
+  await expect(stranger.getByText("Branch jettisoned")).toHaveCount(0);
   await fresh.close();
   expect(errors).toEqual([]);
 });
