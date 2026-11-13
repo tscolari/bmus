@@ -839,6 +839,8 @@ func TestReenergizeBeamingInEndedTour(t *testing.T) {
 	_, err := r.d.ReenergizeCrew(ctx, "sorell")
 	require.NoError(t, err, "under way while its tour provisions")
 
+	// The tour is pending before it starts its transporter workflow.
+	requirePending(t, r.d, beamWorkflowID("sorell", 0))
 	require.NoError(t, dbos.CancelWorkflow(r.d.dbos, beamWorkflowID("sorell", 0)))
 	require.NoError(t, dbos.CancelWorkflow(r.d.dbos, tourWorkflowID("sorell", 0)))
 	require.Eventually(t, func() bool {
