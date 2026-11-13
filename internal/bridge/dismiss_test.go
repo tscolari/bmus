@@ -177,6 +177,10 @@ func TestDismissSignalsTourReadInTransaction(t *testing.T) {
 
 	requireOutcome(t, OutcomeDone)(r.d.DismissCrew(t.Context(), "sorell"))
 	require.Equal(t, []string{"fake-1"}, p.removed())
+	beams, err := r.d.store.ListBeams(t.Context(), "sorell")
+	require.NoError(t, err)
+	require.Len(t, beams, 1)
+	require.NotNil(t, beams[0].RemovedAt, "DismissCrew sets the beam's removed_at (#111)")
 	tourID := tourWorkflowID("sorell", 0)
 	live, _, err := workflowLive(r.d, tourID)
 	require.NoError(t, err)

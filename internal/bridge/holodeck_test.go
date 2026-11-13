@@ -695,6 +695,9 @@ func TestDismissMidMission(t *testing.T) {
 	exists, err := b.h.Exists(t.Context(), transporter.Beam{Alias: c.CurrentBeam})
 	require.NoError(t, err)
 	require.False(t, exists, "the beam was removed")
+	beams, err := hd.d.store.ListBeams(t.Context(), "sorell")
+	require.NoError(t, err)
+	require.NotNil(t, beams[len(beams)-1].RemovedAt, "the tour's remove-beam sets removed_at (#111)")
 	requireOutcome(t, OutcomeDone)(hd.d.DismissCrew(t.Context(), "sorell")) // already dismissed
 	_, err = hd.d.DismissCrew(t.Context(), "nobody")
 	require.ErrorIs(t, err, ErrNotFound)
