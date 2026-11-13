@@ -26,7 +26,11 @@ CREATE TABLE IF NOT EXISTS beams (
     expires_at      TIMESTAMP NOT NULL,
     egress_mode     TEXT NOT NULL DEFAULT '',
     allowed_domains TEXT NOT NULL DEFAULT '[]',
-    compute_status  TEXT NOT NULL DEFAULT ''
+    compute_status  TEXT NOT NULL DEFAULT '',
+    -- Set once the beam is removed or found gone; NULL while it may still
+    -- exist (#111). A removal that failed leaves it NULL for reconcile.
+    removed_at      TIMESTAMP,
+    labels          TEXT NOT NULL DEFAULT '{}' -- the provider labels, a JSON object (#111)
 );
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -52,7 +56,11 @@ CREATE TABLE IF NOT EXISTS orders (
     progress_seq  INTEGER NOT NULL DEFAULT 0,
     -- Where the order came from, free-form: tracker:<ref> for a tracker
     -- item whose text the bridge put in the body (#54). Empty for none.
-    source        TEXT NOT NULL DEFAULT ''
+    source        TEXT NOT NULL DEFAULT '',
+    -- 0 for unlimited, as budget_tokens. budget_extended counts the
+    -- extensions the captain granted (#111).
+    budget_turns    INTEGER NOT NULL DEFAULT 0,
+    budget_extended INTEGER NOT NULL DEFAULT 0
 );
 
 -- The repos an order works on (#51), in the order's list order (pos from
@@ -65,6 +73,19 @@ CREATE TABLE IF NOT EXISTS order_repos (
     base_ref TEXT NOT NULL,
     PRIMARY KEY (order_id, pos),
     UNIQUE (order_id, name)
+);
+
+-- An order's usage as each beam that ran it reported it (#111): the
+-- beam's running totals for the order, the latest seq's. The order's usage
+-- is the sum over its rows.
+CREATE TABLE IF NOT EXISTS order_usage (
+    order_id      TEXT NOT NULL REFERENCES orders(id),
+    beam          TEXT NOT NULL,
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    turns         INTEGER NOT NULL DEFAULT 0,
+    seq           INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (order_id, beam)
 );
 
 CREATE TABLE IF NOT EXISTS hails (
@@ -92,6 +113,15 @@ CREATE TABLE IF NOT EXISTS hails (
     -- The option the captain's last countermand picked, NULL for a
     -- free-text one or none (#54).
     countermand_option  INTEGER
+);
+
+-- Domains an egress hail allowed for an order (#111). Every beam that runs
+-- the order gets them.
+CREATE TABLE IF NOT EXISTS order_egress (
+    order_id TEXT NOT NULL REFERENCES orders(id),
+    domain   TEXT NOT NULL,
+    hail_id  TEXT NOT NULL REFERENCES hails(id),
+    PRIMARY KEY (order_id, domain)
 );
 
 -- A checkpoint's seq is the beam's message seq, so a resumed order's next
@@ -150,6 +180,17 @@ CREATE TABLE IF NOT EXISTS inbox (
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+-- The backup workflow's runs (#111). finished_at is NULL while one runs
+-- or after a crash in it; error is empty for a backup that passed its check.
+CREATE TABLE IF NOT EXISTS backups (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at  TIMESTAMP NOT NULL,
+    finished_at TIMESTAMP,
+    dir         TEXT NOT NULL,
+    bytes       INTEGER NOT NULL DEFAULT 0,
+    error       TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS orders_assignee_state ON orders (assignee, state);
