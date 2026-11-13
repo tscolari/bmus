@@ -6,7 +6,7 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { holodeckHarness, loadScript, parseScript, validateScript } from "../src/harness/holodeck.js";
-import type { Inbound } from "../src/harness/types.js";
+import type { Inbound, Outbound } from "../src/harness/types.js";
 import { onLines } from "../src/lines.js";
 import type { BeamToBridgeMessage, ConsultBody, OrderBody } from "../src/protocol.js";
 import { git, orderBundle } from "./gitfix.js";
@@ -394,6 +394,10 @@ describe("validateScript", () => {
     ["hail no question", [{ at_pct: 0, hail: { category: "c" } }, report], "step 0: hail.question must be a non-empty string"],
     ["hail bad options", [{ at_pct: 0, hail: { category: "c", question: "q", options: [1] } }, report], "step 0: hail.options must be an array of strings"],
     ["hail bad context", [{ at_pct: 0, hail: { category: "c", question: "q", context: [] } }, report], "step 0: hail.context must be an object"],
+    ["usage not an object", [{ at_pct: 0, usage: 5 }, report], "step 0: usage must be an object"],
+    ["usage unknown key", [{ at_pct: 0, usage: { input_tokens: 1, output_tokens: 1, turns: 1, seq: 1 } }, report], "step 0: unknown usage key seq"],
+    ["usage without turns", [{ at_pct: 0, usage: { input_tokens: 1, output_tokens: 1 } }, report], "step 0: usage.turns must be a non-negative integer"],
+    ["usage negative tokens", [{ at_pct: 0, usage: { input_tokens: -1, output_tokens: 1, turns: 1 } }, report], "step 0: usage.input_tokens must be a non-negative integer"],
     ["report unknown key", [{ at_pct: 100, report: { summary: "x", usage: {} } }], "step 0: unknown report key usage"],
     ["report with branch", [{ at_pct: 100, report: { summary: "x", branch: "b" } }], "step 0: unknown report key branch"],
     ["report no summary", [{ at_pct: 100, report: {} }], "step 0: report.summary must be a string"],
@@ -420,6 +424,25 @@ describe("holodeck run (in process)", () => {
       [ORDER, "model-x", "pick up here"], [ORDER, "model-x", "pick up here"],
       ["ORD-0002", undefined, undefined], ["ORD-0002", undefined, undefined],
     ]);
+  });
+
+  it("emits a usage step's counts with a seq per order, kept across runs, and reports the latest tokens (#117)", async () => {
+    const dir = tempDir();
+    const script = path.join(dir, "usage.json");
+    fs.writeFileSync(script, JSON.stringify([
+      { at_pct: 10, usage: { input_tokens: 100, output_tokens: 20, turns: 1 } },
+      { at_pct: 50, usage: { input_tokens: 900, output_tokens: 70, turns: 3 } },
+      { at_pct: 100, report: { summary: "done" } },
+    ]));
+    const h = holodeckHarness({ script, stepLog: path.join(dir, "steps.ndjson"), workDir: path.join(dir, "work") });
+    const emitted: Outbound[] = [];
+    const first = await h.run({ id: ORDER, body: orderBody, repos: [] }, (m) => emitted.push(m), () => {});
+    const again = await h.run({ id: ORDER, body: orderBody, repos: [] }, (m) => emitted.push(m), () => {});
+    const other = await h.run({ id: "ORD-0002", body: orderBody, repos: [] }, (m) => emitted.push(m), () => {});
+    expect(emitted.map((m) => (m.type === "usage" ? m.body.seq : m.type))).toEqual([1, 2, 3, 4, 1, 2]);
+    expect(emitted[1]).toEqual({ type: "usage", body: { input_tokens: 900, output_tokens: 70, turns: 3, seq: 2 } });
+    for (const r of [first, again, other]) expect(r.usage).toEqual({ input_tokens: 900, output_tokens: 70 });
+    expect(stepLog(dir).map((e) => e.action)).toEqual(["usage", "usage", "report", "usage", "usage", "report", "usage", "usage", "report"]);
   });
 
   it("records each repo's checkout dir in the step log", async () => {

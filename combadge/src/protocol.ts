@@ -136,6 +136,22 @@ export interface Usage {
   output_tokens: number;
 }
 
+/**
+ * Running usage of the order on this beam (#117): cumulative over every run
+ * and query of the order that this serve has seen. Input counts cache reads
+ * and writes. Sent every USAGE_EVERY_TURNS turns and at every checkpoint,
+ * stop and report.
+ */
+export interface UsageBody extends Usage {
+  /** Main-loop turns; a subagent's turns are not counted. */
+  turns: number;
+  /** This report's number for the order on this beam, from 1: a later report has a higher seq. */
+  seq: number;
+}
+
+/** A harness sends `usage` every this many turns. */
+export const USAGE_EVERY_TURNS = 10;
+
 /** Final result of an order. */
 export interface ReportBody {
   summary: string;
@@ -263,6 +279,7 @@ export interface BeamToBridgeBodies {
   hello: HelloBody;
   heartbeat: HeartbeatBody;
   progress: ProgressBody;
+  usage: UsageBody;
   hail: HailBody;
   checkpoint_ready: CheckpointReadyBody;
   report: ReportBody;
@@ -289,7 +306,7 @@ export type BridgeToBeamType = keyof BridgeToBeamBodies;
 export type MessageType = keyof Bodies;
 
 export const BEAM_TO_BRIDGE_TYPES = [
-  "hello", "heartbeat", "progress", "hail", "checkpoint_ready", "report", "error", "consult_reply",
+  "hello", "heartbeat", "progress", "usage", "hail", "checkpoint_ready", "report", "error", "consult_reply",
 ] as const satisfies readonly BeamToBridgeType[];
 
 export const BRIDGE_TO_BEAM_TYPES = [
@@ -311,7 +328,7 @@ export type Payload<T extends MessageType = MessageType> = {
 
 /** Types that belong to one order: the schema requires a non-empty `order` on them. */
 export type OrderBoundType =
-  | "progress" | "hail" | "checkpoint_ready" | "report"
+  | "progress" | "usage" | "hail" | "checkpoint_ready" | "report"
   | "order" | "answer" | "checkpoint" | "recall" | "belay";
 
 /**

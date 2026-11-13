@@ -58,6 +58,13 @@
  *   with the recorded report, or with the agent's final text as the summary
  *   if it never called `report`. serve then bundles each repo's
  *   `bmus/<order>` into the report. A failed query rejects the run.
+ * - Usage (#117; see Tally): the harness counts tokens and main-loop turns
+ *   as the query streams, and keeps the counts per order across a park, a
+ *   resume and a later run of the same order on this serve. It emits `usage`
+ *   (cumulative, with a seq of its own) every USAGE_EVERY_TURNS turns, before
+ *   every checkpoint_ready and before the report, and when a run ends any
+ *   other way with counts not yet reported. The report's usage is the same
+ *   cumulative token count.
  * - An order with a `handover` resumes from a checkpoint: its bundle's tip,
  *   the checkout's starting commit, is presented as that checkpoint, and the
  *   note goes into the system prompt next to the dossier.
@@ -137,6 +144,7 @@ import {
   type HookJSONOutput,
   type Options,
   type PermissionResult,
+  type SDKAssistantMessage,
   type SDKMessage,
   type SDKResultMessage,
   type SDKUserMessage,
@@ -161,6 +169,8 @@ import {
   type ConsultReplyBody,
   type HailBody,
   type Usage,
+  type UsageBody,
+  USAGE_EVERY_TURNS,
 } from "../protocol.js";
 import { abortable, bundleCheckpoint, checkpointFiles, escalate, orderDir, Stopped, type StopCommand } from "./common.js";
 import { git, type RepoCheckout } from "../repos.js";
@@ -216,6 +226,8 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
   const hailParkAfterMs = opts.hailParkAfterMs ?? HAIL_PARK_AFTER_MS;
   const claudePath = opts.claudePath === undefined ? undefined : checkExecutable(path.resolve(opts.claudePath));
   const workDir = path.resolve(opts.workDir);
+  /** Each order's usage on this beam, kept across its runs (#117). */
+  const tallies = new Map<string, Tally>();
 
   return {
     name: "sdk",
@@ -224,6 +236,10 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
     run(order, emit, onInbound) {
       const abort = new AbortController();
       const { signal } = abort;
+      const tally = tallies.get(order.id) ?? new Tally();
+      tallies.set(order.id, tally);
+      /** Emits the order's usage so far (#117). */
+      const sendUsage = () => emit({ type: "usage", body: tally.report() });
       const answers = new Map<string, (a: AnswerBody) => void>();
       /** Each hail's question by ref, and by bridge hail id once answered: a correction names the hail id. */
       const questions = new Map<string, string>();
@@ -390,6 +406,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
       /** Emits a checkpoint; when it answers a stop, marks it stopping and ends the run. */
       const checkpointReady = (body: CheckpointReadyBody) => {
         if (halted) return;
+        sendUsage();
         if (!state.stop) return emit({ type: "checkpoint_ready", body });
         emit({ type: "checkpoint_ready", body: { ...body, stopping: true } });
         end(state.stop.stopped);
@@ -428,6 +445,8 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
         let result: SDKResultMessage | undefined;
         /** The session a resumed query continues. */
         let resume: string | undefined;
+        /** The order's tokens before this run's first query: what the session's queries add is past them. */
+        const before = tally.tokens;
         for (;;) {
           signal.throwIfAborted();
           const q = (current = new AbortController());
@@ -447,12 +466,15 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
           // Entries last until this query ends, or GRANT_TTL_MS after it starts.
           const expiry = grants.length > 0 ? setTimeout(() => (grants = []), GRANT_TTL_MS) : undefined;
           const abandoned = new Promise<void>((r) => (abandon = r));
+          tally.start(resume === undefined ? undefined : minus(tally.tokens, before));
           const consumed = (async () => {
             for await (const m of query({ prompt: input, options: { ...options, ...perQuery } })) {
               // Aborted (a park, a belay, a stop's end): its messages change nothing. A belay or stop then ends the run below.
               if (q.signal.aborted) return;
               if ("session_id" in m && typeof m.session_id === "string") state.sessionId = m.session_id;
+              if (m.type === "assistant" && tally.assistant(m) && tally.turns % USAGE_EVERY_TURNS === 0) sendUsage();
               if (m.type === "result") {
+                tally.result(m);
                 result ??= m;
                 if (!state.stop) input.close();
                 else if (state.report) {
@@ -472,6 +494,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
             // The park's abort ends the query; anything else fails the run.
             if (!park) throw err;
           } finally {
+            tally.end();
             signal.removeEventListener("abort", chain);
             clearTimeout(expiry);
             clearTimeout(windDown);
@@ -496,10 +519,11 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
         if (result.subtype !== "success") throw new Error(`agent failed (${result.subtype}): ${result.errors.join("; ")}`);
         if (result.is_error) throw new Error(`agent failed: ${result.result}`);
         const reported = state.report;
+        sendUsage();
         return {
           summary: reported?.summary ?? result.result,
           ...(reported?.artifacts && { artifacts: reported.artifacts }),
-          usage: usageOf(result),
+          usage: tally.tokens,
         };
       };
       const driven = drive().finally(() => {
@@ -509,8 +533,15 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
         clearTimeout(grace);
         for (const h of held.values()) clearTimeout(h.timer);
       });
-      // A query the harness aborted ends however halt says.
-      return Promise.race([halting, driven.catch((err: unknown) => (signal.aborted ? halting : Promise.reject(err as Error)))]);
+      // A query the harness aborted ends however halt says. A run ending
+      // without a report (a stop, a belay, a failure) reports usage counted
+      // since the last report, if any.
+      return Promise.race([halting, driven.catch((err: unknown) => (signal.aborted ? halting : Promise.reject(err as Error)))]).catch(
+        (err: unknown) => {
+          if (tally.changed) sendUsage();
+          throw err as Error;
+        },
+      );
     },
   };
 }
@@ -1176,7 +1207,8 @@ export async function writeCheckpoint(
 /**
  * Totals over every model the query used (modelUsage covers subagents and
  * compaction; `usage` is the main loop only). Input counts cache reads and
- * writes too: they are input the order consumed.
+ * writes too: they are input the order consumed. modelUsage is cumulative
+ * over the query's results, so the latest result holds the query's total.
  */
 function usageOf(result: SDKResultMessage): Usage {
   const total = { input_tokens: 0, output_tokens: 0 };
@@ -1185,6 +1217,116 @@ function usageOf(result: SDKResultMessage): Usage {
     total.output_tokens += m.outputTokens ?? 0;
   }
   return total;
+}
+
+// ---- usage (#117) ----
+
+const ZERO: Usage = { input_tokens: 0, output_tokens: 0 };
+const plus = (a: Usage, b: Usage): Usage => ({ input_tokens: a.input_tokens + b.input_tokens, output_tokens: a.output_tokens + b.output_tokens });
+const minus = (a: Usage, b: Usage): Usage => ({
+  input_tokens: Math.max(0, a.input_tokens - b.input_tokens),
+  output_tokens: Math.max(0, a.output_tokens - b.output_tokens),
+});
+const covers = (a: Usage, b: Usage) => a.input_tokens >= b.input_tokens && a.output_tokens >= b.output_tokens;
+
+/** An assistant message's `message.usage`, as Usage: input counts cache reads and writes. */
+function streamedUsage(m: SDKAssistantMessage): Usage {
+  const u = (m.message as unknown as { usage?: Partial<Record<string, unknown>> } | undefined)?.usage ?? {};
+  const n = (k: string) => (typeof u[k] === "number" ? u[k] : 0);
+  return {
+    input_tokens: n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens"),
+    output_tokens: n("output_tokens"),
+  };
+}
+
+/**
+ * An order's usage on this beam (#117), counted as the queries stream and
+ * kept by the harness across runs, so it survives a park and a resume and a
+ * stopped order sent here again.
+ *
+ * - A main-loop assistant message adds its usage and one turn; a
+ *   subagent's (parent_tool_use_id set) adds its usage only. The CLI sends
+ *   one message per content block, several sharing a message id and none
+ *   with final usage: a message id counts once, as one turn, at the usage
+ *   of its latest message.
+ * - A result replaces the running query's count with usageOf(result), which
+ *   also counts what the stream didn't show (compaction, say).
+ * - A resumed session's results may already carry its earlier queries'
+ *   totals, when its transcript saved them. A resumed query's result that
+ *   covers those plus what this query streamed is taken as such, and the
+ *   earlier queries' tokens are taken off it.
+ */
+export class Tally {
+  turns = 0;
+  /** The order's usage reports so far, the last one's seq. */
+  seq = 0;
+  /** Tokens of the order's ended queries. */
+  private ended: Usage = ZERO;
+  /** The running query's tokens: what it streamed, then its latest result's. */
+  private query: Usage = ZERO;
+  /** Tokens this query streamed, results aside. */
+  private streamed: Usage = ZERO;
+  /** The running query's message ids, each at the usage counted for it. */
+  private byId = new Map<string, Usage>();
+  /** Tokens of the session's earlier queries, when this query resumes one. */
+  private earlier: Usage = ZERO;
+  /** The counts the last usage report carried. */
+  private sent = "";
+
+  /** A query starts; resumes is the tokens of the earlier queries of the session it resumes, if any. */
+  start(resumes: Usage = ZERO): void {
+    this.earlier = resumes;
+  }
+
+  /** The order's tokens so far: ended queries plus the running one. */
+  get tokens(): Usage {
+    return plus(this.ended, this.query);
+  }
+
+  /** Counts an assistant message; true when it added a turn. */
+  assistant(m: SDKAssistantMessage): boolean {
+    const u = streamedUsage(m);
+    const id = typeof m.message?.id === "string" && m.message.id !== "" ? m.message.id : undefined;
+    const prev = id === undefined ? undefined : this.byId.get(id);
+    if (id !== undefined) this.byId.set(id, u);
+    this.query = plus(minus(this.query, prev ?? ZERO), u);
+    this.streamed = plus(minus(this.streamed, prev ?? ZERO), u);
+    if (prev !== undefined || m.parent_tool_use_id !== null) return false;
+    this.turns++;
+    return true;
+  }
+
+  /** A result: the query's count becomes usageOf(result), less a resumed session's earlier queries. */
+  result(r: SDKResultMessage): void {
+    const total = usageOf(r);
+    this.query = covers(total, plus(this.earlier, this.streamed)) ? minus(total, this.earlier) : total;
+    this.byId.clear();
+  }
+
+  /** The running query ended (a result, an abort, a failure): its tokens join the ended ones. */
+  end(): void {
+    this.ended = this.tokens;
+    this.query = ZERO;
+    this.streamed = ZERO;
+    this.byId.clear();
+    this.earlier = ZERO;
+  }
+
+  /** Counts differ from the last report's. */
+  get changed(): boolean {
+    return this.key() !== this.sent;
+  }
+
+  /** The next usage report: the counts so far, under the next seq. */
+  report(): UsageBody {
+    this.sent = this.key();
+    return { ...this.tokens, turns: this.turns, seq: ++this.seq };
+  }
+
+  private key(): string {
+    const t = this.tokens;
+    return `${t.input_tokens}/${t.output_tokens}/${this.turns}`;
+  }
 }
 
 // ---- prompt ----

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -121,7 +122,14 @@ type holodeckBeam struct {
 
 func startHolodeckBeam(t *testing.T) holodeckBeam {
 	t.Helper()
-	script, err := filepath.Abs(filepath.Join("..", "..", "combadge", "test", "fixtures", "default.json"))
+	return startHolodeckBeamScript(t, "default.json")
+}
+
+// startHolodeckBeamScript is startHolodeckBeam with another script from
+// combadge/test/fixtures.
+func startHolodeckBeamScript(t *testing.T, fixture string) holodeckBeam {
+	t.Helper()
+	script, err := filepath.Abs(filepath.Join("..", "..", "combadge", "test", "fixtures", fixture))
 	require.NoError(t, err)
 	// t.TempDir paths can push serve.sock past the Unix socket limit.
 	base := os.TempDir()
@@ -473,4 +481,111 @@ func TestPumpHolodeckRecycleDeliversWrittenCommand(t *testing.T) {
 	msgs := waitMission(t, sink, 1)
 	require.Equal(t, TypeHail, msgs[0].Type)
 	require.Equal(t, "ORD-0001", msgs[0].Order)
+}
+
+// recordingHandler keeps every log record at or above debug, for tests that
+// check what the pump logged.
+type recordingHandler struct {
+	mu      *sync.Mutex
+	records *[]slog.Record
+}
+
+func newRecordingLogger() (*slog.Logger, func() []slog.Record) {
+	h := recordingHandler{mu: &sync.Mutex{}, records: &[]slog.Record{}}
+	return slog.New(h), func() []slog.Record {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return slices.Clone(*h.records)
+	}
+}
+
+func (recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	*h.records = append(*h.records, r.Clone())
+	return nil
+}
+func (h recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h recordingHandler) WithGroup(string) slog.Handler      { return h }
+
+// #117: a holodeck script's usage steps reach the bridge as usage messages.
+// The pump records and acks them, and for now only logs them at debug
+// (#118 stores them): no mission, crew-error or log entry, and no
+// unknown-type warning.
+func TestPumpHolodeckUsage(t *testing.T) {
+	t.Parallel()
+	b := startHolodeckBeamScript(t, "usage.json")
+	st := b.openStore(t)
+	logger, records := newRecordingLogger()
+	link, sink := b.link(), &fakeSink{}
+	cfg := holodeckPumpConfig(st, link, sink)
+	cfg.Logger = logger
+	p := startTestPump(t, cfg)
+	waitConnected(t, p)
+
+	order, err := NewMessage(TypeOrder, OrderBody{Title: "holodeck", Body: "count it"})
+	require.NoError(t, err)
+	order.Order = "ORD-0001"
+	_, err = p.Send(order)
+	require.NoError(t, err)
+
+	msgs := waitMission(t, sink, 1)
+	require.Equal(t, TypeReport, msgs[0].Type)
+	var report ReportBody
+	require.NoError(t, json.Unmarshal(msgs[0].Body, &report))
+	require.Equal(t, Usage{InputTokens: 5400, OutputTokens: 910}, report.Usage)
+
+	type usageLog struct {
+		Order                     string
+		Input, Output, Turns, Seq uint64
+	}
+	var got []usageLog
+	var usageSeqs []uint64
+	for _, r := range records() {
+		require.NotEqual(t, "comms: skipping message of unknown type", r.Message)
+		if r.Message != "comms: usage" {
+			continue
+		}
+		require.Equal(t, slog.LevelDebug, r.Level)
+		var u usageLog
+		r.Attrs(func(a slog.Attr) bool {
+			switch a.Key {
+			case "order":
+				u.Order = a.Value.String()
+			case "input_tokens":
+				u.Input = a.Value.Uint64()
+			case "output_tokens":
+				u.Output = a.Value.Uint64()
+			case "turns":
+				u.Turns = a.Value.Uint64()
+			case "usage_seq":
+				u.Seq = a.Value.Uint64()
+			case "seq":
+				usageSeqs = append(usageSeqs, a.Value.Uint64())
+			}
+			return true
+		})
+		got = append(got, u)
+	}
+	require.Equal(t, []usageLog{
+		{Order: "ORD-0001", Input: 1200, Output: 300, Turns: 4, Seq: 1},
+		{Order: "ORD-0001", Input: 5400, Output: 910, Turns: 10, Seq: 2},
+	}, got)
+	// Both came before the report, and were recorded in the inbox like any other message.
+	require.Len(t, usageSeqs, 2)
+	for _, seq := range usageSeqs {
+		require.Less(t, seq, msgs[0].Seq)
+		seen, err := st.SeenInbox(t.Context(), "crew-1", 0, seq)
+		require.NoError(t, err)
+		require.True(t, seen, "usage seq %d not recorded", seq)
+	}
+
+	require.Len(t, sink.missions(), 1, "usage never reaches a mission")
+	require.Empty(t, sink.errors())
+	entries, err := st.ListLog(t.Context(), 0)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "only the progress step is logged")
+	require.Equal(t, "surveying the codebase", entries[0].Text)
+	requireInboxContiguous(t, st, b.dbPath, p)
 }

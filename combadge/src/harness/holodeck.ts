@@ -10,6 +10,11 @@
  *
  *   {"at_pct": 10, "progress": "note"}
  *       Emits progress {pct: at_pct, note}.
+ *   {"at_pct": 30, "usage": {"input_tokens": 1200, "output_tokens": 300, "turns": 4}}
+ *       Emits usage with those counts (#117), which stand for the order's
+ *       cumulative usage on this beam, and the next seq for the order (from
+ *       1, across every run of it this serve sees). Each count is a
+ *       non-negative integer.
  *   {"at_pct": 40, "hail": {"category": "...", "question": "...", "options": [...], "context": {...}}}
  *       Emits a hail with ref `holodeck-<order>-<index>` (options/context
  *       optional) and waits for the answer echoing that ref. The answer's
@@ -28,7 +33,8 @@
  *   {"at_pct": 50, "sleep_ms": 3000}
  *       Waits (at most 2147483647 ms, Node's timer limit).
  *   {"at_pct": 100, "report": {"summary": "...", "artifacts": [...]}}
- *       Terminal. The run resolves with that report (usage is zero); serve
+ *       Terminal. The run resolves with that report, its usage the tokens of
+ *       the order's latest usage step (zero without one); serve
  *       bundles each repo's `bmus/<order>` into it and emits it.
  *   {"at_pct": 100, "crash": 137}
  *       Terminal. The whole serve process exits at once with that code (1-255)
@@ -92,16 +98,18 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { AnswerBody, ConsultReplyBody, HailBody, ReportBody } from "../protocol.js";
+import type { AnswerBody, ConsultReplyBody, HailBody, ReportBody, Usage, UsageBody } from "../protocol.js";
 import { git } from "../repos.js";
 import { abortable, orderDir, Stopped, writePlaceholderCheckpoint } from "./common.js";
 import type { Harness, HarnessOptions, HarnessReport, Inbound, Order } from "./types.js";
 
 type HailSpec = Omit<HailBody, "ref">;
 type ReportSpec = Omit<ReportBody, "usage" | "repos">;
+type UsageSpec = Omit<UsageBody, "seq">;
 
 export type Step = { at_pct: number } & (
   | { progress: string }
+  | { usage: UsageSpec }
   | { hail: HailSpec }
   | { commit: string }
   | { request_handover: string }
@@ -121,7 +129,7 @@ type Delivered<T> = { body: T; delivery: number };
 
 export type ConsultSpec = (Omit<ConsultReplyBody, "hail_id" | "rationale"> & { rationale?: string }) | "silence";
 
-const ACTIONS = ["progress", "hail", "commit", "request_handover", "sleep_ms", "report", "crash"] as const;
+const ACTIONS = ["progress", "usage", "hail", "commit", "request_handover", "sleep_ms", "report", "crash"] as const;
 type Action = (typeof ACTIONS)[number];
 const TERMINAL = new Set<Action>(["report", "crash"]);
 /** Longest Node timer; anything above it fires after 1ms. */
@@ -133,6 +141,8 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
   const workDir = path.resolve(opts.workDir);
   const stepLog = opts.stepLog === undefined ? undefined : path.resolve(opts.stepLog);
   let deliveries = 0; // inbound messages so far, for the step log's "delivery"
+  /** Each order's latest usage step and its seq, kept across runs as the sdk harness keeps its counts. */
+  const usages = new Map<string, { usage: Usage; seq: number }>();
 
   return {
     name: "holodeck",
@@ -208,6 +218,12 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
           if ("progress" in step) {
             emit({ type: "progress", body: { pct: step.at_pct, note: step.progress } });
             log();
+          } else if ("usage" in step) {
+            const { input_tokens, output_tokens, turns } = step.usage;
+            const seq = (usages.get(order.id)?.seq ?? 0) + 1;
+            usages.set(order.id, { usage: { input_tokens, output_tokens }, seq });
+            emit({ type: "usage", body: { input_tokens, output_tokens, turns, seq } });
+            log();
           } else if ("hail" in step) {
             const ref = `holodeck-${order.id}-${index}`;
             const answer = abortable(new Promise<Delivered<AnswerBody>>((resolve) => answers.set(ref, resolve)), signal);
@@ -236,7 +252,7 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
           } else if ("report" in step) {
             log();
             finished = true;
-            return { ...step.report, usage: { input_tokens: 0, output_tokens: 0 } };
+            return { ...step.report, usage: usages.get(order.id)?.usage ?? { input_tokens: 0, output_tokens: 0 } };
           } else {
             log();
             process.exit(step.crash);
@@ -355,6 +371,15 @@ export function validateScript(raw: unknown): Step[] {
       case "crash":
         if (!Number.isInteger(v) || (v as number) < 1 || (v as number) > 255) fail("crash must be an exit code from 1 to 255");
         break;
+      case "usage": {
+        if (!isObject(v)) fail("usage must be an object");
+        const u = v as Record<string, unknown>;
+        onlyKeys(u, ["input_tokens", "output_tokens", "turns"], "usage", fail);
+        for (const k of ["input_tokens", "output_tokens", "turns"]) {
+          if (!Number.isSafeInteger(u[k]) || (u[k] as number) < 0) fail(`usage.${k} must be a non-negative integer`);
+        }
+        break;
+      }
       case "hail": {
         if (!isObject(v)) fail("hail must be an object");
         const h = v as Record<string, unknown>;
