@@ -1108,6 +1108,10 @@ const resultWith = (input: number, output: number) =>
 describe("sdk harness usage (#117)", () => {
   it("counts main-loop turns and every message's tokens, reports every 10 turns, and takes the result's totals", async () => {
     const dir = tempDir();
+    /** The current run's usage reports so far. */
+    let reports = () => 0;
+    /** reports() after nine turns, per run: nine turns report nothing. */
+    const atNine: number[] = [];
     const script = async function* (agent: Agent): AsyncGenerator<SDKMessage> {
       await agent.nextInput();
       yield init;
@@ -1116,37 +1120,60 @@ describe("sdk harness usage (#117)", () => {
       yield assistant("m1", { input: 10, output: 7, cacheRead: 100, cacheWrite: 5 });
       // A subagent's message: tokens, no turn.
       yield assistant("s1", { input: 50, output: 5 }, "toolu_agent");
+      // A synthetic API-error message: nothing.
+      yield msg({ ...(assistant("e1", { input: 0, output: 0 }) as object), error: "rate_limit" });
       for (let i = 2; i <= 9; i++) yield assistant(`m${i}`, { input: 1, output: 1 });
-      atNine.push(agentUsages().length);
+      atNine.push(reports());
       yield assistant("m10", { input: 1, output: 1 });
-      yield success;
+      // modelUsage counts more than the stream showed.
+      yield resultWith(300, 40);
     };
-    /** run.usages' length after nine turns, per run: nine turns report nothing. */
-    const atNine: number[] = [];
-    let agentUsages = () => [] as UsageBody[];
     const run = start(script, { dir, repo: dir, claudePath: fakeClaude(dir) });
-    agentUsages = () => run.usages;
+    reports = () => run.usages.length;
     const report = await run.result;
-    // modelUsage: 10 + 5 + 100 + 3 + 0 + 2 in, 7 + 4 out.
-    expect(report.usage).toEqual({ input_tokens: 120, output_tokens: 11 });
+    expect(report.usage).toEqual({ input_tokens: 300, output_tokens: 40 });
     expect(atNine).toEqual([0]);
     expect(run.usages).toEqual([
-      { input_tokens: 115 + 50 + 9, output_tokens: 7 + 5 + 9, turns: 10, seq: 1 },
-      { input_tokens: 120, output_tokens: 11, turns: 10, seq: 2 },
+      { input_tokens: 115 + 50 + 9, output_tokens: 7 + 5 + 9, turns: 10 },
+      { input_tokens: 300, output_tokens: 40, turns: 10 },
     ]);
 
-    // The same order run again on this harness (a stopped order sent back here) carries on from there.
+    // The order's next run here (a stopped order sent back) carries on from serve's record of it.
     const again: Outbound[] = [];
-    const second = await run.harness.run({ id: ORDER, body: orderBody, repos: [{ name: "app", dir, base_ref: "main", base_commit: "main" }] }, (m) => again.push(m), () => {});
-    expect(second.usage).toEqual({ input_tokens: 240, output_tokens: 22 });
-    expect(atNine).toEqual([0, 2]); // the second run's reports go to again
+    reports = () => again.filter((m) => m.type === "usage").length;
+    const usage = { input_tokens: 300, output_tokens: 40, turns: 10 };
+    const repos = [{ name: "app", dir, base_ref: "main", base_commit: "main" }];
+    const second = await run.harness.run({ id: ORDER, body: orderBody, repos, usage }, (m) => again.push(m), () => {});
+    expect(second.usage).toEqual({ input_tokens: 600, output_tokens: 80 });
+    expect(atNine).toEqual([0, 0]);
     expect(again).toEqual([
-      { type: "usage", body: { input_tokens: 120 + 174, output_tokens: 11 + 21, turns: 20, seq: 3 } },
-      { type: "usage", body: { input_tokens: 240, output_tokens: 22, turns: 20, seq: 4 } },
+      { type: "usage", body: { input_tokens: 300 + 174, output_tokens: 40 + 21, turns: 20 } },
+      { type: "usage", body: { input_tokens: 600, output_tokens: 80, turns: 20 } },
     ]);
   });
 
-  it("reports usage before every checkpoint and before the report", async () => {
+  it("never lowers a count: a result below the stream, or a zeroed error result, keeps what was counted", async () => {
+    const dir = tempDir();
+    const low = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      yield assistant("m1", { input: 30, output: 9 });
+      yield resultWith(50, 2); // more input, less output than streamed
+    }, { dir, repo: dir, claudePath: fakeClaude(dir) });
+    expect((await low.result).usage).toEqual({ input_tokens: 50, output_tokens: 9 });
+    expect(low.usages).toEqual([{ input_tokens: 50, output_tokens: 9, turns: 1 }]);
+
+    const crashed = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      yield assistant("m1", { input: 30, output: 3 });
+      yield msg({ type: "result", subtype: "error_during_execution", is_error: true, errors: ["boom"], session_id: "sess-1", modelUsage: {} });
+    }, { dir, repo: dir, claudePath: fakeClaude(dir) });
+    await expect(crashed.result).rejects.toThrow("agent failed (error_during_execution): boom");
+    expect(crashed.usages).toEqual([{ input_tokens: 30, output_tokens: 3, turns: 1 }]);
+  });
+
+  it("reports usage before a checkpoint and before the report, only when it changed", async () => {
     const dir = tempDir();
     const repo = gitRepo(dir);
     const transcript = path.join(dir, "sess-1.jsonl");
@@ -1157,15 +1184,17 @@ describe("sdk harness usage (#117)", () => {
       yield assistant("m1", { input: 30, output: 3 });
       await agent.preToolUse("mcp__combadge__request_handover", { note: "x" }, transcript);
       await agent.callTool("request_handover", { note: "halfway" });
-      seen.push(...run.usages.map((u) => `${u.seq}:${u.input_tokens}`), ...run.emitted.map((m) => m.type));
+      seen.push(...run.usages.map((u) => String(u.input_tokens)), ...run.emitted.map((m) => m.type));
+      await agent.callTool("request_handover", { note: "nothing new" });
       yield assistant("m2", { input: 40, output: 4 });
       yield resultWith(75, 8);
     }, { dir, repo, claudePath: fakeClaude(dir) });
     await run.result;
-    expect(seen).toEqual(["1:30", "checkpoint_ready"]);
+    expect(seen).toEqual(["30", "checkpoint_ready"]);
+    expect(run.emitted.map((m) => m.type)).toEqual(["checkpoint_ready", "checkpoint_ready"]);
     expect(run.usages).toEqual([
-      { input_tokens: 30, output_tokens: 3, turns: 1, seq: 1 },
-      { input_tokens: 75, output_tokens: 8, turns: 2, seq: 2 },
+      { input_tokens: 30, output_tokens: 3, turns: 1 },
+      { input_tokens: 75, output_tokens: 8, turns: 2 },
     ]);
   });
 
@@ -1178,7 +1207,26 @@ describe("sdk harness usage (#117)", () => {
       throw new Error("model overloaded");
     }, { dir, repo: dir, claudePath: fakeClaude(dir) });
     await expect(run.result).rejects.toThrow("model overloaded");
-    expect(run.usages).toEqual([{ input_tokens: 30, output_tokens: 3, turns: 1, seq: 1 }]);
+    expect(run.usages).toEqual([{ input_tokens: 30, output_tokens: 3, turns: 1 }]);
+  });
+
+  it("reports what a belayed run counted", async () => {
+    const dir = tempDir();
+    let counted!: () => void;
+    const midway = new Promise<void>((r) => (counted = r));
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      yield assistant("m1", { input: 30, output: 3 });
+      yield assistant("m2", { input: 20, output: 2 });
+      counted();
+      await agent.aborted();
+      throw new Error("Claude Code process aborted by user");
+    }, { dir, repo: dir, claudePath: fakeClaude(dir) });
+    await midway;
+    run.send({ type: "belay", body: { reason: "wrong repo" } });
+    await expect(run.result).rejects.toThrow("belayed: wrong repo");
+    expect(run.usages).toEqual([{ input_tokens: 50, output_tokens: 5, turns: 2 }]);
   });
 });
 
@@ -1276,6 +1324,9 @@ describe("sdk harness parking", () => {
     ["only its own turns", resultWith(230, 25), { input_tokens: 140 + 230, output_tokens: 14 + 25 }],
     // The transcript saved the parked query's totals, so the resumed result carries them too (#117).
     ["the parked query's turns too", resultWith(380, 40), { input_tokens: 380, output_tokens: 40 }],
+    // Misread: its own turns only, but past the earlier 140/14 plus the streamed 200/20 (unstreamed
+    // compaction and output). Taken as carrying the earlier turns: low by those, 140/14.
+    ["only its own turns, more than all it streamed plus the parked query's", resultWith(400, 40), { input_tokens: 400, output_tokens: 40 }],
   ])("keeps usage across a park and a resume whose result carries %s (#117)", async (_, resumedResult, total) => {
     const dir = tempDir();
     const run = start(async function* (agent) {
@@ -1286,7 +1337,7 @@ describe("sdk harness parking", () => {
         yield assistant("s1", { input: 40, output: 4 }, "toolu_agent");
         void agent.hold("Bash", DEPLOY);
         await agent.aborted();
-        // The aborted query's last messages count for nothing.
+        // Messages that arrive once the query is aborted count for nothing.
         yield assistant("a2", { input: 1000, output: 100 });
         throw new Error("Claude Code process aborted by user");
       }
@@ -1299,7 +1350,7 @@ describe("sdk harness parking", () => {
     run.answer(deploy, "allow", 0);
     const report = await run.result;
     expect(report.usage).toEqual(total);
-    expect(run.usages).toEqual([{ ...total, turns: 2, seq: 1 }]);
+    expect(run.usages).toEqual([{ ...total, turns: 2 }]);
   });
 
   it("reports usage at a stop's checkpoint while parked, counting the parked query's turns", async () => {
@@ -1327,7 +1378,7 @@ describe("sdk harness parking", () => {
     run.send({ type: "stand_down", body: { reason: "watch change" } });
     await expect(run.result).rejects.toBeInstanceOf(Stopped);
     expect(run.emitted.at(-1)).toMatchObject({ type: "checkpoint_ready", body: { stopping: true } });
-    expect(run.usages).toEqual([{ input_tokens: 300, output_tokens: 30, turns: 2, seq: 1 }]);
+    expect(run.usages).toEqual([{ input_tokens: 300, output_tokens: 30, turns: 2 }]);
   });
 
   it("hails a re-issue whose command or timeout differs from the allowed call's", async () => {

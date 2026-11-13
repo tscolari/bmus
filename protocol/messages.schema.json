@@ -131,15 +131,14 @@
       }
     },
     "usage_report": {
-      "description": "beam->bridge. Running usage of the order on this beam (#117), cumulative over every run and query of the order the combadge has seen; input counts cache reads and writes. Sent every 10 turns and at every checkpoint, stop and report. The bridge keeps the report with the highest seq for (order, beam).",
+      "description": "beam->bridge. Running usage of the order on this beam (#117), cumulative over every run and query of the order on this beam, combadge restarts included; input counts cache reads and writes. Counts never decrease. Sent every 10 turns and at every checkpoint, stop and report. The latest report for (order, beam) is the one with the highest envelope seq, which is monotonic across combadge restarts.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["input_tokens", "output_tokens", "turns", "seq"],
+      "required": ["input_tokens", "output_tokens", "turns"],
       "properties": {
         "input_tokens": {"type": "integer", "minimum": 0},
         "output_tokens": {"type": "integer", "minimum": 0},
-        "turns": {"description": "Main-loop turns; a subagent's are not counted.", "type": "integer", "minimum": 0},
-        "seq": {"description": "This report's number for the order on this beam, from 1.", "type": "integer", "minimum": 1}
+        "turns": {"description": "Main-loop turns; a subagent's are not counted.", "type": "integer", "minimum": 0}
       }
     },
     "hail": {

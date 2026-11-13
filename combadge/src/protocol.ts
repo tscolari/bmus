@@ -138,15 +138,15 @@ export interface Usage {
 
 /**
  * Running usage of the order on this beam (#117): cumulative over every run
- * and query of the order that this serve has seen. Input counts cache reads
- * and writes. Sent every USAGE_EVERY_TURNS turns and at every checkpoint,
- * stop and report.
+ * and query of the order on this beam, combadge restarts included (serve
+ * keeps the latest counts in state.json). Input counts cache reads and
+ * writes. Counts never decrease; the latest report for an order is the one
+ * with the highest envelope seq. Sent every USAGE_EVERY_TURNS turns and at
+ * every checkpoint, stop and report.
  */
 export interface UsageBody extends Usage {
   /** Main-loop turns; a subagent's turns are not counted. */
   turns: number;
-  /** This report's number for the order on this beam, from 1: a later report has a higher seq. */
-  seq: number;
 }
 
 /** A harness sends `usage` every this many turns. */

@@ -537,8 +537,8 @@ func TestPumpHolodeckUsage(t *testing.T) {
 	require.Equal(t, Usage{InputTokens: 5400, OutputTokens: 910}, report.Usage)
 
 	type usageLog struct {
-		Order                     string
-		Input, Output, Turns, Seq uint64
+		Order                string
+		Input, Output, Turns uint64
 	}
 	var got []usageLog
 	var usageSeqs []uint64
@@ -559,8 +559,6 @@ func TestPumpHolodeckUsage(t *testing.T) {
 				u.Output = a.Value.Uint64()
 			case "turns":
 				u.Turns = a.Value.Uint64()
-			case "usage_seq":
-				u.Seq = a.Value.Uint64()
 			case "seq":
 				usageSeqs = append(usageSeqs, a.Value.Uint64())
 			}
@@ -569,8 +567,8 @@ func TestPumpHolodeckUsage(t *testing.T) {
 		got = append(got, u)
 	}
 	require.Equal(t, []usageLog{
-		{Order: "ORD-0001", Input: 1200, Output: 300, Turns: 4, Seq: 1},
-		{Order: "ORD-0001", Input: 5400, Output: 910, Turns: 10, Seq: 2},
+		{Order: "ORD-0001", Input: 1200, Output: 300, Turns: 4},
+		{Order: "ORD-0001", Input: 5400, Output: 910, Turns: 10},
 	}, got)
 	// Both came before the report, and were recorded in the inbox like any other message.
 	require.Len(t, usageSeqs, 2)

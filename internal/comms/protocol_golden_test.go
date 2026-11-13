@@ -142,7 +142,7 @@ func TestSchemaRejects(t *testing.T) {
 		{"confidence over 1", mutate("consult_reply", func(_, b map[string]any) { b["confidence"] = 1.5 })},
 		{"usage without order", mutate("usage", func(m, _ map[string]any) { delete(m, "order") })},
 		{"usage without turns", mutate("usage", func(_, b map[string]any) { delete(b, "turns") })},
-		{"usage with seq 0", mutate("usage", func(_, b map[string]any) { b["seq"] = 0 })},
+		{"usage with a seq", mutate("usage", func(_, b map[string]any) { b["seq"] = 2 })},
 		{"usage with negative tokens", mutate("usage", func(_, b map[string]any) { b["input_tokens"] = -1 })},
 		{"pct as string", mutate("progress", func(_, b map[string]any) { b["pct"] = "40" })},
 		{"empty order on error", mutate("error", func(m, _ map[string]any) { m["order"] = "" })},

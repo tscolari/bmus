@@ -1,4 +1,4 @@
-import type { ConsultBody, ConsultReplyBody, OrderBody, Payload, ReportBody } from "../protocol.js";
+import type { ConsultBody, ConsultReplyBody, OrderBody, Payload, ReportBody, UsageBody } from "../protocol.js";
 import type { RepoCheckout } from "../repos.js";
 
 /**
@@ -10,6 +10,13 @@ export interface Order {
   id: string;
   body: OrderBody;
   repos: RepoCheckout[];
+  /**
+   * The order's usage on this beam so far (#117): serve's record of its
+   * latest usage report from an earlier run, kept across combadge restarts.
+   * Absent on an order's first run here. A harness that reports usage
+   * carries on from it.
+   */
+  usage?: UsageBody;
 }
 
 /**

@@ -12,9 +12,8 @@
  *       Emits progress {pct: at_pct, note}.
  *   {"at_pct": 30, "usage": {"input_tokens": 1200, "output_tokens": 300, "turns": 4}}
  *       Emits usage with those counts (#117), which stand for the order's
- *       cumulative usage on this beam, and the next seq for the order (from
- *       1, across every run of it this serve sees). Each count is a
- *       non-negative integer.
+ *       cumulative usage on this beam. Each count is a non-negative integer.
+ *       Unlike the sdk harness, nothing checks they never decrease.
  *   {"at_pct": 40, "hail": {"category": "...", "question": "...", "options": [...], "context": {...}}}
  *       Emits a hail with ref `holodeck-<order>-<index>` (options/context
  *       optional) and waits for the answer echoing that ref. The answer's
@@ -34,7 +33,8 @@
  *       Waits (at most 2147483647 ms, Node's timer limit).
  *   {"at_pct": 100, "report": {"summary": "...", "artifacts": [...]}}
  *       Terminal. The run resolves with that report, its usage the tokens of
- *       the order's latest usage step (zero without one); serve
+ *       the run's latest usage step, else of the order's earlier runs on this
+ *       beam (Order.usage), else zero; serve
  *       bundles each repo's `bmus/<order>` into it and emits it.
  *   {"at_pct": 100, "crash": 137}
  *       Terminal. The whole serve process exits at once with that code (1-255)
@@ -105,7 +105,7 @@ import type { Harness, HarnessOptions, HarnessReport, Inbound, Order } from "./t
 
 type HailSpec = Omit<HailBody, "ref">;
 type ReportSpec = Omit<ReportBody, "usage" | "repos">;
-type UsageSpec = Omit<UsageBody, "seq">;
+type UsageSpec = UsageBody;
 
 export type Step = { at_pct: number } & (
   | { progress: string }
@@ -141,8 +141,6 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
   const workDir = path.resolve(opts.workDir);
   const stepLog = opts.stepLog === undefined ? undefined : path.resolve(opts.stepLog);
   let deliveries = 0; // inbound messages so far, for the step log's "delivery"
-  /** Each order's latest usage step and its seq, kept across runs as the sdk harness keeps its counts. */
-  const usages = new Map<string, { usage: Usage; seq: number }>();
 
   return {
     name: "holodeck",
@@ -210,6 +208,8 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
         ...(order.body.model !== undefined && order.body.model !== "" && { model: order.body.model }),
         ...(order.body.handover !== undefined && order.body.handover !== "" && { handover: order.body.handover }),
       };
+      /** The tokens the report carries: the latest usage step's, else the order's earlier runs'. */
+      let tokens: Usage = { input_tokens: order.usage?.input_tokens ?? 0, output_tokens: order.usage?.output_tokens ?? 0 };
       const walk = async (): Promise<HarnessReport> => {
         for (const [index, step] of steps.entries()) {
           signal.throwIfAborted();
@@ -220,9 +220,8 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
             log();
           } else if ("usage" in step) {
             const { input_tokens, output_tokens, turns } = step.usage;
-            const seq = (usages.get(order.id)?.seq ?? 0) + 1;
-            usages.set(order.id, { usage: { input_tokens, output_tokens }, seq });
-            emit({ type: "usage", body: { input_tokens, output_tokens, turns, seq } });
+            tokens = { input_tokens, output_tokens };
+            emit({ type: "usage", body: { input_tokens, output_tokens, turns } });
             log();
           } else if ("hail" in step) {
             const ref = `holodeck-${order.id}-${index}`;
@@ -252,7 +251,7 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
           } else if ("report" in step) {
             log();
             finished = true;
-            return { ...step.report, usage: usages.get(order.id)?.usage ?? { input_tokens: 0, output_tokens: 0 } };
+            return { ...step.report, usage: tokens };
           } else {
             log();
             process.exit(step.crash);

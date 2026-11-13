@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { UsageBody } from "./protocol.js";
 
 interface StateData {
   /** Bridge command ids (envelope seq) already handled. */
@@ -14,6 +15,8 @@ interface StateData {
   completed: string[];
   /** Orders a stand_down or recall stopped; a resend runs again, from a clean order dir. */
   stopped: string[];
+  /** Each unfinished order's latest usage report (#117), so its counts carry on after a restart. */
+  usage: Record<string, UsageBody>;
 }
 
 /** One atomic change to the state; every field present is applied. */
@@ -25,13 +28,16 @@ export interface Change {
   stopping?: string;
   completed?: string;
   stopped?: string;
+  /** An order's latest usage report. */
+  usage?: { order: string; counts: UsageBody };
 }
 
 /**
  * Small JSON file next to the outbox holding what `serve` must remember across
  * restarts: handled command ids (dedup), the last ack, the running order, the
- * completed orders and the stopped ones. Each `record` is one durable write: temp file, fsync,
- * rename, fsync of the directory.
+ * completed orders, the stopped ones and each unfinished order's usage. Each
+ * `record` is one durable write: temp file, fsync, rename, fsync of the
+ * directory.
  *
  * Command ids are kept as a set, not a high-water mark, so dedup assumes only
  * that the bridge never reuses an id, not that ids arrive in order.
@@ -67,6 +73,11 @@ export class State {
     return this.completed.has(order);
   }
 
+  /** The order's latest usage report, if serve emitted one and the order hasn't completed. */
+  usageOf(order: string): UsageBody | undefined {
+    return Object.hasOwn(this.data.usage, order) ? this.data.usage[order] : undefined;
+  }
+
   isStopped(order: string): boolean {
     return this.data.stopped.includes(order);
   }
@@ -89,6 +100,9 @@ export class State {
       this.completed.add(change.completed);
       this.data.completed.push(change.completed);
     }
+    // A completed order never runs again: its usage is no longer needed.
+    if (change.completed !== undefined) delete this.data.usage[change.completed];
+    if (change.usage !== undefined && !this.completed.has(change.usage.order)) this.data.usage[change.usage.order] = change.usage.counts;
     if (change.stopping !== undefined) this.data.stopping = change.stopping;
     if (change.stopped !== undefined && !this.data.stopped.includes(change.stopped)) this.data.stopped.push(change.stopped);
     this.save();
@@ -118,7 +132,7 @@ function read(file: string): StateData {
   try {
     raw = fs.readFileSync(file, "utf8");
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { handled: [], acked: 0, completed: [], stopped: [] };
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { handled: [], acked: 0, completed: [], stopped: [], usage: {} };
     throw err;
   }
   const parsed = JSON.parse(raw) as Partial<StateData>;
@@ -127,6 +141,7 @@ function read(file: string): StateData {
     acked: parsed.acked ?? 0,
     completed: parsed.completed ?? [],
     stopped: parsed.stopped ?? [],
+    usage: parsed.usage ?? {},
   };
   if (parsed.running !== undefined) data.running = parsed.running;
   if (parsed.stopping !== undefined) data.stopping = parsed.stopping;

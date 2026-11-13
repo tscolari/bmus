@@ -59,12 +59,12 @@
  *   if it never called `report`. serve then bundles each repo's
  *   `bmus/<order>` into the report. A failed query rejects the run.
  * - Usage (#117; see Tally): the harness counts tokens and main-loop turns
- *   as the query streams, and keeps the counts per order across a park, a
- *   resume and a later run of the same order on this serve. It emits `usage`
- *   (cumulative, with a seq of its own) every USAGE_EVERY_TURNS turns, before
- *   every checkpoint_ready and before the report, and when a run ends any
- *   other way with counts not yet reported. The report's usage is the same
- *   cumulative token count.
+ *   as the query streams, carrying on from the order's earlier runs on this
+ *   beam (Order.usage) and across a park and a resume. It emits `usage`
+ *   (cumulative) every USAGE_EVERY_TURNS turns, and before every
+ *   checkpoint_ready, before the report and when a run ends any other way,
+ *   each time only when the counts changed since the last report. The
+ *   report's usage is the same cumulative token count.
  * - An order with a `handover` resumes from a checkpoint: its bundle's tip,
  *   the checkout's starting commit, is presented as that checkpoint, and the
  *   note goes into the system prompt next to the dossier.
@@ -226,8 +226,6 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
   const hailParkAfterMs = opts.hailParkAfterMs ?? HAIL_PARK_AFTER_MS;
   const claudePath = opts.claudePath === undefined ? undefined : checkExecutable(path.resolve(opts.claudePath));
   const workDir = path.resolve(opts.workDir);
-  /** Each order's usage on this beam, kept across its runs (#117). */
-  const tallies = new Map<string, Tally>();
 
   return {
     name: "sdk",
@@ -236,10 +234,11 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
     run(order, emit, onInbound) {
       const abort = new AbortController();
       const { signal } = abort;
-      const tally = tallies.get(order.id) ?? new Tally();
-      tallies.set(order.id, tally);
-      /** Emits the order's usage so far (#117). */
-      const sendUsage = () => emit({ type: "usage", body: tally.report() });
+      const tally = new Tally(order.usage);
+      /** Emits the order's usage so far (#117), when it changed since the last report. */
+      const sendUsage = () => {
+        if (tally.changed) emit({ type: "usage", body: tally.report() });
+      };
       const answers = new Map<string, (a: AnswerBody) => void>();
       /** Each hail's question by ref, and by bridge hail id once answered: a correction names the hail id. */
       const questions = new Map<string, string>();
@@ -538,7 +537,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
       // since the last report, if any.
       return Promise.race([halting, driven.catch((err: unknown) => (signal.aborted ? halting : Promise.reject(err as Error)))]).catch(
         (err: unknown) => {
-          if (tally.changed) sendUsage();
+          sendUsage();
           throw err as Error;
         },
       );
@@ -1227,6 +1226,11 @@ const minus = (a: Usage, b: Usage): Usage => ({
   input_tokens: Math.max(0, a.input_tokens - b.input_tokens),
   output_tokens: Math.max(0, a.output_tokens - b.output_tokens),
 });
+/** The larger of a and b, field by field. */
+const most = (a: Usage, b: Usage): Usage => ({
+  input_tokens: Math.max(a.input_tokens, b.input_tokens),
+  output_tokens: Math.max(a.output_tokens, b.output_tokens),
+});
 const covers = (a: Usage, b: Usage) => a.input_tokens >= b.input_tokens && a.output_tokens >= b.output_tokens;
 
 /** An assistant message's `message.usage`, as Usage: input counts cache reads and writes. */
@@ -1240,28 +1244,31 @@ function streamedUsage(m: SDKAssistantMessage): Usage {
 }
 
 /**
- * An order's usage on this beam (#117), counted as the queries stream and
- * kept by the harness across runs, so it survives a park and a resume and a
- * stopped order sent here again.
+ * An order's usage on this beam (#117), counted as the queries stream. It
+ * starts from serve's record of the order's earlier runs here (Order.usage),
+ * so it survives a park, a resume, a stopped order sent back and a combadge
+ * restart. Counts never decrease.
  *
  * - A main-loop assistant message adds its usage and one turn; a
- *   subagent's (parent_tool_use_id set) adds its usage only. The CLI sends
- *   one message per content block, several sharing a message id and none
- *   with final usage: a message id counts once, as one turn, at the usage
- *   of its latest message.
+ *   subagent's (parent_tool_use_id set) adds its usage only. A synthetic
+ *   API-error message (`error` set) counts for nothing. The CLI sends one
+ *   message per content block, several sharing a message id and none with
+ *   final usage: a message id counts once, as one turn, at the highest usage
+ *   its messages carried. A refusal fallback's `supersedes` is not evicted:
+ *   the refused leg's tokens were spent, and its turn stays counted.
  * - A result replaces the running query's count with usageOf(result), which
- *   also counts what the stream didn't show (compaction, say).
+ *   also counts what the stream didn't show (compaction, say), field by
+ *   field never below the count it replaces: a crash result may carry
+ *   zeroed usage.
  * - A resumed session's results may already carry its earlier queries'
  *   totals, when its transcript saved them. A resumed query's result that
  *   covers those plus what this query streamed is taken as such, and the
  *   earlier queries' tokens are taken off it.
  */
 export class Tally {
-  turns = 0;
-  /** The order's usage reports so far, the last one's seq. */
-  seq = 0;
-  /** Tokens of the order's ended queries. */
-  private ended: Usage = ZERO;
+  turns: number;
+  /** Tokens of the order's ended queries, earlier runs' included. */
+  private ended: Usage;
   /** The running query's tokens: what it streamed, then its latest result's. */
   private query: Usage = ZERO;
   /** Tokens this query streamed, results aside. */
@@ -1271,7 +1278,13 @@ export class Tally {
   /** Tokens of the session's earlier queries, when this query resumes one. */
   private earlier: Usage = ZERO;
   /** The counts the last usage report carried. */
-  private sent = "";
+  private sent: string;
+
+  constructor(from?: UsageBody) {
+    this.turns = from?.turns ?? 0;
+    this.ended = { input_tokens: from?.input_tokens ?? 0, output_tokens: from?.output_tokens ?? 0 };
+    this.sent = this.key();
+  }
 
   /** A query starts; resumes is the tokens of the earlier queries of the session it resumes, if any. */
   start(resumes: Usage = ZERO): void {
@@ -1285,9 +1298,10 @@ export class Tally {
 
   /** Counts an assistant message; true when it added a turn. */
   assistant(m: SDKAssistantMessage): boolean {
-    const u = streamedUsage(m);
+    if (m.error !== undefined) return false;
     const id = typeof m.message?.id === "string" && m.message.id !== "" ? m.message.id : undefined;
     const prev = id === undefined ? undefined : this.byId.get(id);
+    const u = most(streamedUsage(m), prev ?? ZERO);
     if (id !== undefined) this.byId.set(id, u);
     this.query = plus(minus(this.query, prev ?? ZERO), u);
     this.streamed = plus(minus(this.streamed, prev ?? ZERO), u);
@@ -1296,10 +1310,11 @@ export class Tally {
     return true;
   }
 
-  /** A result: the query's count becomes usageOf(result), less a resumed session's earlier queries. */
+  /** A result: the query's count becomes usageOf(result), less a resumed session's earlier queries, never lower than before. */
   result(r: SDKResultMessage): void {
     const total = usageOf(r);
-    this.query = covers(total, plus(this.earlier, this.streamed)) ? minus(total, this.earlier) : total;
+    const chosen = covers(total, plus(this.earlier, this.streamed)) ? minus(total, this.earlier) : total;
+    this.query = most(chosen, this.query);
     this.byId.clear();
   }
 
@@ -1317,10 +1332,10 @@ export class Tally {
     return this.key() !== this.sent;
   }
 
-  /** The next usage report: the counts so far, under the next seq. */
+  /** The next usage report: the counts so far. */
   report(): UsageBody {
     this.sent = this.key();
-    return { ...this.tokens, turns: this.turns, seq: ++this.seq };
+    return { ...this.tokens, turns: this.turns };
   }
 
   private key(): string {

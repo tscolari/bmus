@@ -215,16 +215,16 @@ type ProgressBody struct {
 }
 
 // UsageBody is the running usage of an order on this beam (#117),
-// cumulative over every run and query of the order the combadge has seen.
-// InputTokens counts cache reads and writes. Turns counts main-loop turns
-// only. Seq numbers the order's usage reports on this beam from 1, so the
-// latest is the one with the highest Seq. The harness sends one every 10
-// turns and at every checkpoint, stop and report.
+// cumulative over every run and query of the order on this beam, combadge
+// restarts included. InputTokens counts cache reads and writes. Turns
+// counts main-loop turns only. Counts never decrease, and the latest report
+// for (order, beam) is the one with the highest envelope Seq, which is
+// monotonic across combadge restarts. The harness sends one every 10 turns
+// and at every checkpoint, stop and report.
 type UsageBody struct {
 	InputTokens  uint64 `json:"input_tokens"`
 	OutputTokens uint64 `json:"output_tokens"`
 	Turns        uint64 `json:"turns"`
-	Seq          uint64 `json:"seq"`
 }
 
 // HailBody is a question or permission request the agent is blocked on.
