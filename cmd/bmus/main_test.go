@@ -20,13 +20,15 @@ repos:
   - name: app
     base_ref: main
 budget_tokens: 1000
+budget_turns: 40
 model: model-x
 body: |
   look around
 `))
 	require.NoError(t, err)
 	require.Equal(t, bridge.OrderCreateArgs{Title: "survey", Division: "science", Assignee: "sorell",
-		Repos: []bridge.OrderRepo{{Name: "app", BaseRef: "main"}}, BudgetTokens: 1000, Body: "look around\n", Model: "model-x"}, args)
+		Repos: []bridge.OrderRepo{{Name: "app", BaseRef: "main"}}, BudgetTokens: 1000, BudgetTurns: 40, Body: "look around\n",
+		Model: "model-x"}, args)
 
 	// A tracker source stands in for the title (#54); any other doesn't.
 	args, err = parseOrder([]byte("source: tracker:#12\ndivision: science\n"))
@@ -43,6 +45,7 @@ body: |
 		"int priority":   "title: t\nassignee: s\npriority: 1\n",
 		"bad type":       "title: t\nassignee: s\nbudget_tokens: lots\n",
 		"negative":       "title: t\nassignee: s\nbudget_tokens: -1\n",
+		"negative turns": "title: t\nassignee: s\nbudget_turns: -1\n",
 		"two documents":  "title: t\nassignee: s\n---\ntitle: u\n",
 		"empty":          "",
 		"blank title":    "title: \"  \"\nassignee: s\n",

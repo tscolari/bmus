@@ -1559,7 +1559,9 @@ func tourOver(c store.Crew, in MissionInput) bool {
 // handover of the checkpoint they were shipped from. The model is the
 // order's, else the crew member's, else the division's (resolveModel),
 // resolved on every send: a resumed order's re-send resolves it for its new
-// crew member. A re-run sends again under a new command id, which serve
+// crew member. The budget is resolved the same way (resolveBudget), and the
+// order carries its current limit and the usage recorded on the order's
+// other beams (budgetFor, #118). A re-run sends again under a new command id, which serve
 // ignores for an order it is running or has finished.
 func sendOrder(ctx context.Context, d *Daemon, in MissionInput, ship shipped) (uint64, error) {
 	o, err := d.store.GetOrder(ctx, in.OrderID)
@@ -1571,8 +1573,16 @@ func sendOrder(ctx context.Context, d *Daemon, in MissionInput, ship shipped) (u
 		return 0, fmt.Errorf("crew %s: %w", in.CrewID, err)
 	}
 	model, _ := d.resolveModel(o, c)
+	budget, _ := d.resolveBudget(o, c)
+	usage, err := d.store.OrderUsage(ctx, in.OrderID)
+	if err != nil {
+		return 0, fmt.Errorf("order %s usage: %w", in.OrderID, err)
+	}
+	limit, used := budgetFor(o, budget, usage, c.CurrentBeam)
 	msg, err := comms.NewMessage(comms.TypeOrder, comms.OrderBody{
-		Title: o.Title, Body: o.Body, Repos: ship.Repos, BudgetTokens: uint64(max(o.BudgetTokens, 0)),
+		Title: o.Title, Body: o.Body, Repos: ship.Repos,
+		BudgetTokens: uint64(max(limit.Tokens, 0)), BudgetTurns: uint64(max(limit.Turns, 0)),
+		UsedTokens: uint64(max(used.Tokens, 0)), UsedTurns: uint64(max(used.Turns, 0)),
 		Model: model, Handover: ship.Handover,
 	})
 	if err != nil {

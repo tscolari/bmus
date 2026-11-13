@@ -333,9 +333,18 @@ type OrderBody struct {
 	Body  string `json:"body"`
 	// Repos are the repos the order works on, shipped onto the beam before
 	// the order. Never null on the wire: nil marshals as [].
-	Repos        []OrderRepo `json:"repos"`
-	BudgetTokens uint64      `json:"budget_tokens"` // 0 means no budget
-	Dossier      string      `json:"dossier,omitempty"`
+	Repos []OrderRepo `json:"repos"`
+	// BudgetTokens and BudgetTurns are the order's current limit: the
+	// resolved budget times 1 + budget_extended (#118). 0 means no
+	// budget.
+	BudgetTokens uint64 `json:"budget_tokens"`
+	BudgetTurns  uint64 `json:"budget_turns,omitempty"`
+	// UsedTokens and UsedTurns are the usage the bridge recorded for the
+	// order on its other beams. The harness is over budget when these
+	// plus its own count pass the limit.
+	UsedTokens uint64 `json:"used_tokens,omitempty"`
+	UsedTurns  uint64 `json:"used_turns,omitempty"`
+	Dossier    string `json:"dossier,omitempty"`
 	// Model is the model to run the order on: the order's own, else the
 	// crew member's, else its division's default. It is opaque to the
 	// bridge; empty means the harness's default.

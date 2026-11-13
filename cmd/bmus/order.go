@@ -26,6 +26,7 @@ type orderFile struct {
 	Priority     string          `yaml:"priority"`
 	Repos        []orderFileRepo `yaml:"repos"`
 	BudgetTokens int64           `yaml:"budget_tokens"`
+	BudgetTurns  int64           `yaml:"budget_turns"`
 	Body         string          `yaml:"body"`
 	Model        string          `yaml:"model"`
 	Source       string          `yaml:"source"`
@@ -82,6 +83,9 @@ func parseOrder(data []byte) (bridge.OrderCreateArgs, error) {
 	if o.BudgetTokens < 0 {
 		return bridge.OrderCreateArgs{}, errors.New("budget_tokens must not be negative")
 	}
+	if o.BudgetTurns < 0 {
+		return bridge.OrderCreateArgs{}, errors.New("budget_turns must not be negative")
+	}
 	// The bridge checks the repos against its registry, and that Phase 1
 	// orders name exactly one.
 	repos := make([]bridge.OrderRepo, len(o.Repos))
@@ -89,7 +93,7 @@ func parseOrder(data []byte) (bridge.OrderCreateArgs, error) {
 		repos[i] = bridge.OrderRepo{Name: r.Name, BaseRef: r.BaseRef}
 	}
 	return bridge.OrderCreateArgs{Title: o.Title, Body: o.Body, Division: o.Division, Assignee: o.Assignee,
-		Priority: priority, Repos: repos, BudgetTokens: o.BudgetTokens, Model: o.Model,
+		Priority: priority, Repos: repos, BudgetTokens: o.BudgetTokens, BudgetTurns: o.BudgetTurns, Model: o.Model,
 		Source: o.Source}, nil
 }
 
@@ -103,10 +107,12 @@ func newOrderCmd(a *app) *cobra.Command {
 		Long: `Create an order from a YAML file and print its id.
 
 The file's fields: title (required), assignee (a crew id), division, repos
-(required), priority, budget_tokens, body, model and source. Unknown fields
-are an error. model is the model the order runs on, overriding the
-assignee's (` + "`crew add --model`" + `); the harness checks it when the order
-starts.
+(required), priority, budget_tokens, budget_turns, body, model and source.
+Unknown fields are an error. model is the model the order runs on,
+overriding the assignee's (` + "`crew add --model`" + `); the harness checks it
+when the order starts. budget_tokens and budget_turns cap what the order
+may spend; 0 or missing takes its division's budget from the roster, and
+none there means unlimited.
 
 source says where the order comes from, free-form. On a bridge with a
 tracker (<home>/tracker.yaml), ` + "`source: tracker:<ref>`" + ` (` + "`tracker:#12`" + ` or

@@ -194,8 +194,14 @@ export interface OrderBody {
   body: string;
   /** Repos shipped onto the beam for the order; serve checks each out before the harness starts. */
   repos: OrderRepo[];
-  /** 0 means no budget. */
+  /** The order's current token limit (its resolved budget times 1 + budget_extended). 0 means no budget. */
   budget_tokens: number;
+  /** The order's current limit of main-loop turns, as budget_tokens. Absent or 0 means no budget. */
+  budget_turns?: number;
+  /** Tokens the bridge recorded for the order on its other beams; over budget when this plus the harness's own count passes the limit. Absent means 0. */
+  used_tokens?: number;
+  /** Main-loop turns recorded on the order's other beams, as used_tokens. Absent means 0. */
+  used_turns?: number;
   dossier?: string;
   /** Model to run the order on (the order's, else the crew member's, else its division's default); opaque to the bridge. Absent means the harness's default. */
   model?: string;

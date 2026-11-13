@@ -485,7 +485,11 @@ type Order struct {
 	ParentID     string
 	Branch       string
 	BudgetTokens int64
-	CreatedBy    string
+	// BudgetTurns is the order's own turn budget, 0 for none (#118);
+	// BudgetExtended counts the extensions the captain granted (#111).
+	BudgetTurns    int64
+	BudgetExtended int64
+	CreatedBy      string
 	// Model is the model the order runs on. Empty means the assignee's.
 	Model string
 	// Source is where the order came from, free-form: "tracker:<ref>"
@@ -515,7 +519,7 @@ type OrderRepo struct {
 	BaseRef string
 }
 
-const orderCols = `id, title, body, division, priority, state, assignee, parent_id, branch, budget_tokens, created_by, model, source, parked_at, progress_pct, progress_note,
+const orderCols = `id, title, body, division, priority, state, assignee, parent_id, branch, budget_tokens, budget_turns, budget_extended, created_by, model, source, parked_at, progress_pct, progress_note,
 	(SELECT COUNT(*) FROM orders c WHERE c.parent_id = orders.id AND c.state NOT IN ` + endedSQL + `)`
 
 func scanOrder(row interface{ Scan(...any) error }) (Order, error) {
@@ -525,7 +529,7 @@ func scanOrder(row interface{ Scan(...any) error }) (Order, error) {
 		pct    sql.NullFloat64
 	)
 	err := row.Scan(&o.ID, &o.Title, &o.Body, &o.Division, &o.Priority, &o.State, &o.Assignee, &o.ParentID, &o.Branch,
-		&o.BudgetTokens, &o.CreatedBy, &o.Model, &o.Source, &parked, &pct, &o.ProgressNote, &o.OpenChildren)
+		&o.BudgetTokens, &o.BudgetTurns, &o.BudgetExtended, &o.CreatedBy, &o.Model, &o.Source, &parked, &pct, &o.ProgressNote, &o.OpenChildren)
 	if parked.Valid {
 		o.ParkedAt = &parked.Time
 	}
@@ -598,8 +602,9 @@ func (s *Store) insertOrder(ctx context.Context, tx *sql.Tx, o Order, entry LogE
 		return "", err
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO orders (id, title, body, division, priority, state, assignee, parent_id,
-		branch, budget_tokens, created_by, model, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, o.Title, o.Body, o.Division, o.Priority, o.State, o.Assignee, o.ParentID, o.Branch, o.BudgetTokens, o.CreatedBy, o.Model, o.Source)
+		branch, budget_tokens, budget_turns, created_by, model, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, o.Title, o.Body, o.Division, o.Priority, o.State, o.Assignee, o.ParentID, o.Branch, o.BudgetTokens, o.BudgetTurns,
+		o.CreatedBy, o.Model, o.Source)
 	if err != nil {
 		return "", err
 	}
@@ -2872,6 +2877,59 @@ func (t InboxTx) SetOrderProgress(id string, pct float64, note string) (bool, er
 	}
 	n, err := res.RowsAffected()
 	return n > 0, err
+}
+
+// Usage is a row of order_usage: what one beam reported spending on an
+// order, cumulative for the order on that beam (#118).
+type Usage struct {
+	Beam         string
+	InputTokens  int64
+	OutputTokens int64
+	Turns        int64
+	// Seq is the envelope seq of the usage message the row holds.
+	Seq uint64
+}
+
+// RecordUsage upserts u as order id's usage on beam u.Beam, with the
+// message's seq (#118). A row already holding a higher or equal seq is
+// kept: the latest report is the one with the highest seq, and a replayed
+// or late one changes nothing. An unknown order writes nothing. It reports
+// whether it wrote the row. Counts are recorded whatever the order's state
+// or assignee: what a beam spent was spent.
+func (t InboxTx) RecordUsage(id string, u Usage) (bool, error) {
+	res, err := t.tx.ExecContext(t.ctx, `INSERT INTO order_usage (order_id, beam, input_tokens, output_tokens, turns, seq)
+		SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM orders WHERE id = ?)
+		ON CONFLICT (order_id, beam) DO UPDATE SET input_tokens = excluded.input_tokens,
+			output_tokens = excluded.output_tokens, turns = excluded.turns, seq = excluded.seq
+		WHERE excluded.seq > order_usage.seq`,
+		id, u.Beam, u.InputTokens, u.OutputTokens, u.Turns, int64(t.seq), id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// OrderUsage returns order id's usage rows, one per beam that reported
+// any, by beam.
+func (s *Store) OrderUsage(ctx context.Context, id string) ([]Usage, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT beam, input_tokens, output_tokens, turns, seq FROM order_usage
+		WHERE order_id = ? ORDER BY beam`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Usage
+	for rows.Next() {
+		var u Usage
+		var seq int64
+		if err := rows.Scan(&u.Beam, &u.InputTokens, &u.OutputTokens, &u.Turns, &seq); err != nil {
+			return nil, err
+		}
+		u.Seq = uint64(seq)
+		out = append(out, u)
+	}
+	return out, rows.Err()
 }
 
 // RecordInbox records that message seq from crewID's tour tourNo was

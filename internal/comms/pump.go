@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,7 +24,8 @@ import (
 // the crew member's beam, reconnecting with backoff whenever it ends, and
 //
 //   - records every inbound message in the inbox, once, and acks it;
-//   - writes progress straight to the captain's log;
+//   - writes progress straight to the captain's log, and usage straight
+//     to order_usage;
 //   - forwards hello, hail, checkpoint_ready, report, error and
 //     consult_reply to the Sink, which hands them to workflows;
 //   - writes commands from workflow steps (Send) to the beam;
@@ -745,15 +747,25 @@ func (p *Pump) dispatch(ctx context.Context, tx store.InboxTx, msg Message) erro
 		})
 		return err
 	case TypeUsage:
-		// Recorded in the inbox and acked; nothing reads it yet (#118
-		// records it per order and beam).
+		// Straight to the store, never into a workflow, like progress
+		// (#118): the beam's running totals for the order, the highest
+		// seq's.
 		var b UsageBody
 		if err := json.Unmarshal(msg.Body, &b); err != nil {
 			p.log.Warn("comms: dropping usage with a bad body", "seq", msg.Seq, "err", err)
 			return nil
 		}
+		if msg.Order == "" {
+			p.log.Error("comms: dropping usage without an order", "seq", msg.Seq)
+			return nil
+		}
+		ok, err := tx.RecordUsage(msg.Order, store.Usage{Beam: p.cfg.Beam,
+			InputTokens: toInt64(b.InputTokens), OutputTokens: toInt64(b.OutputTokens), Turns: toInt64(b.Turns)})
+		if err != nil {
+			return err
+		}
 		p.log.Debug("comms: usage", "seq", msg.Seq, "order", msg.Order, "input_tokens", b.InputTokens,
-			"output_tokens", b.OutputTokens, "turns", b.Turns)
+			"output_tokens", b.OutputTokens, "turns", b.Turns, "recorded", ok)
 		return nil
 	case TypeHail, TypeCheckpointReady, TypeReport:
 		if msg.Order == "" {
@@ -784,6 +796,9 @@ func (p *Pump) dispatch(ctx context.Context, tx store.InboxTx, msg Message) erro
 		return nil
 	}
 }
+
+// toInt64 is n as a store count, capped at math.MaxInt64.
+func toInt64(n uint64) int64 { return int64(min(n, math.MaxInt64)) }
 
 // ackIfAdvanced acks the contiguous seq if it moved past the last ack sent on
 // this connection. Acks are commands like any other and take a command id;

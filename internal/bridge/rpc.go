@@ -129,6 +129,9 @@ type (
 		Priority     int         `json:"priority,omitempty"`
 		Repos        []OrderRepo `json:"repos"`
 		BudgetTokens int64       `json:"budget_tokens,omitempty"`
+		// BudgetTurns caps the order's main-loop turns; 0, like
+		// BudgetTokens, takes the division's default (resolveBudget).
+		BudgetTurns int64 `json:"budget_turns,omitempty"`
 		// Model overrides the assignee's model for this order; opaque
 		// to the bridge.
 		Model string `json:"model,omitempty"`
@@ -495,12 +498,15 @@ func (d *Daemon) createOrder(ctx context.Context, a OrderCreateArgs) (string, er
 	if a.BudgetTokens < 0 {
 		return "", badRequest("budget_tokens must not be negative")
 	}
+	if a.BudgetTurns < 0 {
+		return "", badRequest("budget_turns must not be negative")
+	}
 	repos := make([]store.OrderRepo, len(a.Repos))
 	for i, r := range a.Repos {
 		repos[i] = store.OrderRepo{Name: r.Name, BaseRef: r.BaseRef}
 	}
 	return d.CreateOrder(ctx, store.Order{Title: a.Title, Body: a.Body, Division: a.Division,
-		Assignee: a.Assignee, Priority: a.Priority, Repos: repos, BudgetTokens: a.BudgetTokens, CreatedBy: "captain", Model: a.Model,
+		Assignee: a.Assignee, Priority: a.Priority, Repos: repos, BudgetTokens: a.BudgetTokens, BudgetTurns: a.BudgetTurns, CreatedBy: "captain", Model: a.Model,
 		Source: a.Source})
 }
 
