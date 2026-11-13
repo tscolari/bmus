@@ -38,12 +38,14 @@ type OrderDiff struct {
 
 // RepoDiff is one repo's unified diff from Base, the commit the work
 // started from, to the work. Truncated says Diff stops at the cap; it then
-// ends at the last whole line under it.
+// ends at the last whole line under it. Jettisoned says the order's branch
+// is gone from the clone (bmus jettison, #108): Diff is then empty.
 type RepoDiff struct {
-	Name      string `json:"name"`
-	Base      string `json:"base"`
-	Diff      string `json:"diff"`
-	Truncated bool   `json:"truncated"`
+	Name       string `json:"name"`
+	Base       string `json:"base"`
+	Diff       string `json:"diff"`
+	Truncated  bool   `json:"truncated"`
+	Jettisoned bool   `json:"jettisoned"`
 }
 
 // OrderDiff reads done order id's work in each of its repos (doneOrder,
@@ -76,8 +78,12 @@ func (d *Daemon) doneOrder(ctx context.Context, id string) (store.Order, error) 
 // <base>...bmus/<order>` in the bridge's clone, each capped at limit
 // bytes. Each repo must be registered, with a full commit id as its base
 // (baseCommits) and bmus/<order> in its clone; everything is checked
-// before git runs. The diff takes no repo lock: it only reads, and a
-// fetch into the clone may take minutes.
+// before git runs. A repo whose branch bmus jettison deleted (#108) is
+// Jettisoned instead: its readable clone has no bmus/<order> and the
+// order's log has the jettison entry (branchJettisoned). That is checked
+// again when a diff fails, for a jettison that lands between the check
+// and the diff. The diff takes no repo lock: it only reads, and a fetch
+// into the clone may take minutes.
 func (d *Daemon) orderDiff(ctx context.Context, o store.Order, limit int) (OrderDiff, error) {
 	id := o.ID
 	bases, err := d.baseCommits(ctx, id)
@@ -85,26 +91,44 @@ func (d *Daemon) orderDiff(ctx context.Context, o store.Order, limit int) (Order
 		return OrderDiff{}, err
 	}
 	branch := orderBranch(o.ID)
+	jettisoned := map[string]bool{}
 	for _, r := range o.Repos {
 		if _, ok := d.repos[r.Name]; !ok {
 			return OrderDiff{}, badRequest("repo %s is not registered on this bridge (repos: %s)", r.Name, d.repoNames())
-		}
-		if !fullCommitRE.MatchString(bases[r.Name]) {
-			return OrderDiff{}, badRequest("order %s: repo %s has no recorded base commit", id, r.Name)
 		}
 		_, err := runGit(ctx, d.repoDir(r.Name), "rev-parse", "--verify", "--quiet", "--end-of-options", "refs/heads/"+branch+"^{commit}")
 		if ctx.Err() != nil {
 			return OrderDiff{}, ctx.Err()
 		}
 		if err != nil {
-			return OrderDiff{}, badRequest("repo %s: %s is missing from the bridge's clone", r.Name, branch)
+			_, ok, jerr := d.branchJettisoned(ctx, id, r.Name, err)
+			if jerr != nil {
+				return OrderDiff{}, jerr
+			}
+			if !ok {
+				return OrderDiff{}, badRequest("repo %s: %s is missing from the bridge's clone", r.Name, branch)
+			}
+			jettisoned[r.Name] = true
+			continue
+		}
+		if !fullCommitRE.MatchString(bases[r.Name]) {
+			return OrderDiff{}, badRequest("order %s: repo %s has no recorded base commit", id, r.Name)
 		}
 	}
 	out := OrderDiff{ID: o.ID, Title: o.Title, Branch: branch, Cap: limit, Repos: []RepoDiff{}}
 	for _, r := range o.Repos {
 		base := bases[r.Name]
+		if jettisoned[r.Name] {
+			out.Repos = append(out.Repos, RepoDiff{Name: r.Name, Base: base, Jettisoned: true})
+			continue
+		}
 		diff, truncated, err := repoDiff(ctx, d.repoDir(r.Name), base, branch, limit)
 		if err != nil {
+			_, rerr := runGit(ctx, d.repoDir(r.Name), "rev-parse", "--verify", "--quiet", "--end-of-options", "refs/heads/"+branch+"^{commit}")
+			if _, ok, jerr := d.branchJettisoned(ctx, id, r.Name, rerr); jerr == nil && ok {
+				out.Repos = append(out.Repos, RepoDiff{Name: r.Name, Base: base, Jettisoned: true})
+				continue
+			}
 			return OrderDiff{}, fmt.Errorf("repo %s: %w", r.Name, err)
 		}
 		out.Repos = append(out.Repos, RepoDiff{Name: r.Name, Base: base, Diff: diff, Truncated: truncated})

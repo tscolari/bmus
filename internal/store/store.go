@@ -2802,6 +2802,20 @@ func (s *Store) LastOrderLog(ctx context.Context, orderID, kind string) (LogEntr
 	return e, err
 }
 
+// LatestOrderLogTS returns the time of order orderID's latest captain's
+// log entry, of any kind; sql.ErrNoRows when it has none. Every move of an
+// order to an ended state logs an entry in the same transaction, so for an
+// ended order it is when the order ended or later (#108).
+func (s *Store) LatestOrderLogTS(ctx context.Context, orderID string) (time.Time, error) {
+	var ts time.Time
+	err := s.db.QueryRowContext(ctx, `SELECT ts FROM log WHERE order_id = ? ORDER BY id DESC LIMIT 1`, orderID).Scan(&ts)
+	return ts, err
+}
+
+// OrderEnded reports whether state is one an order ends in: done, failed,
+// belayed or withdrawn.
+func OrderEnded(state string) bool { return slices.Contains(endedStates, state) }
+
 // SeenInbox reports whether the message seq from crewID's tour tourNo was
 // already recorded.
 func (s *Store) SeenInbox(ctx context.Context, crewID string, tourNo int, seq uint64) (bool, error) {

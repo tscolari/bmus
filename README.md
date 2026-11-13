@@ -42,6 +42,7 @@ A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026
 - [x] Park a hail for long waits and resume the session on the answer
 - [x] Measure the auto-resolved share, captain overrides and time-to-answer
 - [x] Read orders from an issue tracker, GitHub Issues first ([#33](https://github.com/tscolari/bmus/issues/33))
+- [x] Jettison the branches of orders that ended a while ago with `bmus jettison`
 
 ### Phase 4: hardening ([#109](https://github.com/tscolari/bmus/issues/109))
 
