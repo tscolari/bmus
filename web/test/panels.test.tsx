@@ -451,8 +451,8 @@ describe("usage against budget on the away-missions card (#120)", () => {
         order("ORD-0001", {
           state: "away",
           assignee: "sorell",
-          budget_tokens: 1_000_000,
-          budget_turns: 150,
+          limit_tokens: 1_000_000,
+          limit_turns: 150,
           budget_source: { tokens: "order", turns: "division" },
           usage: { input_tokens: 800_000, output_tokens: 20_000, turns: 42 },
         }),
@@ -483,10 +483,10 @@ describe("usage against budget on the away-missions card (#120)", () => {
 
   it("caps an overspent meter and turns it red", () => {
     const over = renderToString(
-      <UsageLine order={order("ORD-0003", { budget_tokens: 1000, usage: { input_tokens: 1500, output_tokens: 0, turns: 3 } })} />,
+      <UsageLine order={order("ORD-0003", { limit_tokens: 1000, usage: { input_tokens: 1500, output_tokens: 0, turns: 3 } })} />,
     );
-    expect(over).toContain('class="mono usage-text tone-red">1.5k / 1k tokens');
-    expect(over).toContain('aria-valuenow="1000" aria-valuetext="1.5k / 1k tokens"');
+    expect(over).toContain('class="mono usage-text tone-red">1.5k / 1k tokens (over)<');
+    expect(over).toContain('aria-valuenow="1000" aria-valuetext="1.5k / 1k tokens (over)"');
     expect(over).toContain('class="fill bg-red" style="width:100%;"');
     expect(over).toContain('class="mono usage-text tone-grey">3 turns');
   });

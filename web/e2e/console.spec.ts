@@ -323,13 +323,13 @@ test("an order goes away, hails, is answered and comes back done", async ({ page
   await expect(away.getByText(title)).toBeVisible({ timeout: missionTimeout });
   await expect(away.getByText("surveying the codebase")).toBeVisible({ timeout: missionTimeout });
   await expect(away.getByRole("progressbar", { name: `${orderId} progress` })).toHaveAttribute("aria-valuenow", "10");
-  // Its usage, with no budget; then against one set through the CLI (#120).
+  // Its usage, with no budget (#120). A limit can't be set on it while it is away.
   const usage = away.getByRole("group", { name: `${orderId} usage` });
   await expect(usage).toContainText("No budget");
   await expect(usage).toContainText("3.5k tokens, 8 turns");
-  await bridge.bmus("order", "budget", orderId, "--tokens", "1000000");
-  await expect(usage).toContainText("3.5k / 1M tokens");
-  await expect(usage.getByRole("meter", { name: `${orderId} tokens used` })).toHaveAttribute("aria-valuenow", "3500");
+  await expect(bridge.bmus("order", "budget", orderId, "--tokens", "1000000")).rejects.toThrow(
+    `order ${orderId} is away: recall it before lowering its budget`,
+  );
 
   // It hails. The question is the crew member's text, never HTML.
   const hails = page.getByRole("region", { name: "Hailing frequencies open" });
@@ -520,13 +520,19 @@ test("Phase 2 controls: standing orders, withdraw, route, belay and recall", asy
   await expect(recordRow(withdrawn)).toContainText("Withdrawn");
 
   // Route a pool order to Sorell, who takes it away and hails.
-  const belayed = await bridge.createOrder({ title: "Recalibrate the deflector", division: "science" });
+  const belayed = await bridge.createOrder({ title: "Recalibrate the deflector", division: "science", budget_tokens: "1000000" });
   const routeRow = open.locator(".row").filter({ hasText: belayed });
   await expect(routeRow.getByLabel("Route to")).toHaveValue("pool");
   await routeRow.getByLabel("Route to").selectOption("sorell");
   await routeRow.getByRole("button", { name: `Route ${belayed}` }).click();
   await expect(routeRow).toBeHidden({ timeout: missionTimeout });
   await expect(away.locator(".row").filter({ hasText: belayed })).toContainText("SORELL", { timeout: missionTimeout });
+  // Its usage against its budget, which may rise while it is away (#120).
+  const usage = away.getByRole("group", { name: `${belayed} usage` });
+  await expect(usage).toContainText("3.5k / 1M tokens", { timeout: missionTimeout });
+  await expect(usage.getByRole("meter", { name: `${belayed} tokens used` })).toHaveAttribute("aria-valuenow", "3500");
+  await bridge.bmus("order", "budget", belayed, "--tokens", "2000000");
+  await expect(usage).toContainText("3.5k / 2M tokens");
 
   // Belay it from its hail.
   const hails = page.getByRole("region", { name: "Hailing frequencies open" });

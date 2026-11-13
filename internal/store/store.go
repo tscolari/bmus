@@ -2962,6 +2962,10 @@ type InboxTx struct {
 	crewID string
 	tourNo int
 	seq    uint64
+	// usage collects the orders whose usage rows RecordUsage wrote:
+	// RecordInbox hands them to the log hook as refreshes once the
+	// transaction commits (#120).
+	usage *[]string
 }
 
 // SQL returns the underlying transaction, e.g. for dbos.WithSendTransaction:
@@ -3019,7 +3023,13 @@ func (t InboxTx) RecordUsage(id string, u Usage) (bool, error) {
 		return false, err
 	}
 	n, err := res.RowsAffected()
-	return n > 0, err
+	if err != nil {
+		return false, err
+	}
+	if n > 0 && t.usage != nil {
+		*t.usage = append(*t.usage, id)
+	}
+	return n > 0, nil
 }
 
 // OrderUsage returns order id's usage rows, one per beam that reported
@@ -3083,6 +3093,7 @@ func orderUsage(ctx context.Context, q interface {
 // fn runs holding the store's write slot: it must not call a Store write
 // method (it would wait forever).
 func (s *Store) RecordInbox(ctx context.Context, crewID string, tourNo int, seq uint64, fn func(InboxTx) error) (recorded bool, err error) {
+	var usage []string
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO inbox (crew_id, tour_no, seq, received_at) VALUES (?, ?, ?, ?)`,
 			crewID, tourNo, int64(seq), time.Now().UTC())
@@ -3097,11 +3108,12 @@ func (s *Store) RecordInbox(ctx context.Context, crewID string, tourNo int, seq 
 		if fn == nil {
 			return nil
 		}
-		return fn(InboxTx{ctx: ctx, tx: tx, s: s, crewID: crewID, tourNo: tourNo, seq: seq})
+		return fn(InboxTx{ctx: ctx, tx: tx, s: s, crewID: crewID, tourNo: tourNo, seq: seq, usage: &usage})
 	})
 	if err != nil {
 		return false, err
 	}
+	s.publishRefresh(usage)
 	return recorded, nil
 }
 
@@ -3202,7 +3214,8 @@ func isBusy(err error) bool {
 // committing goroutine (#72). Entries already in the log aren't handed
 // over. fn must not block: it holds up the writer and every other
 // commit's hook. Calls to fn don't overlap, and each holds the entries
-// above the previous call's.
+// above the previous call's. A call may instead hold refreshes, entries
+// with ID 0 and kind RefreshKind that are in no log (publishRefresh).
 //
 // SQLite has a single writer, and _txlock=immediate takes the write lock
 // at BEGIN, so log ids rise in commit order: after any commit every entry
@@ -3239,6 +3252,30 @@ func (s *Store) publishLog(ctx context.Context) {
 		return
 	}
 	s.logHookLast = entries[len(entries)-1].ID
+	s.logHook(entries)
+}
+
+// RefreshKind is the kind of a refresh on the log hook (#120): a LogEntry
+// with ID 0 that is in no log, naming an order whose view changed without
+// an entry, as a usage report changes it. The console sends that order's
+// view with no event id.
+const RefreshKind = "refresh"
+
+// publishRefresh hands the log hook a refresh (RefreshKind) for each of
+// orders, if a hook is set and there are any. Called after a commit.
+func (s *Store) publishRefresh(orders []string) {
+	if len(orders) == 0 {
+		return
+	}
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	if s.logHook == nil {
+		return
+	}
+	entries := make([]LogEntry, len(orders))
+	for i, id := range orders {
+		entries[i] = LogEntry{Kind: RefreshKind, OrderID: id}
+	}
 	s.logHook(entries)
 }
 

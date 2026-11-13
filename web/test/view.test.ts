@@ -469,12 +469,14 @@ describe("push (#4)", () => {
 
 describe("usage against budget (#120)", () => {
   it("shortCount writes counts as the bridge does", () => {
-    expect([950, 3500, 420_000, 1_000_000, 1_200_000, 0].map(shortCount)).toEqual(["950", "3.5k", "420k", "1M", "1.2M", "0"]);
+    expect([950, 3500, 420_000, 1_000_000, 1_200_000, 2_000_000_000, 0].map(shortCount)).toEqual(["950", "3.5k", "420k", "1M", "1.2M", "2B", "0"]);
   });
 
   it("orderUsage sets each field against its limit", () => {
+    // The order's own budget doesn't count: the limits do.
+    expect(orderUsage(order("ORD-0004", { budget_tokens: 5, budget_turns: 5 })).budgeted).toBe(false);
     const u = orderUsage(
-      order("ORD-0001", { budget_tokens: 1_000_000, usage: { input_tokens: 300_000, output_tokens: 20_000, turns: 140 }, budget_turns: 150 }),
+      order("ORD-0001", { limit_tokens: 1_000_000, usage: { input_tokens: 300_000, output_tokens: 20_000, turns: 140 }, limit_turns: 150 }),
     );
     expect(u.budgeted).toBe(true);
     expect(u.fields).toEqual([
@@ -487,9 +489,10 @@ describe("usage against budget (#120)", () => {
       ["12 tokens", "grey", undefined],
       ["1 turn", "grey", undefined],
     ]);
-    expect(orderUsage(order("ORD-0003", { budget_turns: 10, usage: { input_tokens: 0, output_tokens: 0, turns: 12 } })).fields[1]).toMatchObject({
+    expect(orderUsage(order("ORD-0003", { limit_turns: 10, usage: { input_tokens: 0, output_tokens: 0, turns: 12 } })).fields[1]).toMatchObject({
       pct: 100,
       tone: "red",
+      text: "12 / 10 turns (over)",
     });
   });
 });

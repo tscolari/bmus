@@ -208,3 +208,47 @@ func TestFeedFromStore(t *testing.T) {
 	require.Equal(t, "ORD-0001", e.OrderID)
 	require.Equal(t, "created", e.Text)
 }
+
+// A usage row RecordUsage wrote reaches the log hook as a refresh once the
+// inbox transaction commits (#120): ID 0, RefreshKind, the order. A
+// report that writes no row, or a rolled back one, hands nothing over.
+func TestUsageRefresh(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := openTest(t)
+	id, err := s.InsertOrder(ctx, Order{Title: "t", Division: "ops"}, testEntry)
+	require.NoError(t, err)
+	var (
+		mu    sync.Mutex
+		calls [][]LogEntry
+	)
+	require.NoError(t, s.SetLogHook(ctx, func(entries []LogEntry) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, entries)
+	}, nil))
+	got := func() [][]LogEntry {
+		mu.Lock()
+		defer mu.Unlock()
+		out := calls
+		calls = nil
+		return out
+	}
+	record := func(seq uint64, fail error) error {
+		_, err := s.RecordInbox(ctx, "a", 0, seq, func(tx InboxTx) error {
+			if _, err := tx.RecordUsage(id, Usage{Beam: "b", InputTokens: int64(seq)}); err != nil {
+				return err
+			}
+			return fail
+		})
+		return err
+	}
+
+	require.NoError(t, record(2, nil))
+	require.Equal(t, [][]LogEntry{{{Kind: RefreshKind, OrderID: id}}}, got())
+	require.NoError(t, record(1, nil))
+	require.Empty(t, got(), "a lower seq writes no row")
+	boom := errors.New("boom")
+	require.ErrorIs(t, record(3, boom), boom)
+	require.Empty(t, got(), "rolled back")
+}

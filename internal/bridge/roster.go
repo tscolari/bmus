@@ -57,6 +57,23 @@ type Budget struct {
 	Turns  int64 `yaml:"turns" json:"turns"`
 }
 
+// MaxBudget caps each budget field (#120), 1e15: an order's own and a
+// division's. It keeps the limit, the budget times 1 + the extensions,
+// far inside an int64.
+const MaxBudget = 1_000_000_000_000_000
+
+// CheckBudgetField refuses budget field name's value v when it is
+// negative or over MaxBudget.
+func CheckBudgetField(name string, v int64) error {
+	switch {
+	case v < 0:
+		return fmt.Errorf("%s must not be negative", name)
+	case v > MaxBudget:
+		return fmt.Errorf("%s must be at most %d (1e15), got %d", name, int64(MaxBudget), v)
+	}
+	return nil
+}
+
 // BudgetSource says where each of a resolved budget's fields comes from:
 // SourceOrder, SourceDivision or SourceDefault (none, unlimited).
 type BudgetSource struct {
@@ -108,7 +125,7 @@ func LoadRoster(path string) (RosterConfig, error) {
 
 // CheckRoster validates r and fills in its defaults: each division name
 // must match divisionNameRE, its harness be empty or one of Harnesses and
-// its budget not negative,
+// its budget neither negative nor over MaxBudget,
 // the limits must not be negative, and a zero limit takes its default.
 func CheckRoster(r *RosterConfig) error {
 	for _, name := range slices.Sorted(maps.Keys(r.Divisions)) {
@@ -118,8 +135,9 @@ func CheckRoster(r *RosterConfig) error {
 		if h := r.Divisions[name].Harness; h != "" && !slices.Contains(Harnesses, h) {
 			return fmt.Errorf("division %s: unknown harness %q (want one of %s)", name, h, strings.Join(Harnesses, ", "))
 		}
-		if b := r.Divisions[name].Budget; b.Tokens < 0 || b.Turns < 0 {
-			return fmt.Errorf("division %s: budget tokens and turns must not be negative", name)
+		b := r.Divisions[name].Budget
+		if err := cmp.Or(CheckBudgetField("budget tokens", b.Tokens), CheckBudgetField("budget turns", b.Turns)); err != nil {
+			return fmt.Errorf("division %s: %w", name, err)
 		}
 	}
 	t := &r.Transporter

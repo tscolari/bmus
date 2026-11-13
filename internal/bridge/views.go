@@ -38,11 +38,12 @@ type (
 	// split order waits on them (#155). ParkedAt is set (UTC) while its
 	// mission is parked, waiting for a resume (#167).
 	//
-	// BudgetTokens and BudgetTurns are the order's current limits (#120):
-	// its budget resolved for its assignee (resolveBudget), each field
-	// times 1 + BudgetExtended, the extensions granted; 0 for unlimited.
-	// BudgetSource says where each field comes from. Usage is what its
-	// beams reported, summed.
+	// BudgetTokens and BudgetTurns are the order's own budget, 0 for none,
+	// as order.create and order.budget take it. LimitTokens and LimitTurns
+	// are its current limits (#120): its budget resolved for its assignee
+	// (resolveBudget), each field times 1 + BudgetExtended, the extensions
+	// granted; 0 for unlimited. BudgetSource says where each resolved
+	// field comes from. Usage is what its beams reported, summed.
 	OrderView struct {
 		ID             string       `json:"id"`
 		Title          string       `json:"title"`
@@ -56,6 +57,8 @@ type (
 		Branch         string       `json:"branch"`
 		BudgetTokens   int64        `json:"budget_tokens"`
 		BudgetTurns    int64        `json:"budget_turns"`
+		LimitTokens    int64        `json:"limit_tokens"`
+		LimitTurns     int64        `json:"limit_turns"`
 		BudgetSource   BudgetSource `json:"budget_source"`
 		BudgetExtended int64        `json:"budget_extended"`
 		Usage          UsageView    `json:"usage"`
@@ -134,7 +137,8 @@ func (d *Daemon) orderView(o store.Order) OrderView {
 	limit, _ := budgetFor(o, b, nil, "")
 	return OrderView{ID: o.ID, Title: o.Title, Body: o.Body, Division: o.Division,
 		Priority: o.Priority, State: o.State, Assignee: o.Assignee, ParentID: o.ParentID, Repos: repos,
-		Branch: o.Branch, BudgetTokens: limit.Tokens, BudgetTurns: limit.Turns, BudgetSource: src,
+		Branch: o.Branch, BudgetTokens: o.BudgetTokens, BudgetTurns: o.BudgetTurns,
+		LimitTokens: limit.Tokens, LimitTurns: limit.Turns, BudgetSource: src,
 		BudgetExtended: o.BudgetExtended,
 		Usage:          UsageView{InputTokens: o.Used.InputTokens, OutputTokens: o.Used.OutputTokens, Turns: o.Used.Turns},
 		CreatedBy:      o.CreatedBy, Model: o.Model,

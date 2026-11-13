@@ -36,6 +36,8 @@ export function order(id: string, over: Partial<OrderView> = {}): OrderView {
     branch: "",
     budget_tokens: 0,
     budget_turns: 0,
+    limit_tokens: 0,
+    limit_turns: 0,
     budget_source: { tokens: "default", turns: "default" },
     budget_extended: 0,
     usage: { input_tokens: 0, output_tokens: 0, turns: 0 },

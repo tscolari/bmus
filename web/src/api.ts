@@ -41,11 +41,15 @@ export interface OrderView {
   readonly parent_id: string;
   readonly repos: readonly OrderRepo[];
   readonly branch: string;
-  /** The current token limit (#120): the resolved budget times 1 + budget_extended; 0 for none. */
+  /** The order's own token budget; 0 for none (its division's applies). */
   readonly budget_tokens: number;
-  /** The current turn limit, the same way. */
+  /** The order's own turn budget, the same way. */
   readonly budget_turns: number;
-  /** Where each field's budget comes from: order, division or default (none). */
+  /** The current token limit (#120): the resolved budget times 1 + budget_extended; 0 for none. */
+  readonly limit_tokens: number;
+  /** The current turn limit, the same way. */
+  readonly limit_turns: number;
+  /** Where each resolved field comes from: order, division or default (none). */
   readonly budget_source: BudgetSource;
   /** The extensions the captain granted. */
   readonly budget_extended: number;

@@ -100,18 +100,24 @@ repos:
   - name: app
     base_ref: main
 `), 0o600))
+	huge := filepath.Join(t.TempDir(), "huge.yaml")
+	require.NoError(t, os.WriteFile(huge, []byte("title: huge\ndivision: ops\nbudget_turns: 1000000000000001\n"), 0o600))
+	require.Contains(t, e.fail(t, "order", "create", huge), "budget_turns must be at most 1000000000000000 (1e15)")
 	require.Equal(t, "ORD-0001\n", e.run(t, "order", "create", file))
 	require.Regexp(t, `(?m)^ID\s+STATE\s+PROGRESS\s+USAGE\s+ASSIGNEE\s+DIVISION\s+TITLE\nORD-0001\s+pool\s+-\s+0/2M\s+-\s+ops\s+capped\n`,
 		e.run(t, "order", "list"))
 
 	require.Contains(t, e.fail(t, "order", "budget", "ORD-0001"), "--tokens or --turns is required")
 	require.Contains(t, e.fail(t, "order", "budget", "ORD-0001", "--turns", "-1"), "budget turns must not be negative")
+	require.Contains(t, e.fail(t, "order", "budget", "ORD-0001", "--tokens", "1000000000000001"),
+		"budget tokens must be at most 1000000000000000 (1e15)")
 	require.Equal(t, "order ORD-0001 limit now 2M tokens (order), 40 turns (order)\n",
 		e.run(t, "order", "budget", "ORD-0001", "--turns", "40"))
 	require.Regexp(t, `(?m)^ORD-0001\s+pool\s+-\s+0/2M 0/40t\s+-\s+ops\s+capped\n`, e.run(t, "order", "list"))
-	var view bridge.OrderView
+	var view bridge.OrderBudgetResult
 	e.runJSON(t, &view, "order", "budget", "ORD-0001", "--tokens", "0", "--json")
-	require.Equal(t, []int64{0, 40, 0}, []int64{view.BudgetTokens, view.BudgetTurns, view.BudgetExtended})
+	require.Equal(t, []int64{0, 40, 0, 40, 0}, []int64{view.BudgetTokens, view.BudgetTurns, view.LimitTokens, view.LimitTurns, view.BudgetExtended})
+	require.Nil(t, view.BudgetHail)
 	require.Equal(t, bridge.BudgetSource{Tokens: bridge.SourceDefault, Turns: bridge.SourceOrder}, view.BudgetSource)
 	require.Equal(t, bridge.UsageView{}, view.Usage)
 	require.Regexp(t, `(?m)^ORD-0001\s+pool\s+-\s+0/40t\s+-\s+ops\s+capped\n`, e.run(t, "order", "list"))
@@ -123,26 +129,34 @@ repos:
 }
 
 // order list's USAGE cell: tokens and turns against their limits, each
-// only with a limit, "-" with neither (#120).
+// only with a limit, "-" with neither (#120). The order's own budget
+// doesn't count: the limits do.
 func TestUsageCell(t *testing.T) {
 	t.Parallel()
 	used := bridge.UsageView{InputTokens: 400_000, OutputTokens: 20_000, Turns: 42}
-	require.Equal(t, "420k/1M 42/150t", usageCell(bridge.OrderView{BudgetTokens: 1_000_000, BudgetTurns: 150, Usage: used}))
-	require.Equal(t, "420k/1M", usageCell(bridge.OrderView{BudgetTokens: 1_000_000, Usage: used}))
-	require.Equal(t, "42/150t", usageCell(bridge.OrderView{BudgetTurns: 150, Usage: used}))
-	require.Equal(t, "-", usageCell(bridge.OrderView{Usage: used}))
+	require.Equal(t, "420k/1M 42/150t", usageCell(bridge.OrderView{LimitTokens: 1_000_000, LimitTurns: 150, Usage: used}))
+	require.Equal(t, "420k/1M", usageCell(bridge.OrderView{LimitTokens: 1_000_000, Usage: used}))
+	require.Equal(t, "42/150t", usageCell(bridge.OrderView{LimitTurns: 150, Usage: used}))
+	require.Equal(t, "-", usageCell(bridge.OrderView{BudgetTokens: 5, Usage: used}))
+	require.Equal(t, "420k/2B", usageCell(bridge.OrderView{LimitTokens: 2_000_000_000, Usage: used}))
 }
 
 // order budget's output: each field's limit and source, and the
-// extensions, which multiply it (#120).
+// extensions, which multiply it; and an open budget hail with the limit
+// its extend would set (#120).
 func TestBudgetLine(t *testing.T) {
 	t.Parallel()
-	v := bridge.OrderView{ID: "ORD-0001", BudgetTokens: 4_000_000, BudgetSource: bridge.BudgetSource{Tokens: "order", Turns: "default"}}
+	v := bridge.OrderView{ID: "ORD-0001", BudgetTokens: 2_000_000, LimitTokens: 4_000_000,
+		BudgetSource: bridge.BudgetSource{Tokens: "order", Turns: "default"}}
 	require.Equal(t, "order ORD-0001 limit now 4M tokens (order), unlimited turns", budgetLine(v))
 	v.BudgetExtended = 1
 	require.Equal(t, "order ORD-0001 limit now 4M tokens (order), unlimited turns, with 1 extension", budgetLine(v))
 	v.BudgetExtended = 3
 	require.Equal(t, "order ORD-0001 limit now 4M tokens (order), unlimited turns, with 3 extensions", budgetLine(v))
+	require.Equal(t, "H-0007 is open: extend makes the limit 15M tokens, 300 turns",
+		budgetHailLine(bridge.OpenBudgetHail{ID: "H-0007", ExtendLimit: bridge.Budget{Tokens: 15_000_000, Turns: 300}}))
+	require.Equal(t, "H-0007 is open: extend makes the limit unlimited tokens, 300 turns",
+		budgetHailLine(bridge.OpenBudgetHail{ID: "H-0007", ExtendLimit: bridge.Budget{Turns: 300}}))
 }
 
 // order list's STATE cell gives a split order's open children (#155).
