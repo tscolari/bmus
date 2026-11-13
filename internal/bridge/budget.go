@@ -58,16 +58,17 @@ func canonBudgetContext(raw json.RawMessage) (json.RawMessage, comms.BudgetConte
 func budgetQuestion(orderID string, c comms.BudgetContext) string {
 	part := func(used, limit uint64, unit string) string {
 		if limit == 0 {
-			return shortCount(used) + " " + unit
+			return ShortCount(used) + " " + unit
 		}
-		return shortCount(used) + " of " + shortCount(limit) + " " + unit
+		return ShortCount(used) + " of " + ShortCount(limit) + " " + unit
 	}
 	return fmt.Sprintf("%s has used %s and %s. Extend by its budget again, or stop?", orderID,
 		part(c.Used, c.Limit, "tokens"), part(c.TurnsUsed, c.TurnsLimit, "turns"))
 }
 
-// shortCount is n for a person to read: 950, 3.5k, 420k, 1M, 1.2M.
-func shortCount(n uint64) string {
+// ShortCount is n for a person to read: 950, 3.5k, 420k, 1M, 1.2M. The
+// CLI's USAGE column uses it too (#120).
+func ShortCount(n uint64) string {
 	f := func(v float64, unit string) string {
 		return strings.TrimSuffix(strconv.FormatFloat(v, 'f', 1, 64), ".0") + unit
 	}
@@ -87,7 +88,7 @@ func limitText(limit Budget) string {
 		if n <= 0 {
 			return "unlimited " + unit
 		}
-		return shortCount(uint64(n)) + " " + unit
+		return ShortCount(uint64(n)) + " " + unit
 	}
 	return field(limit.Tokens, "tokens") + ", " + field(limit.Turns, "turns")
 }
@@ -188,4 +189,49 @@ func (d *Daemon) budgetCeiling(ctx context.Context, tx store.InboxTx, crewID, id
 	d.logger.Warn("budget: recorded usage passed 125% of the order's budget; belaying it", "order", id,
 		"tokens", used.Tokens, "token_limit", limit.Tokens, "turns", used.Turns, "turn_limit", limit.Turns)
 	return nil
+}
+
+// SetOrderBudget sets open order id's own budget (#120): tokens and turns,
+// each left as it is when nil, 0 handing the field back to its division's
+// budget (resolveBudget). An ended order is refused, and so is a split
+// one, whose mission has ended: its child orders carry budgets of their
+// own. budget_extended is kept, so the new limit is the new budget times
+// 1 + budget_extended; the log entry and the view say so. A change is
+// logged "budget set: limit now ..." and reaches a running beam with the
+// order's next send (sendOrder), a recall or a watch change; a budget hail
+// already raised is answered as before, its extend carrying the new budget.
+// A change that changes nothing writes nothing.
+func (d *Daemon) SetOrderBudget(ctx context.Context, id string, tokens, turns *int64) (store.Order, error) {
+	if tokens == nil && turns == nil {
+		return store.Order{}, badRequest("nothing to set: give tokens or turns")
+	}
+	for _, f := range []struct {
+		name string
+		v    *int64
+	}{{"tokens", tokens}, {"turns", turns}} {
+		if f.v != nil && *f.v < 0 {
+			return store.Order{}, badRequest("budget %s must not be negative", f.name)
+		}
+	}
+	o, _, err := d.store.SetOrderBudget(ctx, id, tokens, turns, func(o store.Order, tok, tur int64) (store.LogEntry, error) {
+		if store.OrderEnded(o.State) || o.State == store.OrderSplit {
+			return store.LogEntry{}, badRequest("order %s is %s, too late to change its budget", id, o.State)
+		}
+		o.BudgetTokens, o.BudgetTurns = tok, tur
+		b, src := d.resolveBudget(o, store.Crew{ID: o.Assignee, Division: o.AssigneeDivision})
+		limit, _ := budgetFor(o, b, nil, "")
+		text := "budget set: limit now " + limitText(limit)
+		switch {
+		case o.BudgetExtended == 1:
+			text += ", with 1 extension"
+		case o.BudgetExtended > 1:
+			text += fmt.Sprintf(", with %d extensions", o.BudgetExtended)
+		}
+		return logEntry(logOrder, o.Assignee, id, text, map[string]any{"budget": Budget{Tokens: tok, Turns: tur},
+			"source": src, "budget_extended": o.BudgetExtended, "limit": limit})
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.Order{}, fmt.Errorf("order %s: %w", id, ErrNotFound)
+	}
+	return o, err
 }

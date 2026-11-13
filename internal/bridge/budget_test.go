@@ -432,3 +432,108 @@ func TestBudgetStopSupersedesRecall(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"recall superseded by the budget stop"}, orderTexts(entries, id, "recall superseded"))
 }
+
+// order.budget and the OrderView's budget fields (#120): the current
+// limits and their sources, resolved for the assignee's division when the
+// order has none; usage summed over the order's beams; a change keeps the
+// extensions and logs once; an ended order is refused.
+func TestRPCOrderBudget(t *testing.T) {
+	t.Parallel()
+	home := privateHome(t)
+	cfg := testConfig(home)
+	cfg.Repos = map[string]string{"app": testRepo(t).url}
+	cfg.Divisions = map[string]DivisionConfig{"science": {Budget: Budget{Tokens: 10000, Turns: 50}}, "ops": {}}
+	r := startDaemonConfig(t, cfg)
+	defer r.stop(t)
+	ctx := t.Context()
+	repos := []OrderRepo{{Name: "app", BaseRef: "main"}}
+
+	require.NoError(t, call(t, home, "crew.add", CrewAddArgs{ID: "sorell", Name: "Sorell", Division: "science"}, nil))
+	var created OrderCreateResult
+	require.NoError(t, call(t, home, "order.create", OrderCreateArgs{Title: "survey", Assignee: "sorell", Repos: repos,
+		BudgetTurns: 20}, &created))
+	id := created.ID
+	view := func() OrderView {
+		t.Helper()
+		var res OrderListResult
+		require.NoError(t, call(t, home, "order.list", nil, &res))
+		for _, o := range res.Orders {
+			if o.ID == id {
+				return o
+			}
+		}
+		t.Fatalf("order %s not listed", id)
+		return OrderView{}
+	}
+	v := view()
+	require.Equal(t, [3]int64{10000, 20, 0}, [3]int64{v.BudgetTokens, v.BudgetTurns, v.BudgetExtended})
+	require.Equal(t, BudgetSource{Tokens: SourceDivision, Turns: SourceOrder}, v.BudgetSource, "sorell's division's tokens")
+	require.Equal(t, UsageView{}, v.Usage)
+
+	for i, u := range []store.Usage{{Beam: "beam-a", InputTokens: 3000, OutputTokens: 500, Turns: 8},
+		{Beam: "beam-b", InputTokens: 1000, OutputTokens: 200, Turns: 3}} {
+		_, err := r.d.store.RecordInbox(ctx, "sorell", 0, uint64(101+i), func(tx store.InboxTx) error {
+			_, err := tx.RecordUsage(id, u)
+			return err
+		})
+		require.NoError(t, err)
+	}
+	// One extension, as a budget hail's extend grants it.
+	_, err := r.d.store.RecordInbox(ctx, "sorell", 0, 103, func(tx store.InboxTx) error {
+		_, err := tx.SQL().ExecContext(ctx, `UPDATE orders SET budget_extended = 1 WHERE id = ?`, id)
+		return err
+	})
+	require.NoError(t, err)
+	v = view()
+	require.Equal(t, UsageView{InputTokens: 4000, OutputTokens: 700, Turns: 11}, v.Usage, "summed over both beams")
+	require.Equal(t, [3]int64{20000, 40, 1}, [3]int64{v.BudgetTokens, v.BudgetTurns, v.BudgetExtended})
+
+	// The order's own tokens; its turns and its extension kept.
+	tokens := int64(5000)
+	require.NoError(t, call(t, home, "order.budget", OrderBudgetArgs{ID: id, Tokens: &tokens}, &v))
+	require.Equal(t, [3]int64{10000, 40, 1}, [3]int64{v.BudgetTokens, v.BudgetTurns, v.BudgetExtended})
+	require.Equal(t, BudgetSource{Tokens: SourceOrder, Turns: SourceOrder}, v.BudgetSource)
+	require.Equal(t, repos, v.Repos)
+	stored, err := r.d.store.GetOrder(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, [3]int64{5000, 20, 1}, [3]int64{stored.BudgetTokens, stored.BudgetTurns, stored.BudgetExtended})
+	set := func() []string {
+		entries, err := r.d.store.ListLog(ctx, 0)
+		require.NoError(t, err)
+		var out []string
+		for _, e := range entries {
+			if strings.HasPrefix(e.Text, "budget set") {
+				out = append(out, e.Text)
+			}
+		}
+		return out
+	}
+	require.Equal(t, []string{"budget set: limit now 10k tokens, 40 turns, with 1 extension"}, set())
+	require.NoError(t, call(t, home, "order.budget", OrderBudgetArgs{ID: id, Tokens: &tokens}, &v))
+	require.Len(t, set(), 1, "no change, no entry")
+	// 0 hands the turns back to the division.
+	zero := int64(0)
+	require.NoError(t, call(t, home, "order.budget", OrderBudgetArgs{ID: id, Turns: &zero}, &v))
+	require.Equal(t, [2]int64{10000, 100}, [2]int64{v.BudgetTokens, v.BudgetTurns})
+	require.Equal(t, BudgetSource{Tokens: SourceOrder, Turns: SourceDivision}, v.BudgetSource)
+
+	neg := int64(-1)
+	re := requireRPCError(t, call(t, home, "order.budget", OrderBudgetArgs{ID: id}, nil), CodeBadRequest)
+	require.Equal(t, "nothing to set: give tokens or turns", re.Message)
+	re = requireRPCError(t, call(t, home, "order.budget", OrderBudgetArgs{ID: id, Tokens: &neg}, nil), CodeBadRequest)
+	require.Equal(t, "budget tokens must not be negative", re.Message)
+	requireRPCError(t, call(t, home, "order.budget", OrderBudgetArgs{Tokens: &tokens}, nil), CodeBadRequest)
+	requireRPCError(t, call(t, home, "order.budget", OrderBudgetArgs{ID: "ORD-0404", Tokens: &tokens}, nil), CodeNotFound)
+	requireRPCError(t, call(t, home, "order.budget", map[string]any{"id": id, "tokens": 1, "extra": 1}, nil), CodeBadRequest)
+
+	// An ended order is refused, and keeps its budget.
+	require.NoError(t, call(t, home, "order.create", OrderCreateArgs{Title: "pool", Division: "ops", Repos: repos}, &created))
+	v = OrderView{}
+	require.NoError(t, call(t, home, "order.withdraw", OrderActionArgs{ID: created.ID}, &v))
+	require.Equal(t, BudgetSource{Tokens: SourceDefault, Turns: SourceDefault}, v.BudgetSource)
+	re = requireRPCError(t, call(t, home, "order.budget", OrderBudgetArgs{ID: created.ID, Tokens: &tokens}, nil), CodeBadRequest)
+	require.Equal(t, "order "+created.ID+" is withdrawn, too late to change its budget", re.Message)
+	stored, err = r.d.store.GetOrder(ctx, created.ID)
+	require.NoError(t, err)
+	require.Zero(t, stored.BudgetTokens)
+}

@@ -88,7 +88,7 @@ func TestSplitOrder(t *testing.T) {
 	p := hd.order(t, parent)
 	require.Equal(t, store.OrderSplit, p.State)
 	require.Equal(t, 2, p.OpenChildren)
-	require.Equal(t, 2, orderView(p).OpenChildren)
+	require.Equal(t, 2, hd.d.orderView(p).OpenChildren)
 	kids := []string{"ORD-0002", "ORD-0003"}
 	for i, id := range kids {
 		o := hd.order(t, id)

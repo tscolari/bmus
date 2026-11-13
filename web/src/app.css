@@ -459,6 +459,26 @@ body {
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
+/* An order's usage against its budget (#120). */
+.usage {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+}
+.usage-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1 1 140px;
+  min-width: 0;
+}
+.usage-text {
+  font-size: 13px;
+}
+.bar.thin {
+  height: 4px;
+}
 .away-crew {
   font-size: 13px;
   font-weight: 700;

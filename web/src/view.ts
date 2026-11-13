@@ -156,6 +156,51 @@ function clampPct(pct: unknown): number | undefined {
   return Math.min(100, Math.max(0, pct));
 }
 
+/** A count for a person to read, as the bridge writes it: 950, 3.5k, 420k, 1M, 1.2M. */
+export function shortCount(n: number): string {
+  const f = (v: number, unit: string) => `${v.toFixed(1).replace(/\.0$/, "")}${unit}`;
+  if (!Number.isFinite(n) || n < 0) return "0";
+  if (n >= 1_000_000) return f(n / 1e6, "M");
+  if (n >= 1000) return f(n / 1e3, "k");
+  return String(Math.round(n));
+}
+
+/** One field of an order's usage against its budget (#120). */
+export interface UsageField {
+  readonly unit: "tokens" | "turns";
+  readonly used: number;
+  /** The current limit; 0 for none. */
+  readonly limit: number;
+  /** used of limit, clamped to 0-100; undefined without a limit. */
+  readonly pct?: number;
+  /** "420k / 1M tokens", or "420k tokens" without a limit. */
+  readonly text: string;
+  /** green under 80%, gold from 80%, red from 100%; grey without a limit. */
+  readonly tone: Tone;
+}
+
+/**
+ * An order's usage against its budget (#120): tokens (input and output)
+ * and turns, each against its current limit. budgeted is false when
+ * neither field has a limit.
+ */
+export function orderUsage(o: OrderView): { budgeted: boolean; fields: UsageField[] } {
+  const u = o.usage ?? { input_tokens: 0, output_tokens: 0, turns: 0 };
+  const field = (unit: "tokens" | "turns", used: number, limit: number): UsageField => {
+    used = Math.max(0, used || 0);
+    limit = Math.max(0, limit || 0);
+    if (limit === 0) return { unit, used, limit, text: `${shortCount(used)} ${used === 1 ? unit.slice(0, -1) : unit}`, tone: "grey" };
+    const ratio = used / limit;
+    const tone: Tone = ratio >= 1 ? "red" : ratio >= 0.8 ? "gold" : "green";
+    return { unit, used, limit, pct: Math.min(100, ratio * 100), text: `${shortCount(used)} / ${shortCount(limit)} ${unit}`, tone };
+  };
+  const fields = [
+    field("tokens", u.input_tokens + u.output_tokens, o.budget_tokens),
+    field("turns", u.turns, o.budget_turns ?? 0),
+  ];
+  return { budgeted: fields.some((f) => f.limit > 0), fields };
+}
+
 /** Orders on a mission (away and hailing), red alerts first. */
 export function awayOrders(state: State): OrderView[] {
   return [...state.order.values()].filter((o) => o.state === "away" || o.state === "hailing").sort(byPriority);

@@ -517,7 +517,8 @@ func TestConsoleActions(t *testing.T) {
 	status, _ = post("/api/orders", `{"title":"survey","assignee":"sorell","priority":1,"repos":[{"name":"app","base_ref":"main"}]}`, &ov)
 	require.Equal(t, http.StatusCreated, status)
 	require.Equal(t, OrderView{ID: ov.ID, Title: "survey", State: ov.State, Priority: store.PriorityYellow, Assignee: "sorell",
-		Repos: []OrderRepo{{Name: "app", BaseRef: "main"}}, CreatedBy: "captain"}, ov)
+		Repos: []OrderRepo{{Name: "app", BaseRef: "main"}}, BudgetSource: BudgetSource{Tokens: SourceDefault, Turns: SourceDefault},
+		CreatedBy: "captain"}, ov)
 	require.Equal(t, ov.ID, untilLog("order created: survey").OrderID)
 	repos := `"repos":[{"name":"app","base_ref":"main"}]`
 	for body, code := range map[string]string{

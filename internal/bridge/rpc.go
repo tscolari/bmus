@@ -178,6 +178,15 @@ type (
 		Assignee *string `json:"assignee,omitempty"`
 		Division *string `json:"division,omitempty"`
 	}
+	// OrderBudgetArgs are order.budget's args (#120): an open order's id
+	// and its own budget's new tokens and turns. An absent field keeps the
+	// order's, 0 hands it back to the division's budget; at least one must
+	// be given. It returns the OrderView, with the new current limits.
+	OrderBudgetArgs struct {
+		ID     string `json:"id"`
+		Tokens *int64 `json:"tokens,omitempty"`
+		Turns  *int64 `json:"turns,omitempty"`
+	}
 	// OrderPushArgs are order.push's args: a done order's id, the branch
 	// to push its work to (default bmus/<order>) and whether to force it.
 	OrderPushArgs struct {
@@ -343,6 +352,7 @@ var rpcHandlers = map[string]rpcHandler{
 	"order.recall":      rpcOrderRecall,
 	"order.withdraw":    rpcOrderWithdraw,
 	"order.route":       rpcOrderRoute,
+	"order.budget":      rpcOrderBudget,
 	"order.push":        rpcOrderPush,
 	"hails.list":        rpcHailsList,
 	"hails.answer":      rpcHailsAnswer,
@@ -520,7 +530,7 @@ func rpcOrderList(ctx context.Context, d *Daemon, raw json.RawMessage) (any, err
 	}
 	res := OrderListResult{Orders: []OrderView{}}
 	for _, o := range orders {
-		res.Orders = append(res.Orders, orderView(o))
+		res.Orders = append(res.Orders, d.orderView(o))
 	}
 	return res, nil
 }
@@ -589,7 +599,7 @@ func (d *Daemon) orderAction(ctx context.Context, a OrderActionArgs, act func(ct
 	if err != nil {
 		return OrderView{}, err
 	}
-	return orderView(o), nil
+	return d.orderView(o), nil
 }
 
 func rpcOrderRoute(ctx context.Context, d *Daemon, raw json.RawMessage) (any, error) {
@@ -617,7 +627,25 @@ func (d *Daemon) routeOrder(ctx context.Context, a OrderRouteArgs) (OrderView, e
 	if err != nil {
 		return OrderView{}, err
 	}
-	return orderView(o), nil
+	return d.orderView(o), nil
+}
+
+func rpcOrderBudget(ctx context.Context, d *Daemon, raw json.RawMessage) (any, error) {
+	var a OrderBudgetArgs
+	if err := decodeArgs(raw, &a); err != nil {
+		return nil, err
+	}
+	if a.ID == "" {
+		return nil, badRequest("order id is required")
+	}
+	if _, err := d.SetOrderBudget(ctx, a.ID, a.Tokens, a.Turns); err != nil {
+		return nil, err
+	}
+	o, err := d.store.GetOrder(ctx, a.ID)
+	if err != nil {
+		return nil, err
+	}
+	return d.orderView(o), nil
 }
 
 func rpcOrderPush(ctx context.Context, d *Daemon, raw json.RawMessage) (any, error) {

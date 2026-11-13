@@ -323,6 +323,13 @@ test("an order goes away, hails, is answered and comes back done", async ({ page
   await expect(away.getByText(title)).toBeVisible({ timeout: missionTimeout });
   await expect(away.getByText("surveying the codebase")).toBeVisible({ timeout: missionTimeout });
   await expect(away.getByRole("progressbar", { name: `${orderId} progress` })).toHaveAttribute("aria-valuenow", "10");
+  // Its usage, with no budget; then against one set through the CLI (#120).
+  const usage = away.getByRole("group", { name: `${orderId} usage` });
+  await expect(usage).toContainText("No budget");
+  await expect(usage).toContainText("3.5k tokens, 8 turns");
+  await bridge.bmus("order", "budget", orderId, "--tokens", "1000000");
+  await expect(usage).toContainText("3.5k / 1M tokens");
+  await expect(usage.getByRole("meter", { name: `${orderId} tokens used` })).toHaveAttribute("aria-valuenow", "3500");
 
   // It hails. The question is the crew member's text, never HTML.
   const hails = page.getByRole("region", { name: "Hailing frequencies open" });

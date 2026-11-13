@@ -41,7 +41,16 @@ export interface OrderView {
   readonly parent_id: string;
   readonly repos: readonly OrderRepo[];
   readonly branch: string;
+  /** The current token limit (#120): the resolved budget times 1 + budget_extended; 0 for none. */
   readonly budget_tokens: number;
+  /** The current turn limit, the same way. */
+  readonly budget_turns: number;
+  /** Where each field's budget comes from: order, division or default (none). */
+  readonly budget_source: BudgetSource;
+  /** The extensions the captain granted. */
+  readonly budget_extended: number;
+  /** What the order's beams spent, summed. */
+  readonly usage: OrderUsage;
   readonly created_by: string;
   readonly model: string;
   /** Where the order came from, free-form: tracker:<ref> for a tracker item (#54); absent for none. */
@@ -54,6 +63,19 @@ export interface OrderView {
   readonly open_children: number;
   /** Set while its mission is parked, waiting for a resume (#167); absent otherwise. */
   readonly parked_at?: string;
+}
+
+/** bridge.BudgetSource. */
+export interface BudgetSource {
+  readonly tokens: string;
+  readonly turns: string;
+}
+
+/** An order's usage, summed over its beams: bridge.UsageView. */
+export interface OrderUsage {
+  readonly input_tokens: number;
+  readonly output_tokens: number;
+  readonly turns: number;
 }
 
 /** A hail: bridge.HailView. */

@@ -28,6 +28,8 @@ import {
   openHails,
   openOrders,
   orderProgress,
+  orderUsage,
+  shortCount,
   padInfo,
   priorityInfo,
   progressPct,
@@ -462,5 +464,32 @@ describe("push (#4)", () => {
     expect(pushedTo(s, "ORD-0007")).toBe("feature");
     expect(pushedTo(s, "ORD-0008")).toBe("other");
     expect(pushedTo(s, "ORD-0009")).toBeUndefined();
+  });
+});
+
+describe("usage against budget (#120)", () => {
+  it("shortCount writes counts as the bridge does", () => {
+    expect([950, 3500, 420_000, 1_000_000, 1_200_000, 0].map(shortCount)).toEqual(["950", "3.5k", "420k", "1M", "1.2M", "0"]);
+  });
+
+  it("orderUsage sets each field against its limit", () => {
+    const u = orderUsage(
+      order("ORD-0001", { budget_tokens: 1_000_000, usage: { input_tokens: 300_000, output_tokens: 20_000, turns: 140 }, budget_turns: 150 }),
+    );
+    expect(u.budgeted).toBe(true);
+    expect(u.fields).toEqual([
+      { unit: "tokens", used: 320_000, limit: 1_000_000, pct: 32, text: "320k / 1M tokens", tone: "green" },
+      { unit: "turns", used: 140, limit: 150, pct: (140 / 150) * 100, text: "140 / 150 turns", tone: "gold" },
+    ]);
+    const none = orderUsage(order("ORD-0002", { usage: { input_tokens: 10, output_tokens: 2, turns: 1 } }));
+    expect(none.budgeted).toBe(false);
+    expect(none.fields.map((f) => [f.text, f.tone, f.pct])).toEqual([
+      ["12 tokens", "grey", undefined],
+      ["1 turn", "grey", undefined],
+    ]);
+    expect(orderUsage(order("ORD-0003", { budget_turns: 10, usage: { input_tokens: 0, output_tokens: 0, turns: 12 } })).fields[1]).toMatchObject({
+      pct: 100,
+      tone: "red",
+    });
   });
 });

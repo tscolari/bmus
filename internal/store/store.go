@@ -511,6 +511,18 @@ type Order struct {
 	// OpenChildren counts the order's child orders (parent_id) not yet
 	// ended (endedStates), read with the order.
 	OpenChildren int
+	// Used is the order's usage (order_usage), summed over its beams,
+	// and AssigneeDivision its assignee's division, "" without one; both
+	// read with the order (#120).
+	Used             UsageTotal
+	AssigneeDivision string
+}
+
+// UsageTotal is an order's usage summed over its beams (#120).
+type UsageTotal struct {
+	InputTokens  int64
+	OutputTokens int64
+	Turns        int64
 }
 
 // OrderRepo is a row of the order_repos table: a repo of the bridge's
@@ -521,7 +533,11 @@ type OrderRepo struct {
 }
 
 const orderCols = `id, title, body, division, priority, state, assignee, parent_id, branch, budget_tokens, budget_turns, budget_extended, created_by, model, source, parked_at, progress_pct, progress_note,
-	(SELECT COUNT(*) FROM orders c WHERE c.parent_id = orders.id AND c.state NOT IN ` + endedSQL + `)`
+	(SELECT COUNT(*) FROM orders c WHERE c.parent_id = orders.id AND c.state NOT IN ` + endedSQL + `),
+	(SELECT COALESCE(SUM(u.input_tokens), 0) FROM order_usage u WHERE u.order_id = orders.id),
+	(SELECT COALESCE(SUM(u.output_tokens), 0) FROM order_usage u WHERE u.order_id = orders.id),
+	(SELECT COALESCE(SUM(u.turns), 0) FROM order_usage u WHERE u.order_id = orders.id),
+	COALESCE((SELECT a.division FROM crew a WHERE a.id = orders.assignee), '')`
 
 func scanOrder(row interface{ Scan(...any) error }) (Order, error) {
 	var (
@@ -530,7 +546,8 @@ func scanOrder(row interface{ Scan(...any) error }) (Order, error) {
 		pct    sql.NullFloat64
 	)
 	err := row.Scan(&o.ID, &o.Title, &o.Body, &o.Division, &o.Priority, &o.State, &o.Assignee, &o.ParentID, &o.Branch,
-		&o.BudgetTokens, &o.BudgetTurns, &o.BudgetExtended, &o.CreatedBy, &o.Model, &o.Source, &parked, &pct, &o.ProgressNote, &o.OpenChildren)
+		&o.BudgetTokens, &o.BudgetTurns, &o.BudgetExtended, &o.CreatedBy, &o.Model, &o.Source, &parked, &pct, &o.ProgressNote, &o.OpenChildren,
+		&o.Used.InputTokens, &o.Used.OutputTokens, &o.Used.Turns, &o.AssigneeDivision)
 	if parked.Valid {
 		o.ParkedAt = &parked.Time
 	}
@@ -749,6 +766,56 @@ func (s *Store) ExtendBudget(ctx context.Context, orderID, hailID string, entry 
 		}
 		_, err = s.appendLog(ctx, tx, e)
 		return err
+	})
+	if err != nil {
+		return Order{}, false, err
+	}
+	return o, wrote, nil
+}
+
+// SetBudgetFunc checks a budget change on order o, as read in the
+// transaction, to tokens and turns, and returns the log entry to append
+// (SetOrderBudget). An error aborts the change.
+type SetBudgetFunc func(o Order, tokens, turns int64) (LogEntry, error)
+
+// SetOrderBudget sets order id's own budget (#120): tokens and turns,
+// each kept as it is when nil, 0 meaning none of its own. check runs on
+// the order as read, with the new values, in the same transaction; the
+// update and the entry it returns are written only when a value changes.
+// budget_extended is kept. It returns the order (without its repos) and
+// whether it wrote. A missing order returns sql.ErrNoRows.
+func (s *Store) SetOrderBudget(ctx context.Context, id string, tokens, turns *int64, check SetBudgetFunc) (o Order, wrote bool, err error) {
+	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		read := func() (err error) {
+			o, err = scanOrder(tx.QueryRowContext(ctx, `SELECT `+orderCols+` FROM orders WHERE id = ?`, id))
+			return err
+		}
+		if err := read(); err != nil {
+			return err
+		}
+		tok, tur := o.BudgetTokens, o.BudgetTurns
+		if tokens != nil {
+			tok = *tokens
+		}
+		if turns != nil {
+			tur = *turns
+		}
+		entry, err := check(o, tok, tur)
+		if err != nil {
+			return err
+		}
+		if tok == o.BudgetTokens && tur == o.BudgetTurns {
+			return nil
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE orders SET budget_tokens = ?, budget_turns = ? WHERE id = ?`,
+			tok, tur, id); err != nil {
+			return err
+		}
+		wrote = true
+		if _, err := s.appendLog(ctx, tx, entry); err != nil {
+			return err
+		}
+		return read()
 	})
 	if err != nil {
 		return Order{}, false, err

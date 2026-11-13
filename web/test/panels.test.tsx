@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { ApiError } from "../src/api.js";
 import {
   AwayPanel,
+  UsageLine,
   Composer,
   ConfirmAction,
   CountermandPanel,
@@ -438,5 +439,55 @@ describe("beaming in (#106)", () => {
     const html = renderToString(<Stats state={s} />);
     expect(html).toMatch(/Beaming in<\/span><\/div><span class="mono stat-val">2<\/span>/);
     expect(html).toMatch(/Crew aboard<\/span><\/div><span class="mono stat-val">3<\/span>/);
+  });
+});
+
+describe("usage against budget on the away-missions card (#120)", () => {
+  const s = reduce(emptyState, {
+    type: "snapshot",
+    snapshot: snapshot({
+      crew: [crew("sorell", { status: "away" }), crew("worf", { status: "away" })],
+      orders: [
+        order("ORD-0001", {
+          state: "away",
+          assignee: "sorell",
+          budget_tokens: 1_000_000,
+          budget_turns: 150,
+          budget_source: { tokens: "order", turns: "division" },
+          usage: { input_tokens: 800_000, output_tokens: 20_000, turns: 42 },
+        }),
+        order("ORD-0002", { state: "away", assignee: "worf", usage: { input_tokens: 400_000, output_tokens: 20_000, turns: 9 } }),
+      ],
+    }),
+  });
+  const html = renderToString(<AwayPanel state={s} csrf="c" />);
+  const card = (id: string) => html.slice(html.indexOf(`aria-label="${id} usage"`)).split('class="row-actions"')[0];
+
+  it("shows each limited field against its limit, with a meter", () => {
+    const c = card("ORD-0001");
+    expect(c).toContain(">Budget<");
+    expect(c).toContain("820k / 1M tokens");
+    expect(c).toContain("42 / 150 turns");
+    expect(c).toContain('class="mono usage-text tone-gold">820k / 1M tokens');
+    expect(c).toContain('class="mono usage-text tone-green">42 / 150 turns');
+    expect(c).toContain('role="meter" aria-label="ORD-0001 tokens used" aria-valuemin="0" aria-valuemax="1000000" aria-valuenow="820000"');
+    expect(c).toContain('aria-label="ORD-0001 turns used"');
+  });
+
+  it("shows the usage alone without a budget", () => {
+    const c = card("ORD-0002");
+    expect(c).toContain(">No budget<");
+    expect(c).toContain('class="mono usage-text tone-grey">420k tokens, 9 turns<');
+    expect(c).not.toContain('role="meter"');
+  });
+
+  it("caps an overspent meter and turns it red", () => {
+    const over = renderToString(
+      <UsageLine order={order("ORD-0003", { budget_tokens: 1000, usage: { input_tokens: 1500, output_tokens: 0, turns: 3 } })} />,
+    );
+    expect(over).toContain('class="mono usage-text tone-red">1.5k / 1k tokens');
+    expect(over).toContain('aria-valuenow="1000" aria-valuetext="1.5k / 1k tokens"');
+    expect(over).toContain('class="fill bg-red" style="width:100%;"');
+    expect(over).toContain('class="mono usage-text tone-grey">3 turns');
   });
 });

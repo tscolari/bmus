@@ -130,7 +130,7 @@ func TestRPCCommands(t *testing.T) {
 	o := orders.Orders[0]
 	require.Equal(t, OrderView{ID: "ORD-0001", Title: "survey", Body: "look around", Division: "science", State: o.State,
 		Priority: store.PriorityYellow, Assignee: "sorell", Repos: []OrderRepo{{Name: "app", BaseRef: "main"}}, BudgetTokens: 1000,
-		CreatedBy: "captain", Model: "model-x"}, o)
+		BudgetTurns: 40, BudgetSource: BudgetSource{Tokens: SourceOrder, Turns: SourceOrder}, CreatedBy: "captain", Model: "model-x"}, o)
 	// The tour claims it and starts its mission.
 	requirePending(t, r.d, missionWorkflowID(created.ID))
 

@@ -461,7 +461,7 @@ func TestCLIEndToEnd(t *testing.T) {
 	require.NotNil(t, orders.Orders[0].ProgressPct)
 	require.InDelta(t, 10, *orders.Orders[0].ProgressPct, 0)
 	require.Equal(t, "surveying the codebase", orders.Orders[0].ProgressNote)
-	require.Regexp(t, `(?m)^ID\s+STATE\s+PROGRESS\s+ASSIGNEE\s+DIVISION\s+TITLE\n`+orderID+`\s+hailing\s+10%\s+sorell\s`,
+	require.Regexp(t, `(?m)^ID\s+STATE\s+PROGRESS\s+USAGE\s+ASSIGNEE\s+DIVISION\s+TITLE\n`+orderID+`\s+hailing\s+10%\s+0/5k\s+sorell\s`,
 		e.run(t, "order", "list"))
 
 	require.Equal(t, "H-0001 decided: allow\n", e.run(t, "hails", "answer", hail.ID, "--option", "0"))
@@ -486,7 +486,8 @@ func TestCLIEndToEnd(t *testing.T) {
 	require.Equal(t, store.OrderDone, orders.Orders[0].State)
 	// Settling cleared the progress: the JSON omits it, the table shows "-".
 	require.NotContains(t, e.run(t, "order", "list", "--json"), "progress_")
-	require.Regexp(t, `(?m)^`+orderID+`\s+done\s+-\s+sorell\s`, e.run(t, "order", "list"))
+	require.Regexp(t, `(?m)^`+orderID+`\s+done\s+-\s+0/5k\s+sorell\s`, e.run(t, "order", "list"))
+	require.Contains(t, e.fail(t, "order", "budget", orderID, "--tokens", "1000"), "order "+orderID+" is done, too late to change its budget")
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
 		var crew bridge.CrewListResult
 		e.runJSON(ct, &crew, "crew", "list")
