@@ -1,0 +1,1 @@
+{"v":1,"seq":31,"crew":"sorell","order":"ORD-0414","type":"hail","ts":"2026-10-16T09:30:00Z","body":{"ref":"sdk-ORD-0414-4","category":"budget","question":"ORD-0414 is over its budget: 1200000 tokens of 1000000, 140 turns of 150. Extend it, or stop?","options":["extend","stop"],"context":{"used":1200000,"limit":1000000,"turns_used":140,"turns_limit":150}}}

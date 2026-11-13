@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dbos-inc/dbos-transact-golang/dbos"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -213,7 +215,7 @@ escalation:
 	require.Equal(t, int64(1), o.BudgetExtended)
 	h, err = hd.d.store.GetHail(t.Context(), "H-0001")
 	require.NoError(t, err)
-	require.Equal(t, [3]string{store.HailDecided, comms.OptionExtend, "budget extended"}, [3]string{h.Status, h.Decision, h.Rationale})
+	require.Equal(t, [2]string{store.HailDecided, comms.OptionExtend}, [2]string{h.Status, h.Decision})
 	require.Contains(t, orderTexts(hd.logEntries(t), id, "budget extended"),
 		"budget extended for hail H-0001: limit now unlimited tokens, 20 turns")
 	require.Contains(t, stepNames(t, hd.d, missionWorkflowID(id)), "budget-extend")
@@ -289,6 +291,13 @@ func TestBudgetCeilingBelays(t *testing.T) {
 		require.Equal(ct, int64(1300), u[0].InputTokens)
 	}, 15*time.Second, 20*time.Millisecond)
 	require.Equal(t, []string{budgetBelayText}, orderTexts(hd.logEntries(t), id, "belay requested"))
+	for _, e := range hd.logEntries(t) {
+		if e.OrderID == id && e.Text == budgetBelayText {
+			var p map[string]any
+			require.NoError(t, json.Unmarshal(e.Payload, &p))
+			require.Equal(t, backstopValue, p[backstopField], "the backstop's mark, which a captain's belay lacks")
+		}
+	}
 
 	// A late report for the belayed order, far past the ceiling.
 	_, err := hd.d.store.RecordInbox(t.Context(), "sorell", 99, 1, func(tx store.InboxTx) error {
@@ -333,4 +342,93 @@ func TestCeilingPassed(t *testing.T) {
 	require.True(t, ceilingPassed(Budget{Turns: 126}, limit))
 	require.False(t, ceilingPassed(Budget{Tokens: 1 << 40, Turns: 1 << 20}, Budget{}), "unlimited")
 	require.True(t, ceilingPassed(Budget{Turns: 13}, Budget{Turns: 10}))
+}
+
+// injectCrew sends msg, of type typ with body, to order id's mission as
+// crew member sorell's beam would, with seq.
+func injectCrew(t *testing.T, d *Daemon, id, typ string, seq uint64, body any) {
+	t.Helper()
+	msg, err := comms.NewMessage(typ, body)
+	require.NoError(t, err)
+	msg.Seq, msg.Crew, msg.Order = seq, "sorell", id
+	require.NoError(t, dbos.Send(d.dbos, missionWorkflowID(id), msg, fromCrewTopic))
+}
+
+// fakeMission starts a daemon on a fake provider with sorell, of division
+// science, on deck, and an order for it whose order command has gone out.
+func fakeMission(t *testing.T) (running, string) {
+	t.Helper()
+	home := privateHome(t)
+	insertCrew(t, home, store.Crew{ID: "sorell", Name: "Sorell", Division: "science"})
+	r := startDaemonWith(t, home, &fakeProvider{hello: true})
+	t.Cleanup(func() { r.stop(t) })
+	waitOnDeck(t, r.d, "sorell", "fake-1")
+	id, err := r.d.CreateOrder(t.Context(), store.Order{Title: "t", Assignee: "sorell", Division: "science",
+		Repos: []store.OrderRepo{{Name: "app", BaseRef: "main"}}})
+	require.NoError(t, err)
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		_, ok := stepOutput(c, r.d, missionWorkflowID(id), "send-order")
+		require.True(c, ok)
+	}, 20*time.Second, 20*time.Millisecond)
+	return r, id
+}
+
+// A hail that arrives while another is open on the order (#119) waits its
+// turn: the open hail keeps its category, so answering it extends no
+// budget, and the budget hail is recorded once the first answer has gone
+// out, and extends the budget when it is answered.
+func TestMissionQueuesHailBehindOpenOne(t *testing.T) {
+	t.Parallel()
+	r, id := fakeMission(t)
+	injectCrew(t, r.d, id, comms.TypeHail, 2, comms.HailBody{Ref: "q1", Category: comms.CategoryClarifyingQuestion,
+		Question: "Which way?", Options: []string{"left", "right"}})
+	injectCrew(t, r.d, id, comms.TypeHail, 3, comms.HailBody{Ref: "b1", Category: comms.CategoryBudget, Question: "?",
+		Options: []string{comms.OptionExtend, comms.OptionStop}, Context: json.RawMessage(`{"used": 9, "limit": 5, "turns_used": 1, "turns_limit": 0}`)})
+	hail := func(t require.TestingT, hid string) store.Hail {
+		h, err := r.d.store.GetHail(context.Background(), hid)
+		require.NoError(t, err)
+		return h
+	}
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		require.Equal(c, store.HailOpen, hail(c, "H-0001").Status)
+	}, 20*time.Second, 20*time.Millisecond)
+	require.Equal(t, comms.CategoryClarifyingQuestion, hail(t, "H-0001").Category)
+
+	left := 0
+	require.NoError(t, r.d.AnswerHail(t.Context(), "H-0001", "", &left))
+	var b store.Hail
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		b = hail(c, "H-0002")
+		require.Equal(c, store.HailOpen, b.Status)
+	}, 20*time.Second, 20*time.Millisecond)
+	require.Equal(t, comms.CategoryBudget, b.Category)
+	require.Equal(t, id+" has used 9 of 5 tokens and 1 turns. Extend by its budget again, or stop?", b.Question)
+	require.NotContains(t, stepNames(t, r.d, missionWorkflowID(id)), "budget-extend")
+	require.Zero(t, getOrder(t, r.d, id).BudgetExtended)
+
+	require.NoError(t, r.d.AnswerHail(t.Context(), "H-0002", "extend", nil))
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		require.Equal(c, int64(1), getOrder(c, r.d, id).BudgetExtended)
+	}, 20*time.Second, 20*time.Millisecond)
+}
+
+// A budget stop that meets a pending recall (#119) fails the order
+// budget_exceeded, and the log says the recall was superseded.
+func TestBudgetStopSupersedesRecall(t *testing.T) {
+	t.Parallel()
+	r, id := fakeMission(t)
+	require.NoError(t, r.d.RecallOrder(t.Context(), id, "reassigning"))
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		_, ok := stepOutput(c, r.d, missionWorkflowID(id), "send-recall")
+		require.True(c, ok)
+	}, 20*time.Second, 20*time.Millisecond)
+	injectCrew(t, r.d, id, comms.TypeError, 2, comms.ErrorBody{Reason: "budget exceeded: the captain stopped " + id, Code: CodeBudgetExceeded})
+
+	res := missionResult(t, r.d, id)
+	require.Equal(t, MissionFailed, res.Status, "%+v", res)
+	require.Equal(t, CodeBudgetExceeded, res.Code)
+	require.Equal(t, store.OrderFailed, getOrder(t, r.d, id).State)
+	entries, err := r.d.store.ListLog(t.Context(), 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"recall superseded by the budget stop"}, orderTexts(entries, id, "recall superseded"))
 }

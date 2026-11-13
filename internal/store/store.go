@@ -712,25 +712,25 @@ func childBatch(ctx context.Context, tx *sql.Tx, parent, createdBy string) ([]st
 // splitRefusedMark starts the note RefuseSplit adds to a hail's rationale.
 const splitRefusedMark = "split refused: "
 
-// budgetExtendedMark starts the note ExtendBudget adds to a hail's
-// rationale.
-const budgetExtendedMark = "budget extended"
-
 // ExtendBudget grants order orderID one more extension of its budget for
-// budget hail hailID (#119): it increments the order's budget_extended,
-// notes "budget extended" in the hail's rationale ("; " after one already
-// there) and appends the entry entry builds from the order as extended, in
-// one transaction, only while the rationale carries no such note: an
-// extension is keyed by its hail, and a re-run returns the order as it
-// stands and writes nothing. It returns the order (without its repos) and
-// whether it wrote. A missing order or hail returns sql.ErrNoRows.
+// budget hail hailID (#119): it records the extension in
+// budget_extensions, keyed by the hail, increments the order's
+// budget_extended and appends the entry entry builds from the order as
+// extended, in one transaction. A hail already recorded writes nothing: a
+// re-run returns the order as it stands. It returns the order (without its
+// repos) and whether it wrote. A missing order returns sql.ErrNoRows.
 func (s *Store) ExtendBudget(ctx context.Context, orderID, hailID string, entry func(Order) (LogEntry, error)) (o Order, wrote bool, err error) {
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
-		var rationale string
-		if err := tx.QueryRowContext(ctx, `SELECT rationale FROM hails WHERE id = ?`, hailID).Scan(&rationale); err != nil {
+		res, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO budget_extensions (hail_id, order_id, granted_at) VALUES (?, ?, ?)`,
+			hailID, orderID, time.Now().UTC())
+		if err != nil {
 			return err
 		}
-		if !strings.Contains(rationale, budgetExtendedMark) {
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 1 {
 			res, err := tx.ExecContext(ctx, `UPDATE orders SET budget_extended = budget_extended + 1 WHERE id = ?`, orderID)
 			if err != nil {
 				return err
@@ -738,16 +738,8 @@ func (s *Store) ExtendBudget(ctx context.Context, orderID, hailID string, entry 
 			if n, err := res.RowsAffected(); err != nil || n == 0 {
 				return cmp.Or(err, sql.ErrNoRows)
 			}
-			note := budgetExtendedMark
-			if rationale != "" {
-				note = rationale + "; " + note
-			}
-			if _, err := tx.ExecContext(ctx, `UPDATE hails SET rationale = ? WHERE id = ?`, note, hailID); err != nil {
-				return err
-			}
 			wrote = true
 		}
-		var err error
 		if o, err = scanOrder(tx.QueryRowContext(ctx, `SELECT `+orderCols+` FROM orders WHERE id = ?`, orderID)); err != nil || !wrote {
 			return err
 		}
@@ -2979,12 +2971,12 @@ func (t InboxTx) Order(id string) (Order, error) {
 // message being recorded wrote included.
 func (t InboxTx) OrderUsage(id string) ([]Usage, error) { return orderUsage(t.ctx, t.tx, id) }
 
-// OrderLogged reports whether order id's log holds an entry of kind with
-// exactly text.
-func (t InboxTx) OrderLogged(id, kind, text string) (bool, error) {
+// OrderLogMarked reports whether order id's log holds an entry of kind
+// whose payload's field is value (a string).
+func (t InboxTx) OrderLogMarked(id, kind, field, value string) (bool, error) {
 	var n int
-	err := t.tx.QueryRowContext(t.ctx, `SELECT EXISTS (SELECT 1 FROM log WHERE order_id = ? AND kind = ? AND text = ?)`,
-		id, kind, text).Scan(&n)
+	err := t.tx.QueryRowContext(t.ctx, `SELECT EXISTS (SELECT 1 FROM log WHERE order_id = ? AND kind = ?
+		AND json_valid(payload) AND json_extract(payload, '$.' || ?) = ?)`, id, kind, field, value).Scan(&n)
 	return n == 1, err
 }
 

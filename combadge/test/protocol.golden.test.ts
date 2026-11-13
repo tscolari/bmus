@@ -15,8 +15,10 @@ const goldens = fs.readdirSync(goldenDir).filter((f) => f.endsWith(".json")).sor
 const tsTypes: readonly string[] = [...BEAM_TO_BRIDGE_TYPES, ...BRIDGE_TO_BEAM_TYPES];
 
 describe("protocol golden files", () => {
-  it("has one golden per message type", () => {
-    expect(goldens.map((f) => f.replace(/\.json$/, ""))).toEqual([...tsTypes].sort());
+  it("has one golden per message type, and variants named <type>.<variant>.json of known types", () => {
+    const names = goldens.map((f) => f.replace(/\.json$/, ""));
+    expect(names.filter((n) => !n.includes("."))).toEqual([...tsTypes].sort());
+    for (const n of names.filter((n) => n.includes("."))) expect(tsTypes).toContain(n.split(".")[0]);
   });
 
   it("lists the same message types as the schema", () => {
@@ -29,7 +31,7 @@ describe("protocol golden files", () => {
     const msg = JSON.parse(raw) as Message;
     if (!validate(msg)) expect.fail(JSON.stringify(validate.errors, null, 2));
     expect(msg.v).toBe(PROTOCOL_VERSION);
-    expect(`${msg.type}.json`).toBe(file);
+    expect(file.split(".")[0]).toBe(msg.type);
     // The TS envelope serializes in protocol order, so a golden survives a round trip byte for byte.
     const { v, seq, crew, order, type, ts, body } = msg;
     expect(JSON.stringify({ v, seq, crew, order, type, ts, body })).toBe(raw.trim());

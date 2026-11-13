@@ -368,7 +368,7 @@
         "option": {"description": "Index into the hail's options, when one was picked.", "type": "integer", "minimum": 0},
         "rationale": {"type": "string"},
         "budget": {
-          "description": "The order's new limit, on a budget hail's answer that extends it (#119): tokens and main-loop turns, 0 for unlimited.",
+          "description": "The order's new limit, on a budget hail's answer that extends it (#119): tokens and main-loop turns, 0 for unlimited. A harness given an extend without it (from an older bridge) keeps its old limit.",
           "type": "object",
           "additionalProperties": false,
           "required": ["tokens", "turns"],

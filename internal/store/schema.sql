@@ -115,6 +115,15 @@ CREATE TABLE IF NOT EXISTS hails (
     countermand_option  INTEGER
 );
 
+-- The budget extensions the captain granted (#119), one per budget hail
+-- answered extend: orders.budget_extended counts them, and the hail id
+-- keys each, so a re-run of the step that grants one adds nothing.
+CREATE TABLE IF NOT EXISTS budget_extensions (
+    hail_id    TEXT PRIMARY KEY REFERENCES hails(id),
+    order_id   TEXT NOT NULL REFERENCES orders(id),
+    granted_at TIMESTAMP NOT NULL
+);
+
 -- Domains an egress hail allowed for an order (#111). Every beam that runs
 -- the order gets them.
 CREATE TABLE IF NOT EXISTS order_egress (

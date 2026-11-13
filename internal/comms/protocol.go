@@ -419,7 +419,8 @@ type AnswerBody struct {
 	Option    *int   `json:"option,omitempty"` // index into the hail's options, if one was picked
 	Rationale string `json:"rationale,omitempty"`
 	// Budget is the order's new limit, set only on a budget hail's answer
-	// that extends it (#119).
+	// that extends it (#119). A harness given an extend without it (from
+	// an older bridge) keeps its old limit.
 	Budget *BudgetLimit `json:"budget,omitempty"`
 }
 

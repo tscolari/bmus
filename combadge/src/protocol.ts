@@ -262,7 +262,7 @@ export interface AnswerBody {
   decision: string;
   option?: number;
   rationale?: string;
-  /** The order's new limit, on a budget hail's answer that extends it (#119). */
+  /** The order's new limit, on a budget hail's answer that extends it (#119). An extend without it (an older bridge) keeps the old limit. */
   budget?: BudgetLimit;
 }
 

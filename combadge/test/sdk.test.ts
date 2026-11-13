@@ -1314,8 +1314,6 @@ describe("sdk harness budget (#119)", () => {
       yield success;
     }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { budget_turns: 1 } });
     const hail = await budgetHail(run, 0);
-    await sleep(20);
-    expect(run.emitted).toHaveLength(1);
     answerBudget(run, hail.ref, 0, { tokens: 0, turns: 2 });
     const q = await run.nth(1);
     expect(q).toMatchObject({ type: "hail", body: { category: "clarifying_question", question: "Which way?" } });
@@ -1327,6 +1325,86 @@ describe("sdk harness budget (#119)", () => {
       { behavior: "allow", updatedInput: { ...question, answers: { "Which way?": "left" } } },
     ]);
     expect(run.emitted).toHaveLength(2);
+  });
+
+  it("checks a turn whose hook request comes before the harness has taken its message", async () => {
+    const dir = tempDir();
+    let asked: unknown[] = [];
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      yield assistant("m1", { input: 10, output: 1 });
+      // The hook starts before the consumer takes m2: it waits for pending messages first.
+      const hook = agent.preToolUse("Read", {});
+      yield assistant("m2", { input: 10, output: 1 });
+      asked = await hook;
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { budget_turns: 1 } });
+    await run.result;
+    expect(asked).toContainEqual(ASK);
+  });
+
+  it("waits for an outstanding hail before raising the budget hail", async () => {
+    const dir = tempDir();
+    const question = { questions: [{ question: "Which way?", options: [{ label: "left" }, { label: "right" }] }] };
+    const results: unknown[] = [];
+    let entered!: () => void;
+    const gated = new Promise<void>((r) => (entered = r));
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      yield assistant("m1", { input: 10, output: 1 });
+      const asking = agent.hold("AskUserQuestion", question, "q"); // under budget: its own hail
+      yield assistant("m2", { input: 10, output: 1 }); // now over
+      await agent.preToolUse("Bash", { command: "make" }, "/nonexistent", { tool_use_id: "b" });
+      const making = agent.hold("Bash", { command: "make" }, "b");
+      entered();
+      results.push(...(await Promise.all([asking, making])));
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { budget_turns: 1 } });
+    const q = await run.nth(0);
+    expect(q).toMatchObject({ type: "hail", body: { category: "clarifying_question" } });
+    await gated;
+    await new Promise<void>((r) => setImmediate(r));
+    expect(run.emitted).toHaveLength(1); // the budget hail waits for the question's answer
+    run.answer((q.body as { ref: string }).ref, "left", 0);
+    const hail = await budgetHail(run, 1);
+    answerBudget(run, hail.ref, 0, { tokens: 0, turns: 5 });
+    await run.result;
+    expect(results).toEqual([
+      { behavior: "allow", updatedInput: { ...question, answers: { "Which way?": "left" } } },
+      { behavior: "allow", updatedInput: { command: "make" } },
+    ]);
+  });
+
+  it("parks a later hail once the budget is extended", async () => {
+    const dir = tempDir();
+    const run = start(async function* (agent) {
+      if (agent.options.resume !== undefined) {
+        await agent.nextInput();
+        yield success;
+        return;
+      }
+      await agent.nextInput();
+      yield init;
+      yield assistant("m1", { input: 10, output: 1 });
+      yield assistant("m2", { input: 10, output: 1 });
+      await agent.preToolUse("Read", {}, "/nonexistent", { tool_use_id: "r" });
+      await agent.hold("Read", {}, "r");
+      await agent.postToolUse("Read", {}, "r"); // the allowed call ran: nothing holds off a park
+      void agent.hold("Bash", { command: "make deploy" }, "d"); // under the new limit: a tool_approval, parked
+      await agent.aborted();
+      throw new Error("Claude Code process aborted by user");
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { budget_turns: 1 }, hailParkAfterMs: 50 });
+    const hail = await budgetHail(run, 0);
+    answerBudget(run, hail.ref, 0, { tokens: 0, turns: 10 });
+    const deploy = await run.nth(1);
+    expect(deploy).toMatchObject({ type: "hail", body: { category: "tool_approval" } });
+    await run.query(0).then((a) => a.aborted()); // parked
+    run.answer((deploy.body as { ref: string }).ref, "allow", 0);
+    await run.query(1);
+    await run.result;
+    expect(run.queries).toHaveLength(2);
   });
 
   it("stop denies the call, asks for a handover, and ends the run budget_exceeded after an ordinary checkpoint", async () => {

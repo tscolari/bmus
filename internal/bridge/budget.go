@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -25,9 +26,17 @@ import (
 const budgetCeilingReason = "budget ceiling passed"
 
 // budgetBelayText is the log text of the backstop's belay request, as
-// requestOrder writes it. The backstop sends one per order: an order whose
-// log holds it is not belayed again.
+// requestOrder writes it.
 const budgetBelayText = "belay requested: " + budgetCeilingReason
+
+// backstopMark is the payload field and value that mark the backstop's
+// belay request in the log. The backstop sends one per order: an order
+// whose log holds the mark is not belayed again. A captain's belay with the
+// same reason carries no mark.
+const (
+	backstopField = "backstop"
+	backstopValue = "budget_ceiling"
+)
 
 // canonBudgetContext is a budget hail's context as the bridge stores it:
 // raw's four counts, re-encoded, so the question and the stored context
@@ -129,11 +138,13 @@ func ceilingPassed(used, limit Budget) bool {
 // every beam, passes 125% of its current limit (ceilingPassed), it sends
 // the order's mission a belay with reason budgetCeilingReason, through
 // BelayOrder's path (orderRequest): the same checks, message and log
-// entry, in the same transaction. Only an open order with a mission to
-// belay is belayed (belayCheck): usage reports also arrive for ended
-// orders. An order whose log already holds the backstop's request is left
-// alone, so a report that follows the belay sends no second one. The
-// budget is resolved as sendOrder does, for crewID.
+// entry, in the same transaction, the entry's payload marked
+// backstop=budget_ceiling. Only an open order with a mission to belay is
+// belayed (belayCheck): usage reports also arrive for ended orders. An
+// order whose log already holds the mark is left alone, so a report that
+// follows the belay sends no second one. The budget is resolved as
+// sendOrder does, for the order's assignee, else for crewID, the crew
+// member that reported.
 func (d *Daemon) budgetCeiling(ctx context.Context, tx store.InboxTx, crewID, id string) error {
 	o, err := tx.Order(id)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -145,11 +156,12 @@ func (d *Daemon) budgetCeiling(ctx context.Context, tx store.InboxTx, crewID, id
 	if belayCheck(o) != nil {
 		return nil
 	}
-	division, err := store.CrewDivision(ctx, tx.SQL(), crewID)
+	crew := cmp.Or(o.Assignee, crewID)
+	division, err := store.CrewDivision(ctx, tx.SQL(), crew)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("crew %s: %w", crewID, err)
+		return fmt.Errorf("crew %s: %w", crew, err)
 	}
-	b, _ := d.resolveBudget(o, store.Crew{ID: crewID, Division: division})
+	b, _ := d.resolveBudget(o, store.Crew{ID: crew, Division: division})
 	usage, err := tx.OrderUsage(id)
 	if err != nil {
 		return fmt.Errorf("order %s usage: %w", id, err)
@@ -158,7 +170,7 @@ func (d *Daemon) budgetCeiling(ctx context.Context, tx store.InboxTx, crewID, id
 	if !ceilingPassed(used, limit) {
 		return nil
 	}
-	if sent, err := tx.OrderLogged(id, logOrder, budgetBelayText); err != nil || sent {
+	if sent, err := tx.OrderLogMarked(id, logOrder, backstopField, backstopValue); err != nil || sent {
 		return err
 	}
 	entry, err := d.orderRequest(tx.SQL(), o, comms.TypeBelay, comms.BelayBody{Reason: budgetCeilingReason}, "belay requested",
@@ -166,8 +178,14 @@ func (d *Daemon) budgetCeiling(ctx context.Context, tx store.InboxTx, crewID, id
 	if err != nil {
 		return err
 	}
+	if entry.Payload, err = json.Marshal(map[string]any{"reason": budgetCeilingReason, backstopField: backstopValue,
+		"used": used, "limit": limit}); err != nil {
+		return err
+	}
+	if _, err := tx.AppendLog(entry); err != nil {
+		return err
+	}
 	d.logger.Warn("budget: recorded usage passed 125% of the order's budget; belaying it", "order", id,
 		"tokens", used.Tokens, "token_limit", limit.Tokens, "turns", used.Turns, "turn_limit", limit.Turns)
-	_, err = tx.AppendLog(entry)
-	return err
+	return nil
 }

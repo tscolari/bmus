@@ -73,20 +73,24 @@
  *   beams (`used_tokens`, `used_turns`). The run is over budget when that
  *   usage plus the Tally's count (which already holds this beam's earlier
  *   runs) passes the limit. The PreToolUse hook budgetPolicy, ahead of every
- *   other rule, asks for each call while over; canUseTool then raises one
- *   `budget` hail at a time (options extend/stop, context {used, limit,
- *   turns_used, turns_limit}; the bridge writes the question), which never
- *   parks, and holds the call. extend (option 0) takes the answer's `budget`
+ *   other rule, asks for each call while over (not one gitPushPolicy denies);
+ *   canUseTool then waits until no other hail is outstanding, checks again,
+ *   and raises one `budget` hail at a time (options extend/stop, context
+ *   {used, limit, turns_used, turns_limit}; the bridge writes the question),
+ *   and holds the call. While the budget hail is pending the run doesn't
+ *   park. extend (option 0) takes the answer's `budget`
  *   as the new limit and lets the call through; stop denies it and takes the
  *   stand-down path (commit, request_handover, the stop timeout's fallback),
  *   whose checkpoint is an ordinary one, and the run rejects with
  *   BudgetExceeded: serve emits an error coded `budget_exceeded`. An order
  *   sent already over budget hails at its first tool call. A turn with no
  *   tool call isn't held: the query ends anyway. The check reads the counts
- *   as of the messages the harness has taken (budgetPolicy first lets
- *   pending ones land), and streamed output is a lower bound until the
- *   query's result (#117), so a check against tokens can fire late by the
- *   running query's output.
+ *   as of the messages the harness has taken. budgetPolicy first lets pending
+ *   ones land, but if the CLI sends the hook request before the assistant
+ *   line the check lags one turn. Streamed output is a lower bound until the
+ *   query's result (#117): a check against tokens can fire late by the
+ *   running query's output. An extend answer without `budget` (an older
+ *   bridge) keeps the old limit.
  * - An order with a `handover` resumes from a checkpoint: its bundle's tip,
  *   the checkout's starting commit, is presented as that checkpoint, and the
  *   note goes into the system prompt next to the dossier.
@@ -103,8 +107,8 @@
  * - A query that raised an `order_split` hail never parks, so the split's
  *   result reaches the agent: a resumed Command could split twice. Its other
  *   hails hold until answered. The same goes for a tracker request: a resumed
- *   agent could ask for it again, and for a budget hail, whose answer the
- *   harness acts on itself.
+ *   agent could ask for it again. A budget hail holds off a park only while
+ *   it is pending.
  * - A call allowed through canUseTool runs until its PostToolUse (or
  *   PostToolUseFailure): a park that comes due meanwhile waits for it, then
  *   RESULT_GRACE_MS (5s) more.
@@ -175,6 +179,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import {
+  CATEGORY_BUDGET,
   CATEGORY_CLARIFYING_QUESTION,
   CATEGORY_ORDER_SPLIT,
   CATEGORY_TOOL_APPROVAL,
@@ -272,6 +277,13 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
       /** The budget hail being waited on: concurrent calls share it. true once extended, false once stopped. */
       let budgetPending: Promise<boolean> | undefined;
       const answers = new Map<string, (a: AnswerBody) => void>();
+      /** Wakes the budget gate once no hail is outstanding (answers is empty): a budget hail never meets another (#119). */
+      const quiet: (() => void)[] = [];
+      /** Forgets ref's answers entry, waking quiet once none is left. */
+      const settle = (ref: string) => {
+        answers.delete(ref);
+        if (answers.size === 0) for (const w of quiet.splice(0)) w();
+      };
       /** Each hail's question by ref, and by bridge hail id once answered: a correction names the hail id. */
       const questions = new Map<string, string>();
       const answered = new Map<string, string>();
@@ -299,7 +311,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
       /** Hails that may park, held now, by ref, with their park timers. */
       const held = new Map<string, { call: Parked; timer: NodeJS.Timeout }>();
       /**
-       * The running query raised an order_split hail, a tracker request or a budget hail: it
+       * The running query raised an order_split hail or a tracker request: it
        * never parks, so the result reaches the agent (a resumed agent could
        * ask again).
        */
@@ -321,7 +333,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
       /** Parks the run: every held hail is kept for the resume, and the query is aborted. */
       const parkRun = () => {
         due = false;
-        if (park || halted || state.stop || held.size === 0 || splitRaised) return;
+        if (park || halted || state.stop || held.size === 0 || splitRaised || budgetPending !== undefined) return;
         if (running.size > 0) {
           // Not mid-run: an allowed call finishes before its query is aborted.
           due = true;
@@ -363,14 +375,14 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
           if (park && parked && !parked.answer) {
             // Kept for the resume, also when the aborted query hasn't ended yet.
             parked.answer = m.body;
-            answers.delete(m.body.ref);
+            settle(m.body.ref);
             answered.set(m.body.hail_id, parked.question);
             if ([...park.refs.values()].every((p) => p.answer)) park.wake();
             return;
           }
           const resolve = answers.get(m.body.ref);
           if (!resolve) return warn(`ignoring answer for unknown or already answered ref ${m.body.ref}`);
-          answers.delete(m.body.ref);
+          settle(m.body.ref);
           const question = questions.get(m.body.ref);
           if (question !== undefined) answered.set(m.body.hail_id, question);
           resolve(m.body);
@@ -390,7 +402,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
           if (park) {
             // The stop is the resume's first message, and the parked hails are dropped.
             park.stop = [request, ...[...park.refs.values()].flatMap((p) => (p.answer ? [answerText(p)] : neverAnswered(p)))].join("\n\n");
-            for (const ref of park.refs.keys()) answers.delete(ref);
+            for (const ref of park.refs.keys()) settle(ref);
             park.refs.clear();
             park.wake();
           } else input.push(request, "next");
@@ -402,7 +414,9 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
        * Query q's hail: emits one and holds until its answer, a belay, the
        * SDK's own abort or a park. With call (tool_approval,
        * clarifying_question) the hail starts its park timer; without
-       * (order_split, a tracker request, a budget hail) it holds off any park.
+       * (order_split, a tracker request) it holds off any park for the rest
+       * of the query. A budget hail holds one off only while it is pending
+       * (parkRun reads budgetPending).
        */
       const hailIn = (q: AbortController): Hail => async (body, sdkSignal, call) => {
         withdraw.signal.throwIfAborted();
@@ -415,14 +429,14 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
         if (call) {
           const parked: Parked = { ...call, category: body.category, question: body.question, ...(body.options && { options: body.options }) };
           held.set(ref, { call: parked, timer: setTimeout(parkRun, hailParkAfterMs) });
-        } else splitRaised = true;
+        } else if (body.category !== CATEGORY_BUDGET) splitRaised = true;
         try {
           return await abortable(abortable(abortable(answer, withdraw.signal), sdkSignal), q.signal);
         } finally {
           clearTimeout(held.get(ref)?.timer);
           held.delete(ref);
           // A parked hail keeps its entry until its answer arrives (onInbound).
-          if (!park?.refs.has(ref)) answers.delete(ref);
+          if (!park?.refs.has(ref)) settle(ref);
         }
       };
       /** Query q's lookup: takes the entry matching a call, if any. An aborted query gets none. */
@@ -472,6 +486,8 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
        */
       const budgetPolicy: HookCallback = async (input) => {
         if (input.hook_event_name !== "PreToolUse" || budget.unlimited || halted || state.stop) return {};
+        // gitPushPolicy denies it: canUseTool never sees the call, so nothing is recorded for it.
+        if (pushDenied(input.tool_input)) return {};
         await nextTick();
         if (halted || state.stop || !budget.over(own())) return {};
         budgetAsked.add(input.tool_use_id);
@@ -479,25 +495,31 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
       };
       /**
        * Query q's budget gate, which canUseTool runs first (#119). Over budget,
-       * it raises a budget hail (never parked; concurrent calls wait on the same
-       * one) and holds the call until the captain answers: extend raises the
-       * limit to the answer's and lets the call go on, stop takes the stop path
-       * and denies it. A call budgetPolicy asked about only for the budget is
-       * then allowed ("asked").
+       * it waits until no other hail is outstanding, checks again, and raises a
+       * budget hail, which concurrent calls share and which never parks. The
+       * hail waits on the withdraw and the query's abort only; each call waits
+       * on it under its own signal. extend raises the limit to the answer's and
+       * lets the call go on, stop takes the stop path and denies it. A call
+       * budgetPolicy asked about only for the budget is then allowed ("asked").
        */
       const budgetGate = (hail: Hail): BudgetGate => async (toolUseID, signal) => {
         const asked = budgetAsked.delete(toolUseID);
-        if (budget.over(own())) {
+        while (budget.over(own())) {
+          if (budgetPending === undefined && answers.size > 0) {
+            await abortable(new Promise<void>((r) => quiet.push(r)), signal);
+            continue;
+          }
           budgetPending ??= (async () => {
             try {
-              if (budget.answer(await hail(budget.hail(order.id, own()), signal))) return true;
+              if (budget.answer(await hail(budget.hail(order.id, own()), new AbortController().signal))) return true;
               stopForBudget();
               return false;
             } finally {
               budgetPending = undefined;
             }
           })();
-          if (!(await budgetPending)) return { behavior: "deny", message: budgetStopRequest(order) };
+          if (!(await abortable(budgetPending, signal))) return { behavior: "deny", message: budgetStopRequest(order) };
+          break;
         }
         return asked ? "asked" : "go";
       };
@@ -812,6 +834,12 @@ const MAYBE_PUSH_DENIED =
  * PreToolUse on any tool whose input has a string `command` (Bash, Monitor,
  * ...): deny any git push, saying what to do instead.
  */
+/** Whether gitPushPolicy denies a call with tool_input: its `command` holds a push, or may. */
+function pushDenied(toolInput: unknown): boolean {
+  const command = (toolInput as { command?: unknown } | null)?.command;
+  return typeof command === "string" && classifyGitPush(command) !== "none";
+}
+
 export const gitPushPolicy: HookCallback = (input) => {
   if (input.hook_event_name !== "PreToolUse") return Promise.resolve({});
   const command = (input.tool_input as { command?: unknown } | null)?.command;

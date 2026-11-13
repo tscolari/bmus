@@ -67,13 +67,18 @@ func TestGolden(t *testing.T) {
 	sch := compileSchema(t)
 	golden := loadGolden(t)
 
-	// One golden file per message type, named after it.
+	// One golden file per message type, named after it, plus variants
+	// named <type>.<variant> (answer.budget, #119).
 	var types []string
 	for typ := range bodyTypes {
 		types = append(types, typ)
 	}
 	var names []string
 	for name := range golden {
+		if typ, _, variant := strings.Cut(name, "."); variant {
+			require.Contains(t, types, typ, name)
+			continue
+		}
 		names = append(names, name)
 	}
 	require.ElementsMatch(t, types, names)
@@ -84,7 +89,8 @@ func TestGolden(t *testing.T) {
 
 			var m Message
 			require.NoError(t, json.Unmarshal(raw, &m))
-			require.Equal(t, name, m.Type)
+			typ, _, _ := strings.Cut(name, ".")
+			require.Equal(t, typ, m.Type)
 
 			// Re-encode through the typed body so a field the Go struct
 			// drops or renames shows up as a difference.
