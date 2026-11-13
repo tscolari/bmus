@@ -83,8 +83,9 @@
  * `"model"`, the order's model, when it has one (the holodeck runs no model and
  * only records it, so tests can see what reached the harness), and
  * `"handover"`, the note a resumed order carries, when it has one, and
- * `"budget_tokens"` and `"budget_turns"`, the remaining budget the order
- * carries, when nonzero (#118). The bridge
+ * `"budget_tokens"`, `"budget_turns"`, `"used_tokens"` and `"used_turns"`,
+ * the budget limit and other beams' usage the order carries, when nonzero
+ * (#118). The bridge
  * restart test uses it to assert no step ran twice. The harness lives inside
  * serve, which survives a bridge restart, so steps are never replayed by
  * design. If serve itself restarts mid-order the order is lost
@@ -211,6 +212,8 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
         ...(order.body.handover !== undefined && order.body.handover !== "" && { handover: order.body.handover }),
         ...(order.body.budget_tokens > 0 && { budget_tokens: order.body.budget_tokens }),
         ...((order.body.budget_turns ?? 0) > 0 && { budget_turns: order.body.budget_turns }),
+        ...((order.body.used_tokens ?? 0) > 0 && { used_tokens: order.body.used_tokens }),
+        ...((order.body.used_turns ?? 0) > 0 && { used_turns: order.body.used_turns }),
       };
       /** The tokens the report carries: the latest usage step's, else the order's earlier runs'. */
       let tokens: Usage = { input_tokens: order.usage?.input_tokens ?? 0, output_tokens: order.usage?.output_tokens ?? 0 };

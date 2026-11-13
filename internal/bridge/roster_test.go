@@ -212,30 +212,34 @@ func TestResolveBudget(t *testing.T) {
 	}
 }
 
-// What remains is the budget times 1 + budget_extended less the usage on
-// every beam; unlimited stays 0 and a spent budget is 1 (#118).
-func TestRemainingBudget(t *testing.T) {
+// An order command carries the limit, the budget times 1 +
+// budget_extended, and the usage on the order's other beams (#118).
+func TestBudgetFor(t *testing.T) {
 	t.Parallel()
 	usage := []store.Usage{
 		{Beam: "a", InputTokens: 300, OutputTokens: 100, Turns: 4},
 		{Beam: "b", InputTokens: 50, OutputTokens: 50, Turns: 1},
+		{Beam: "c", InputTokens: 10, OutputTokens: 0, Turns: 2},
 	}
 	for name, tc := range map[string]struct {
-		budget   Budget
-		extended int64
-		usage    []store.Usage
-		want     Budget
+		budget      Budget
+		extended    int64
+		usage       []store.Usage
+		beam        string
+		limit, used Budget
 	}{
-		"no usage":      {Budget{1000, 10}, 0, nil, Budget{1000, 10}},
-		"two beams":     {Budget{1000, 10}, 0, usage, Budget{500, 5}},
-		"extended":      {Budget{1000, 10}, 1, usage, Budget{1500, 15}},
-		"unlimited":     {Budget{}, 3, usage, Budget{}},
-		"turns only":    {Budget{0, 10}, 0, usage, Budget{0, 5}},
-		"exactly spent": {Budget{500, 5}, 0, usage, Budget{1, 1}},
-		"overspent":     {Budget{100, 2}, 0, usage, Budget{1, 1}},
+		"no usage":         {Budget{1000, 10}, 0, nil, "a", Budget{1000, 10}, Budget{}},
+		"other beams":      {Budget{1000, 10}, 0, usage, "a", Budget{1000, 10}, Budget{110, 3}},
+		"new beam":         {Budget{1000, 10}, 0, usage, "d", Budget{1000, 10}, Budget{510, 7}},
+		"extended":         {Budget{1000, 10}, 2, usage, "b", Budget{3000, 30}, Budget{410, 6}},
+		"unlimited":        {Budget{}, 3, usage, "a", Budget{}, Budget{110, 3}},
+		"turns only":       {Budget{0, 10}, 0, usage, "c", Budget{0, 10}, Budget{500, 5}},
+		"overspent as is":  {Budget{100, 2}, 0, usage, "d", Budget{100, 2}, Budget{510, 7}},
+		"only this beam's": {Budget{100, 2}, 0, usage[:1], "a", Budget{100, 2}, Budget{}},
 	} {
-		got := remainingBudget(store.Order{BudgetExtended: tc.extended}, tc.budget, tc.usage)
-		require.Equal(t, tc.want, got, name)
+		limit, used := budgetFor(store.Order{BudgetExtended: tc.extended}, tc.budget, tc.usage, tc.beam)
+		require.Equal(t, tc.limit, limit, name)
+		require.Equal(t, tc.used, used, name)
 	}
 }
 

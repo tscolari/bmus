@@ -1564,3 +1564,65 @@ func TestNonce(t *testing.T) {
 	require.NoError(t, s.Close())
 	require.NotEqual(t, nonce, openTest(t).Nonce(), "a fresh database")
 }
+
+// RecordUsage keeps the row with the highest seq for (order, beam): an
+// equal or lower seq changes nothing, a higher one replaces it, another
+// beam gets its own row and an unknown order writes nothing (#118).
+func TestRecordUsage(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := openTest(t)
+	id, err := s.InsertOrder(ctx, Order{Title: "t", Assignee: "a"}, LogEntry{Kind: "order"})
+	require.NoError(t, err)
+	record := func(seq uint64, order string, u Usage) bool {
+		t.Helper()
+		var wrote bool
+		recorded, err := s.RecordInbox(ctx, "a", 0, seq, func(tx InboxTx) error {
+			var err error
+			wrote, err = tx.RecordUsage(order, u)
+			return err
+		})
+		require.NoError(t, err)
+		require.True(t, recorded)
+		return wrote
+	}
+	alpha := func(in, out, turns int64) Usage {
+		return Usage{Beam: "alpha", InputTokens: in, OutputTokens: out, Turns: turns}
+	}
+	for _, step := range []struct {
+		name  string
+		seq   uint64
+		order string
+		u     Usage
+		wrote bool
+		want  []Usage
+	}{
+		{"first", 5, id, alpha(100, 10, 1), true, []Usage{{"alpha", 100, 10, 1, 5}}},
+		{"higher seq", 7, id, alpha(300, 30, 3), true, []Usage{{"alpha", 300, 30, 3, 7}}},
+		{"lower seq", 6, id, alpha(200, 20, 2), false, []Usage{{"alpha", 300, 30, 3, 7}}},
+		{"another beam", 2, id, Usage{Beam: "beta", InputTokens: 9, Turns: 1}, true,
+			[]Usage{{"alpha", 300, 30, 3, 7}, {"beta", 9, 0, 1, 2}}},
+		{"unknown order", 8, "ORD-9999", alpha(1, 1, 1), false, []Usage{{"alpha", 300, 30, 3, 7}, {"beta", 9, 0, 1, 2}}},
+	} {
+		require.Equal(t, step.wrote, record(step.seq, step.order, step.u), step.name)
+		got, err := s.OrderUsage(ctx, id)
+		require.NoError(t, err)
+		require.Equal(t, step.want, got, step.name)
+	}
+
+	// An equal seq (another tour's beam numbering from 1 again, say)
+	// changes nothing either.
+	recorded, err := s.RecordInbox(ctx, "a", 1, 7, func(tx InboxTx) error {
+		wrote, err := tx.RecordUsage(id, alpha(1, 1, 1))
+		require.False(t, wrote)
+		return err
+	})
+	require.NoError(t, err)
+	require.True(t, recorded)
+	got, err := s.OrderUsage(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, Usage{"alpha", 300, 30, 3, 7}, got[0])
+	none, err := s.OrderUsage(ctx, "ORD-9999")
+	require.NoError(t, err)
+	require.Empty(t, none)
+}

@@ -181,7 +181,7 @@ transporter:              # zero or missing: the default
 
 A crew member's own `--harness` and `--model` override its division's; an order's `model` overrides both. With none, serve runs sdk and the harness its default model. The harness is resolved when a tour provisions its beam, the model when an order is sent. `bmus crew list` shows each resolved value and its source: `(crew)`, `(division)` or `(default)`. If the roster changed since a crew member's beam was provisioned, HARNESS shows what its next tour will get.
 
-An order's `budget_tokens` and `budget_turns` (in the order file or `order.create`) override its division's budget, field by field; a directed order without a division takes its crew member's division's. Tokens count input, cache reads and writes, and output. The bridge records the usage each beam reports for an order, and each order it sends carries what remains: the budget, times one plus the extensions granted, less the usage on every beam so far.
+An order's `budget_tokens` and `budget_turns` (in the order file or `order.create`) override its division's budget, field by field; a directed order without a division takes its crew member's division's. Tokens count input, cache reads and writes, and output. The bridge records the usage each beam reports for an order. Each order it sends carries the limit, the budget times one plus the extensions granted, and the usage recorded on the order's other beams.
 
 ## Regulations
 

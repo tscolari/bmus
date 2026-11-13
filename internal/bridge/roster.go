@@ -156,13 +156,17 @@ func (d *Daemon) checkDivision(division string) error {
 		strings.Join(slices.Sorted(maps.Keys(d.divisions)), ", "))
 }
 
-// Where a crew member's harness or an order's model comes from
-// (CrewView.HarnessSource and ModelSource, resolveHarness, resolveModel).
+// Where a crew member's harness or an order's model or budget comes from
+// (CrewView.HarnessSource and ModelSource, resolveHarness, resolveModel,
+// resolveBudget).
 const (
-	SourceOrder    = "order"    // the order's own model or budget
-	SourceCrew     = "crew"     // the crew member's own setting
-	SourceDivision = "division" // the crew member's (for a budget, the order's) division's default
-	SourceDefault  = "default"  // none: serve's default harness (sdk), the harness's default model, no budget
+	SourceOrder = "order" // the order's own model or budget
+	SourceCrew  = "crew"  // the crew member's own setting
+	// SourceDivision is the crew member's division's default; for a
+	// budget, the order's division's, else its crew member's for a
+	// directed order with none (resolveBudget).
+	SourceDivision = "division"
+	SourceDefault  = "default" // none: serve's default harness (sdk), the harness's default model, no budget
 )
 
 // resolveHarness is the harness crew member c's beams run (#59): c's own,
@@ -199,9 +203,9 @@ func (d *Daemon) resolveModel(o store.Order, c store.Crew) (model, source string
 // resolveBudget is order o's budget when crew member c takes it (#118),
 // each field on its own: the order's own value, else its division's
 // default, else 0 (unlimited), with where each came from. The division is
-// the order's, else c's for an order with none (a directed order). A split
-// child or any other order created without a budget so takes its
-// division's. budget_extended is not applied here (remainingBudget).
+// the order's; a directed order with none takes c's division. An order
+// created without a budget, a split child among them, takes its
+// division's. budget_extended is applied by budgetFor.
 func (d *Daemon) resolveBudget(o store.Order, c store.Crew) (Budget, BudgetSource) {
 	div := d.divisions[cmp.Or(o.Division, c.Division)].Budget
 	pick := func(own, def int64) (int64, string) {
@@ -220,25 +224,22 @@ func (d *Daemon) resolveBudget(o store.Order, c store.Crew) (Budget, BudgetSourc
 	return b, src
 }
 
-// remainingBudget is what order o may still spend under budget b, for the
-// order command (#118): each limited field of b times 1 + o.BudgetExtended,
-// less usage summed over every beam's row. An unlimited field stays 0. A
-// limited field with nothing left is 1, the smallest value that still
-// reads as a limit, since 0 means unlimited on the wire: the harness's
-// first budget check (#119) then finds it spent.
-func remainingBudget(o store.Order, b Budget, usage []store.Usage) Budget {
-	var tokens, turns int64
+// budgetFor is what an order command to beam carries about order o's
+// budget b (#118): limit, each field of b times 1 + o.BudgetExtended (0
+// stays 0, unlimited), and used, the usage recorded on the order's other
+// beams. The harness's own count already holds this beam's earlier runs
+// on the order (#117), and is over budget when used plus that count passes
+// the limit (#119).
+func budgetFor(o store.Order, b Budget, usage []store.Usage, beam string) (limit, used Budget) {
 	for _, u := range usage {
-		tokens += u.InputTokens + u.OutputTokens
-		turns += u.Turns
-	}
-	left := func(limit, used int64) int64 {
-		if limit <= 0 {
-			return 0
+		if u.Beam == beam {
+			continue
 		}
-		return max(limit*(1+max(o.BudgetExtended, 0))-used, 1)
+		used.Tokens += u.InputTokens + u.OutputTokens
+		used.Turns += u.Turns
 	}
-	return Budget{Tokens: left(b.Tokens, tokens), Turns: left(b.Turns, turns)}
+	ext := 1 + max(o.BudgetExtended, 0)
+	return Budget{Tokens: b.Tokens * ext, Turns: b.Turns * ext}, used
 }
 
 // checkHarness fails with a bad request when this bridge can't run crew
