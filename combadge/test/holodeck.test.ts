@@ -282,8 +282,10 @@ describe("holodeck harness", () => {
     expect(cp.body.handover_path).toBe(path.join(dir, "work", other, "5", "handover.md"));
     expect(fs.readFileSync(cp.body.handover_path, "utf8")).toContain(`budget exceeded: the captain stopped ${other}`);
     expect(await a.next((m) => m.order === other)).toMatchObject({ type: "error", body: { code: "budget_exceeded", reason: expect.stringContaining("budget exceeded") } });
-    const state = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8")) as Record<string, unknown>;
-    expect(state.completed).toEqual([ORDER, other]);
+    // serve emits the error before it records the order completed.
+    await expect
+      .poll(() => (JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8")) as Record<string, unknown>).completed)
+      .toEqual([ORDER, other]);
     await a.close();
   });
 
