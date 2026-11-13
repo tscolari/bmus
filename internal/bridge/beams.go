@@ -164,13 +164,15 @@ func removePrevious(ctx context.Context, d *Daemon, in TransporterInput) error {
 // <alias> removed". A failure to check or remove it is logged, here and in
 // the captain's log ("beam <alias> not removed, left to its TTL: <err>"),
 // and the beam is left to its TTL; only ctx ending or the store fails it.
+// A beam removed or found gone gets its row's removed_at
+// (store.SetBeamRemoved); one left to its TTL keeps it NULL.
 // remove-previous, a dismissed tour's remove-beam and DismissCrew use it.
 func (d *Daemon) removeBeam(ctx context.Context, crewID string, b store.BeamRecord) error {
 	beam := transporter.Beam{Alias: b.Alias, ExpiresAt: b.ExpiresAt}
 	payload := map[string]any{"beam": beam.Alias, "tour_no": b.TourNo}
 	exists, err := d.transporter.Exists(ctx, beam)
 	if err == nil && !exists {
-		return nil
+		return d.store.SetBeamRemoved(ctx, crewID, beam.Alias, time.Now())
 	}
 	if err == nil {
 		err = d.transporter.Remove(ctx, beam)
@@ -182,6 +184,9 @@ func (d *Daemon) removeBeam(ctx context.Context, crewID string, b store.BeamReco
 		d.logger.Warn("transporter: beam not removed; leaving it to its TTL", "crew", crewID, "beam", beam.Alias, "err", err)
 		payload["error"] = err.Error()
 		return d.appendLog(ctx, logBeam, crewID, "", "beam "+beam.Alias+" not removed, left to its TTL: "+err.Error(), payload)
+	}
+	if err := d.store.SetBeamRemoved(ctx, crewID, beam.Alias, time.Now()); err != nil {
+		return err
 	}
 	return d.appendLog(ctx, logBeam, crewID, "", "beam "+beam.Alias+" removed", payload)
 }
@@ -278,6 +283,10 @@ func provisionBeam(ctx context.Context, d *Daemon, in TransporterInput) (provisi
 			beam = last
 		} else {
 			d.logger.Info("provision: recorded beam is gone; creating another", "crew", crewID, "beam", last.Alias)
+			// Marked before Create, so a new beam reusing the alias stays unmarked.
+			if err := d.store.SetBeamRemoved(ctx, crewID, last.Alias, time.Now()); err != nil {
+				return provisionAttempt{}, err
+			}
 		}
 	}
 	if beam.Alias == "" {

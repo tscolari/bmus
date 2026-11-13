@@ -263,6 +263,10 @@ var addedColumns = []struct{ table, column, def string }{
 	{"hails", "countermanded_at", `TIMESTAMP`},
 	{"hails", "original_decided_by", `TEXT NOT NULL DEFAULT ''`},
 	{"hails", "countermand_option", `INTEGER`}, // #54
+	{"beams", "removed_at", `TIMESTAMP`},       // #111
+	{"beams", "labels", `TEXT NOT NULL DEFAULT '{}'`},
+	{"orders", "budget_turns", `INTEGER NOT NULL DEFAULT 0`},
+	{"orders", "budget_extended", `INTEGER NOT NULL DEFAULT 0`},
 }
 
 // requiredColumns are columns schema.sql gained that Open doesn't add to an
@@ -2568,6 +2572,9 @@ type BeamRecord struct {
 	TourNo    int
 	CreatedAt time.Time
 	ExpiresAt time.Time
+	// RemovedAt is when the bridge removed the beam or found it gone, nil
+	// while it may still exist (SetBeamRemoved).
+	RemovedAt *time.Time
 }
 
 // ErrBeamTaken is returned by InsertBeam for a UUID already recorded for
@@ -2610,7 +2617,8 @@ func (s *Store) InsertBeam(ctx context.Context, b BeamRecord, entry LogEntry) er
 
 // ListBeams returns crewID's beams, oldest first.
 func (s *Store) ListBeams(ctx context.Context, crewID string) ([]BeamRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT uuid, alias, crew_id, tour_no, created_at, expires_at FROM beams WHERE crew_id = ? ORDER BY rowid`, crewID)
+	rows, err := s.db.QueryContext(ctx, `SELECT uuid, alias, crew_id, tour_no, created_at, expires_at, removed_at
+		FROM beams WHERE crew_id = ? ORDER BY rowid`, crewID)
 	if err != nil {
 		return nil, err
 	}
@@ -2618,12 +2626,24 @@ func (s *Store) ListBeams(ctx context.Context, crewID string) ([]BeamRecord, err
 	var out []BeamRecord
 	for rows.Next() {
 		var b BeamRecord
-		if err := rows.Scan(&b.UUID, &b.Alias, &b.CrewID, &b.TourNo, &b.CreatedAt, &b.ExpiresAt); err != nil {
+		if err := rows.Scan(&b.UUID, &b.Alias, &b.CrewID, &b.TourNo, &b.CreatedAt, &b.ExpiresAt, &b.RemovedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, b)
 	}
 	return out, rows.Err()
+}
+
+// SetBeamRemoved records at as when crewID's beam alias was removed or
+// found gone, on each of its rows with that alias not yet marked. Providers
+// reuse aliases, but only one beam holds an alias at a time, so the older
+// rows are gone too. A row already marked keeps its time.
+func (s *Store) SetBeamRemoved(ctx context.Context, crewID, alias string, at time.Time) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE beams SET removed_at = ? WHERE crew_id = ? AND alias = ? AND removed_at IS NULL`,
+			at.UTC(), crewID, alias)
+		return err
+	})
 }
 
 // LogEntry is a row of the append-only captain's log.

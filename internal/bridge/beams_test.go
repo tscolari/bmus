@@ -225,8 +225,9 @@ func TestTransporterRemovesPreviousBeam(t *testing.T) {
 		name      string
 		removeErr error
 		logged    string
+		marked    bool // the old beam's row gets removed_at (#111)
 	}{
-		{name: "removed", logged: "beam fake-old removed"},
+		{name: "removed", logged: "beam fake-old removed", marked: true},
 		{name: "remove fails", removeErr: assert.AnError, logged: "beam fake-old not removed, left to its TTL: " + assert.AnError.Error()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -246,6 +247,8 @@ func TestTransporterRemovesPreviousBeam(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, beams, 2)
 			require.Equal(t, 1, beams[1].TourNo)
+			require.Equal(t, tc.marked, beams[0].RemovedAt != nil, "the old beam's removed_at")
+			require.Nil(t, beams[1].RemovedAt)
 			require.Contains(t, logTexts(t, r.d, "sorell"), tc.logged)
 
 			// A restart re-runs nothing: the tour's beam is its own.
