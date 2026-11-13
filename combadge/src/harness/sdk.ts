@@ -17,6 +17,7 @@
  *   branch `bmus/<order>` (repos.ts); an order must have exactly one. It runs
  *   with `permissionMode: "bypassPermissions"`. PreToolUse hooks run before the
  *   permission mode, and enforce the in-beam policy:
+ *   - first, the budget (#119; see Budget below): over it, ask.
  *   - a `command` (Bash, Monitor, any tool with one) holding a git push, or
  *     one that can't be ruled out (see classifyGitPush): deny. The beam
  *     holds no push credentials and the bridge collects `bmus/<order>`
@@ -25,10 +26,12 @@
  *   - everything else: no decision, so bypassPermissions runs it.
  * - `canUseTool` turns each ask into a hail and holds the agent until the
  *   answer arrives, or parks the run past `--hail-park-after` (see Parking):
+ *   - first, over budget: a `budget` hail (see Budget below).
  *   - AskUserQuestion: one `clarifying_question` hail per question, one after
  *     another. The answer's decision (else the picked option's label) becomes
  *     the answer to that question.
- *   - anything else (no hook asks for anything else today): a
+ *   - a call only budgetPolicy asked about, once extended: allowed.
+ *   - anything else (no other hook asks for anything else today): a
  *     `tool_approval` hail with options allow/deny. Option 0 allows;
  *     anything else denies with the decision as the message.
  * - In-process tools (MCP server `combadge`, pre-allowed):
@@ -65,6 +68,25 @@
  *   checkpoint_ready, before the report and when a run ends any other way,
  *   each time only when the counts changed since the last report. The
  *   report's usage is the same cumulative token count.
+ * - Budget (#119): the order carries its limit (`budget_tokens`,
+ *   `budget_turns`, 0 for unlimited) and the usage recorded on its other
+ *   beams (`used_tokens`, `used_turns`). The run is over budget when that
+ *   usage plus the Tally's count (which already holds this beam's earlier
+ *   runs) passes the limit. The PreToolUse hook budgetPolicy, ahead of every
+ *   other rule, asks for each call while over; canUseTool then raises one
+ *   `budget` hail at a time (options extend/stop, context {used, limit,
+ *   turns_used, turns_limit}; the bridge writes the question), which never
+ *   parks, and holds the call. extend (option 0) takes the answer's `budget`
+ *   as the new limit and lets the call through; stop denies it and takes the
+ *   stand-down path (commit, request_handover, the stop timeout's fallback),
+ *   whose checkpoint is an ordinary one, and the run rejects with
+ *   BudgetExceeded: serve emits an error coded `budget_exceeded`. An order
+ *   sent already over budget hails at its first tool call. A turn with no
+ *   tool call isn't held: the query ends anyway. The check reads the counts
+ *   as of the messages the harness has taken (budgetPolicy first lets
+ *   pending ones land), and streamed output is a lower bound until the
+ *   query's result (#117), so a check against tokens can fire late by the
+ *   running query's output.
  * - An order with a `handover` resumes from a checkpoint: its bundle's tip,
  *   the checkout's starting commit, is presented as that checkpoint, and the
  *   note goes into the system prompt next to the dossier.
@@ -81,7 +103,8 @@
  * - A query that raised an `order_split` hail never parks, so the split's
  *   result reaches the agent: a resumed Command could split twice. Its other
  *   hails hold until answered. The same goes for a tracker request: a resumed
- *   agent could ask for it again.
+ *   agent could ask for it again, and for a budget hail, whose answer the
+ *   harness acts on itself.
  * - A call allowed through canUseTool runs until its PostToolUse (or
  *   PostToolUseFailure): a park that comes due meanwhile waits for it, then
  *   RESULT_GRACE_MS (5s) more.
@@ -134,6 +157,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { setImmediate as nextTick } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
 import {
   createSdkMcpServer,
@@ -172,7 +196,7 @@ import {
   type UsageBody,
   USAGE_EVERY_TURNS,
 } from "../protocol.js";
-import { abortable, bundleCheckpoint, checkpointFiles, escalate, orderDir, Stopped, type StopCommand } from "./common.js";
+import { abortable, Budget, BudgetExceeded, bundleCheckpoint, checkpointFiles, escalate, orderDir, Stopped, type StopCommand } from "./common.js";
 import { git, type RepoCheckout } from "../repos.js";
 import type { Emit, Harness, HarnessOptions, HarnessReport, Inbound, Order, Role, SelfCheck } from "./types.js";
 
@@ -239,6 +263,14 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
       const sendUsage = () => {
         if (tally.changed) emit({ type: "usage", body: tally.report() });
       };
+      /** The order's budget (#119): its limit, raised by each extension, and the usage on its other beams. */
+      const budget = new Budget(order.body);
+      /** The harness's own count for the order, as the budget reads it. */
+      const own = (): UsageBody => ({ ...tally.tokens, turns: tally.turns });
+      /** Calls budgetPolicy asked about, by tool_use_id: canUseTool lets them through once the budget is extended. */
+      const budgetAsked = new Set<string>();
+      /** The budget hail being waited on: concurrent calls share it. true once extended, false once stopped. */
+      let budgetPending: Promise<boolean> | undefined;
       const answers = new Map<string, (a: AnswerBody) => void>();
       /** Each hail's question by ref, and by bridge hail id once answered: a correction names the hail id. */
       const questions = new Map<string, string>();
@@ -267,7 +299,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
       /** Hails that may park, held now, by ref, with their park timers. */
       const held = new Map<string, { call: Parked; timer: NodeJS.Timeout }>();
       /**
-       * The running query raised an order_split hail or a tracker request: it
+       * The running query raised an order_split hail, a tracker request or a budget hail: it
        * never parks, so the result reaches the agent (a resumed agent could
        * ask again).
        */
@@ -370,7 +402,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
        * Query q's hail: emits one and holds until its answer, a belay, the
        * SDK's own abort or a park. With call (tool_approval,
        * clarifying_question) the hail starts its park timer; without
-       * (order_split, a tracker request) it holds off any park.
+       * (order_split, a tracker request, a budget hail) it holds off any park.
        */
       const hailIn = (q: AbortController): Hail => async (body, sdkSignal, call) => {
         withdraw.signal.throwIfAborted();
@@ -407,15 +439,68 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
         if (halted) return;
         sendUsage();
         if (!state.stop) return emit({ type: "checkpoint_ready", body });
-        emit({ type: "checkpoint_ready", body: { ...body, stopping: true } });
-        end(state.stop.stopped);
+        // A budget stop's checkpoint is an ordinary one: the run then ends with budget_exceeded, not Stopped.
+        const { stopped } = state.stop;
+        emit({ type: "checkpoint_ready", body: stopped instanceof Stopped ? { ...body, stopping: true } : body });
+        end(stopped);
       };
       /** The stop timeout: the agent wrote no checkpoint, so the harness writes one with a stub note. */
-      const fallback = (stopped: Stopped) =>
+      const fallback = (stopped: Stopped | BudgetExceeded) =>
         checkpoint(state, order, workDir, (dir) => {
           const note = `Order ${order.id}: ${stopped.message}. The agent wrote no handover within ${Math.round(stopTimeoutMs / 1000)}s, so the harness wrote this checkpoint: read the transcript and the commits on bmus/${order.id} to see where the work stands.`;
           return writeCheckpoint(dir, order, transcriptOf(state, order.repos[0]?.dir ?? workDir), note, { missingTranscript: "empty" });
         }).then(checkpointReady, (err: unknown) => end(err instanceof Error ? err : new Error(String(err))));
+      /**
+       * The captain answered the budget hail stop (#119): the stand-down path,
+       * with BudgetExceeded as the run's end. Every hail is withdrawn, the
+       * agent is asked to commit and hand over, and once its checkpoint is out
+       * (or the harness's own, at the stop timeout) the run rejects with
+       * BudgetExceeded. A run already ending or stopping is left alone.
+       */
+      const stopForBudget = () => {
+        if (halted || state.stop) return;
+        const stopped = new BudgetExceeded(order.id, budget.context(own()));
+        state.stop = { stopped, timer: setTimeout(() => void fallback(stopped), stopTimeoutMs) };
+        withdraw.abort(new HailWithdrawn(order));
+        input.push(budgetStopRequest(order), "next");
+      };
+      /**
+       * PreToolUse, before every other rule (#119): over budget, ask, so the
+       * call reaches canUseTool and its budget gate. It first lets the
+       * stream's pending messages reach the tally. Nothing is asked once a stop
+       * is under way: the agent must be able to commit and hand over.
+       */
+      const budgetPolicy: HookCallback = async (input) => {
+        if (input.hook_event_name !== "PreToolUse" || budget.unlimited || halted || state.stop) return {};
+        await nextTick();
+        if (halted || state.stop || !budget.over(own())) return {};
+        budgetAsked.add(input.tool_use_id);
+        return preToolUse("ask", "over budget: the captain decides whether to extend it or stop the order");
+      };
+      /**
+       * Query q's budget gate, which canUseTool runs first (#119). Over budget,
+       * it raises a budget hail (never parked; concurrent calls wait on the same
+       * one) and holds the call until the captain answers: extend raises the
+       * limit to the answer's and lets the call go on, stop takes the stop path
+       * and denies it. A call budgetPolicy asked about only for the budget is
+       * then allowed ("asked").
+       */
+      const budgetGate = (hail: Hail): BudgetGate => async (toolUseID, signal) => {
+        const asked = budgetAsked.delete(toolUseID);
+        if (budget.over(own())) {
+          budgetPending ??= (async () => {
+            try {
+              if (budget.answer(await hail(budget.hail(order.id, own()), signal))) return true;
+              stopForBudget();
+              return false;
+            } finally {
+              budgetPending = undefined;
+            }
+          })();
+          if (!(await budgetPending)) return { behavior: "deny", message: budgetStopRequest(order) };
+        }
+        return asked ? "asked" : "go";
+      };
       const drive = async (): Promise<HarnessReport> => {
         if (order.repos.length !== 1) {
           throw new Error(`the sdk harness works in exactly one repo; order ${order.id} has ${order.repos.length}`);
@@ -432,7 +517,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
           systemPrompt: { type: "preset", preset: "claude_code", append: instructions(order, checkout, opts.role) },
           hooks: {
             PreToolUse: [
-              { hooks: [recordTranscript(state), gitPushPolicy] },
+              { hooks: [budgetPolicy, recordTranscript(state), gitPushPolicy] },
               { matcher: "AskUserQuestion", hooks: [askPolicy] },
             ],
             PostToolUse: [{ hooks: [finished] }],
@@ -456,7 +541,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
           // Bound to q: a call from an aborted query takes no entry, raises no hail and reaches no in-process tool.
           const perQuery: Options = {
             abortController: q,
-            canUseTool: canUseTool(hailIn(q), { take: takeIn(q), running: (id) => running.add(id) }),
+            canUseTool: canUseTool(hailIn(q), { take: takeIn(q), running: (id) => running.add(id) }, budgetGate(hailIn(q))),
             mcpServers: { [MCP_SERVER]: combadgeServer(order, checkpointReady, emit, state, { repo, workDir }, q.signal, hailIn(q), opts.role) },
             ...(resume !== undefined && { resume }),
           };
@@ -594,8 +679,8 @@ interface RunState {
   handovers: number;
   /** The latest checkpoint being written, which the next one waits for. */
   handing: Promise<unknown>;
-  /** A stand_down or recall the run is answering, and its fallback timer. */
-  stop?: { stopped: Stopped; timer: NodeJS.Timeout };
+  /** A stand_down, recall or budget stop the run is answering, and its fallback timer. */
+  stop?: { stopped: Stopped | BudgetExceeded; timer: NodeJS.Timeout };
 }
 
 // ---- policy ----
@@ -882,9 +967,16 @@ interface ParkHooks {
   running(toolUseID: string): void;
 }
 
+/**
+ * The budget check canUseTool runs first (#119): a result to return at once
+ * (a deny once the captain stopped the order), "asked" for a call the budget
+ * alone asked about, now allowed, or "go" for the usual path.
+ */
+type BudgetGate = (toolUseID: string, signal: AbortSignal) => Promise<PermissionResult | "asked" | "go">;
+
 /** canUseTool, denying the tool when its hail is withdrawn. */
-export function canUseTool(hail: Hail, parking?: ParkHooks): CanUseTool {
-  const ask = askOrApprove(hail, parking);
+export function canUseTool(hail: Hail, parking?: ParkHooks, budget?: BudgetGate): CanUseTool {
+  const ask = askOrApprove(hail, parking, budget);
   return async (toolName, input, opts) => {
     try {
       return await ask(toolName, input, opts);
@@ -895,13 +987,17 @@ export function canUseTool(hail: Hail, parking?: ParkHooks): CanUseTool {
   };
 }
 
-function askOrApprove(hail: Hail, parking?: ParkHooks): CanUseTool {
+function askOrApprove(hail: Hail, parking?: ParkHooks, budget?: BudgetGate): CanUseTool {
   return async (toolName, input, { signal, decisionReason, toolUseID }): Promise<PermissionResult> => {
-    if (toolName === "AskUserQuestion") return askQuestions(hail, input, signal);
     const allow = (): PermissionResult => {
       parking?.running(toolUseID);
       return { behavior: "allow", updatedInput: input };
     };
+    const gate = budget ? await budget(toolUseID, signal) : "go";
+    if (typeof gate === "object") return gate;
+    if (toolName === "AskUserQuestion") return askQuestions(hail, input, signal);
+    // budgetPolicy is the only hook that asks about other tools than AskUserQuestion.
+    if (gate === "asked") return allow();
     // A call answered while the run was parked, re-issued by the resumed session.
     const grant = parking?.take(toolName, input);
     if (grant) return grant.allow ? allow() : { behavior: "deny", message: grant.message };
@@ -1378,6 +1474,15 @@ function stopRequest(order: Order, command: StopCommand, reason: string | undefi
   const why = command === "recall" ? "The captain is recalling this order" : "This beam is standing down";
   return [
     `${why}${reason ? ` (${reason})` : ""}. Stop the work at the nearest safe point: commit what you have on bmus/${order.id},`,
+    `then call mcp__${MCP_SERVER}__request_handover with a note for whoever continues it (what is done, what is left, anything surprising).`,
+    "Don't call report and don't start anything new; the session ends once the checkpoint is written.",
+  ].join(" ");
+}
+
+/** The user message a budget stop pushes into the session, and the deny message of the call it held (#119). */
+function budgetStopRequest(order: Order): string {
+  return [
+    `The captain stopped this order: it is over its budget. Stop the work now: commit what you have on bmus/${order.id},`,
     `then call mcp__${MCP_SERVER}__request_handover with a note for whoever continues it (what is done, what is left, anything surprising).`,
     "Don't call report and don't start anything new; the session ends once the checkpoint is written.",
   ].join(" ");

@@ -1,7 +1,21 @@
 // Helpers shared by the harnesses.
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { CheckpointReadyBody, ConsultReplyBody, WorkRepo } from "../protocol.js";
+import {
+  CATEGORY_BUDGET,
+  CODE_BUDGET_EXCEEDED,
+  OPTION_EXTEND,
+  OPTION_STOP,
+  type AnswerBody,
+  type BudgetContext,
+  type BudgetLimit,
+  type CheckpointReadyBody,
+  type ConsultReplyBody,
+  type HailBody,
+  type OrderBody,
+  type UsageBody,
+  type WorkRepo,
+} from "../protocol.js";
 import { bundleWork } from "../repos.js";
 import type { Order } from "./types.js";
 
@@ -82,4 +96,83 @@ export class Stopped extends Error {
 /** A consult_reply handing the hail to the captain, with confidence 0. */
 export function escalate(hailId: string, rationale: string): ConsultReplyBody {
   return { hail_id: hailId, decision: "escalate", rationale, confidence: 0 };
+}
+
+// ---- budgets (#119) ----
+
+/**
+ * An order's budget as a harness enforces it: the limit the order carries
+ * (budget_tokens, budget_turns; 0 is unlimited), raised by each extension the
+ * captain grants, and the usage the bridge recorded on the order's other beams
+ * (used_tokens, used_turns). The harness is over budget when that usage plus
+ * its own count for the order passes the limit; its count already holds this
+ * beam's earlier runs, so no baseline is needed.
+ */
+export class Budget {
+  limit: BudgetLimit;
+  private readonly usedTokens: number;
+  private readonly usedTurns: number;
+
+  constructor(body: OrderBody) {
+    this.limit = { tokens: body.budget_tokens ?? 0, turns: body.budget_turns ?? 0 };
+    this.usedTokens = body.used_tokens ?? 0;
+    this.usedTurns = body.used_turns ?? 0;
+  }
+
+  /** No limit in tokens or in turns. */
+  get unlimited(): boolean {
+    return this.limit.tokens === 0 && this.limit.turns === 0;
+  }
+
+  /** The order's usage and limit, given the harness's own count: a budget hail's context. */
+  context(own: UsageBody): BudgetContext {
+    return {
+      used: this.usedTokens + own.input_tokens + own.output_tokens,
+      limit: this.limit.tokens,
+      turns_used: this.usedTurns + own.turns,
+      turns_limit: this.limit.turns,
+    };
+  }
+
+  /** Whether the order is over its limit in tokens or in turns. */
+  over(own: UsageBody): boolean {
+    const c = this.context(own);
+    return (c.limit > 0 && c.used > c.limit) || (c.turns_limit > 0 && c.turns_used > c.turns_limit);
+  }
+
+  /** The hail an over-budget harness raises. The bridge writes its own question from the context. */
+  hail(orderId: string, own: UsageBody): Omit<HailBody, "ref"> {
+    const c = this.context(own);
+    return {
+      category: CATEGORY_BUDGET,
+      question: `${orderId} is over its budget: ${c.used} tokens of ${c.limit || "unlimited"}, ${c.turns_used} turns of ${c.turns_limit || "unlimited"}. Extend it, or stop?`,
+      options: [OPTION_EXTEND, OPTION_STOP],
+      context: { ...c },
+    };
+  }
+
+  /**
+   * Takes the captain's answer: true for extend (option 0), raising the limit
+   * to the one the answer carries, false for anything else (stop). An extend
+   * without a limit keeps the old one, so the next call hails again.
+   */
+  answer(a: AnswerBody): boolean {
+    if (a.option !== 0) return false;
+    if (a.budget) this.limit = { tokens: a.budget.tokens, turns: a.budget.turns };
+    return true;
+  }
+}
+
+/**
+ * What a run rejects with once the captain answered its budget hail stop and
+ * its checkpoint is out (#119). serve ends the order with an error coded
+ * CODE_BUDGET_EXCEEDED, and the bridge fails it.
+ */
+export class BudgetExceeded extends Error {
+  readonly code = CODE_BUDGET_EXCEEDED;
+  constructor(orderId: string, c: BudgetContext) {
+    const field = (used: number, limit: number, unit: string) => `${used} ${unit}${limit > 0 ? ` of ${limit}` : ""}`;
+    super(`budget exceeded: the captain stopped ${orderId} at ${field(c.used, c.limit, "tokens")} and ${field(c.turns_used, c.turns_limit, "turns")}`);
+    this.name = "BudgetExceeded";
+  }
 }

@@ -298,6 +298,13 @@ func (s pumpSink) CrewHello(ctx context.Context, tx *sql.Tx, msg comms.Message) 
 	return err
 }
 
+// UsageRecorded runs the budget backstop (budgetCeiling) on order, whose
+// usage row a report from the pump's crew member just changed, in the
+// inbox transaction.
+func (s pumpSink) UsageRecorded(ctx context.Context, tx store.InboxTx, order string) error {
+	return s.d.budgetCeiling(ctx, tx, s.crewID, order)
+}
+
 func (s pumpSink) HeartbeatMissed(ctx context.Context) error {
 	// The idempotency key makes this at most once per tour and beam, even
 	// from a new pump after a bridge restart. The beam is in the key and the

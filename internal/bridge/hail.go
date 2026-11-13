@@ -285,6 +285,8 @@ func (d *Daemon) classifyHail(ctx context.Context, id string) (hailRouting, erro
 	case route == regs.RouteAuto:
 		r.Route, r.Why = regs.RouteAuto, rule
 	case route == regs.RouteCaptain:
+		// A captain_only rule, or a category fixed to the captain
+		// whatever regs.yaml says (regs.CaptainFixed: budget, #119).
 		r.Why, r.CaptainOnly = rule, true
 	case c.Division == DivisionCommand:
 		r.Why = "from Command"

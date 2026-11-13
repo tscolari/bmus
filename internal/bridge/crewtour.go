@@ -79,6 +79,11 @@ const (
 	CodeNoHello = "no_hello"
 )
 
+// CodeBudgetExceeded is the code of the error a harness ends an order with
+// when the captain answers its budget hail stop (#119). The mission fails
+// the order with it, even while a stand_down or recall is pending.
+const CodeBudgetExceeded = "budget_exceeded"
+
 // CodeHarnessCheckFailed is the code of the crew-level error combadge
 // serve sends when its startup check fails (#172): a PreToolUse ask didn't
 // reach canUseTool, so no hail would reach the captain. serve then exits.

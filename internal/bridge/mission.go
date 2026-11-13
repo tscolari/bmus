@@ -105,7 +105,7 @@ type openHail struct {
 	Ref string // combadge's ref, echoed in the answer
 	// Category is the hail's: an order_split answered with option 0
 	// runs create-children (#155), a tracker request tracker-request
-	// (#54).
+	// (#54), a budget hail budget-extend (#119).
 	Category string
 }
 
@@ -275,7 +275,9 @@ func syntheticMessage(typ string, body any, crewID, orderID string) (comms.Messa
 //     created (option deny). A tracker request answered with option 0
 //     runs tracker-window, tracker-request and tracker-record there
 //     instead (runTrackerRequest, #54): the answer's decision says what
-//     the bridge did, or why it didn't (option deny).
+//     the bridge did, or why it didn't (option deny). A budget hail
+//     answered extend (option 0) runs budget-extend there (extendBudget,
+//     #119), and the answer carries the order's new limit.
 //   - correction (CountermandHail; also while parked): send-correction
 //     passes it to the beam. Parked, stopping (a stand_down or recall went
 //     out) or off the beam, it is held, the latest per hail, and sent
@@ -311,8 +313,8 @@ func syntheticMessage(typ string, body any, crewID, orderID string) (comms.Messa
 //     queued meanwhile (belayAfterSplit, #146). Returns done. A report
 //     that beats a stand_down or a recall completes the order all the
 //     same.
-//   - error: code dismissed fails the order (order-failed: close an open
-//     hail, mark failed, log reason and code). Code beam_lost (the tour's)
+//   - error: code dismissed or budget_exceeded fails the order
+//     (order-failed: close an open hail, mark failed, log reason and code). Code beam_lost (the tour's)
 //     parks the mission on the checkpoints already pulled, or recalls it
 //     while recalling; so does any error while parking or recalling (the
 //     harness couldn't checkpoint). Any other fails the order. A
@@ -686,6 +688,18 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 					body.Option = &deny
 				}
 			}
+			// An extension raises the order's limit before the answer goes
+			// out, so the answer can carry it (#119). Keyed by the hail: a
+			// re-run extends nothing more.
+			if hail.Category == comms.CategoryBudget && body.Option != nil && *body.Option == 0 {
+				limit, err := dbos.RunAsStep(ctx, func(c context.Context) (comms.BudgetLimit, error) {
+					return daemonFrom(c).extendBudget(c, cur, body.HailID)
+				}, append([]dbos.StepOption{dbos.WithStepName("budget-extend")}, storeRetries...)...)
+				if err != nil {
+					return MissionResult{}, cur.CrewID, err
+				}
+				body.Budget = &limit
+			}
 			// An allowed tracker request runs before the answer goes out,
 			// so the answer can say what the bridge did (#54).
 			if isTrackerRequest(hail.Category) && body.Option != nil && *body.Option == 0 {
@@ -807,7 +821,9 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 
 		case comms.TypeError:
 			body := errorBody(msg)
-			if body.Code != CodeDismissed && (body.Code == CodeBeamLost || parking || recalling) {
+			// A budget stop is the captain's answer: it fails the order
+			// even with a stand_down or recall pending (#119).
+			if body.Code != CodeDismissed && body.Code != CodeBudgetExceeded && (body.Code == CodeBeamLost || parking || recalling) {
 				stop := park
 				if recalling {
 					stop = recall
@@ -1599,7 +1615,9 @@ func sendOrder(ctx context.Context, d *Daemon, in MissionInput, ship shipped) (u
 // tour's sickbay or dismissed alone (#43), and the next tour's status on
 // another order too (#48). An order_split hail is stored with the bridge's
 // question (splitQuestion), not the agent's (#155), and so is a tracker
-// request (trackerQuestion, #54).
+// request (trackerQuestion, #54). A budget hail is stored with the
+// bridge's question (budgetQuestion), its context's four counts and the
+// options extend and stop (#119).
 func recordHail(ctx context.Context, d *Daemon, in MissionInput, body comms.HailBody) (string, error) {
 	if body.Category == comms.CategoryOrderSplit {
 		o, err := d.store.GetOrder(ctx, in.OrderID)
@@ -1611,6 +1629,12 @@ func recordHail(ctx context.Context, d *Daemon, in MissionInput, body comms.Hail
 	if isTrackerRequest(body.Category) {
 		body.Context = d.canonTrackerContext(body.Category, body.Context)
 		body.Question = d.trackerQuestion(body.Category, body.Context)
+	}
+	if body.Category == comms.CategoryBudget {
+		var c comms.BudgetContext
+		body.Context, c = canonBudgetContext(body.Context)
+		body.Question = budgetQuestion(in.OrderID, c)
+		body.Options = []string{comms.OptionExtend, comms.OptionStop}
 	}
 	entry, err := logEntry(logHail, in.CrewID, in.OrderID, body.Question, map[string]any{
 		"category": body.Category, "options": body.Options, "ref": body.Ref,

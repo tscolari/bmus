@@ -4,6 +4,7 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -710,6 +711,58 @@ func childBatch(ctx context.Context, tx *sql.Tx, parent, createdBy string) ([]st
 
 // splitRefusedMark starts the note RefuseSplit adds to a hail's rationale.
 const splitRefusedMark = "split refused: "
+
+// budgetExtendedMark starts the note ExtendBudget adds to a hail's
+// rationale.
+const budgetExtendedMark = "budget extended"
+
+// ExtendBudget grants order orderID one more extension of its budget for
+// budget hail hailID (#119): it increments the order's budget_extended,
+// notes "budget extended" in the hail's rationale ("; " after one already
+// there) and appends the entry entry builds from the order as extended, in
+// one transaction, only while the rationale carries no such note: an
+// extension is keyed by its hail, and a re-run returns the order as it
+// stands and writes nothing. It returns the order (without its repos) and
+// whether it wrote. A missing order or hail returns sql.ErrNoRows.
+func (s *Store) ExtendBudget(ctx context.Context, orderID, hailID string, entry func(Order) (LogEntry, error)) (o Order, wrote bool, err error) {
+	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		var rationale string
+		if err := tx.QueryRowContext(ctx, `SELECT rationale FROM hails WHERE id = ?`, hailID).Scan(&rationale); err != nil {
+			return err
+		}
+		if !strings.Contains(rationale, budgetExtendedMark) {
+			res, err := tx.ExecContext(ctx, `UPDATE orders SET budget_extended = budget_extended + 1 WHERE id = ?`, orderID)
+			if err != nil {
+				return err
+			}
+			if n, err := res.RowsAffected(); err != nil || n == 0 {
+				return cmp.Or(err, sql.ErrNoRows)
+			}
+			note := budgetExtendedMark
+			if rationale != "" {
+				note = rationale + "; " + note
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE hails SET rationale = ? WHERE id = ?`, note, hailID); err != nil {
+				return err
+			}
+			wrote = true
+		}
+		var err error
+		if o, err = scanOrder(tx.QueryRowContext(ctx, `SELECT `+orderCols+` FROM orders WHERE id = ?`, orderID)); err != nil || !wrote {
+			return err
+		}
+		e, err := entry(o)
+		if err != nil {
+			return err
+		}
+		_, err = s.appendLog(ctx, tx, e)
+		return err
+	})
+	if err != nil {
+		return Order{}, false, err
+	}
+	return o, wrote, nil
+}
 
 // RefuseSplit records on decided hail id that its split created no child
 // orders (#155): it appends "split refused: <why>" to the hail's rationale
@@ -2913,7 +2966,33 @@ func (t InboxTx) RecordUsage(id string, u Usage) (bool, error) {
 // OrderUsage returns order id's usage rows, one per beam that reported
 // any, by beam.
 func (s *Store) OrderUsage(ctx context.Context, id string) ([]Usage, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT beam, input_tokens, output_tokens, turns, seq FROM order_usage
+	return orderUsage(ctx, s.db, id)
+}
+
+// Order returns order id as the transaction reads it, without its repos,
+// or sql.ErrNoRows.
+func (t InboxTx) Order(id string) (Order, error) {
+	return scanOrder(t.tx.QueryRowContext(t.ctx, `SELECT `+orderCols+` FROM orders WHERE id = ?`, id))
+}
+
+// OrderUsage is Store.OrderUsage, read in the transaction: the row the
+// message being recorded wrote included.
+func (t InboxTx) OrderUsage(id string) ([]Usage, error) { return orderUsage(t.ctx, t.tx, id) }
+
+// OrderLogged reports whether order id's log holds an entry of kind with
+// exactly text.
+func (t InboxTx) OrderLogged(id, kind, text string) (bool, error) {
+	var n int
+	err := t.tx.QueryRowContext(t.ctx, `SELECT EXISTS (SELECT 1 FROM log WHERE order_id = ? AND kind = ? AND text = ?)`,
+		id, kind, text).Scan(&n)
+	return n == 1, err
+}
+
+// orderUsage is OrderUsage on q, a *sql.DB or *sql.Tx.
+func orderUsage(ctx context.Context, q interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}, id string) ([]Usage, error) {
+	rows, err := q.QueryContext(ctx, `SELECT beam, input_tokens, output_tokens, turns, seq FROM order_usage
 		WHERE order_id = ? ORDER BY beam`, id)
 	if err != nil {
 		return nil, err

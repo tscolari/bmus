@@ -44,6 +44,24 @@ const (
 // (comms.CategoryToolApproval).
 const CategoryToolApproval = "tool_approval"
 
+// CategoryBudget is a harness over its order's budget (comms.CategoryBudget,
+// #119). Spending more inference is the captain's call: it is fixed to the
+// captain (CaptainFixed).
+const CategoryBudget = "budget"
+
+// captainFixed are the categories only the captain answers, whatever
+// regs.yaml says, with why. Classify routes them to the captain before any
+// rule, and CheckAnswer rejects every answer to them; the hail workflow
+// then treats them as captain-only, so on_timeout default_option never
+// decides one.
+var captainFixed = map[string]string{
+	CategoryBudget: "category budget is fixed to the captain",
+}
+
+// CaptainFixed reports why hails of category are fixed to the captain
+// whatever regs.yaml says, or "" when they aren't.
+func CaptainFixed(category string) string { return captainFixed[category] }
+
 // Escalation.OnTimeout values.
 const (
 	OnTimeoutHold          = "hold"
@@ -907,6 +925,8 @@ func lower(c byte) byte {
 func hailText(h Hail) string { return strings.Join(append([]string{h.Command}, h.Values...), "\n\n") }
 
 // Classify routes h:
+//   - RouteCaptain for a category fixed to the captain (CaptainFixed),
+//     before any rule and whether or not c is checked;
 //   - RouteCaptain for a tool_approval hail that is Malformed or names no
 //     tool, for hail text over maxText, for a hail a captain_only rule
 //     (other than an Option rule) fits, and for a question a captain_only
@@ -926,6 +946,9 @@ func (c Config) Classify(h Hail) (route, tag, rule string) {
 
 // classify is Classify, also returning h's subjects and tags.
 func (c Config) classify(h Hail) (route, tag, rule string, subj, tags []string) {
+	if why := CaptainFixed(h.Category); why != "" {
+		return RouteCaptain, "", why, nil, nil
+	}
 	if !c.checked {
 		return RouteCaptain, "", "regs not checked", nil, nil
 	}

@@ -368,3 +368,56 @@ func TestSchemaTrackerRequests(t *testing.T) {
 		})
 	}
 }
+
+// A budget hail (#119) carries options [extend, stop] and a BudgetContext;
+// an answer that extends it carries the new limit.
+func TestSchemaBudget(t *testing.T) {
+	t.Parallel()
+	sch := compileSchema(t)
+	hail := func(fn func(body, ctx map[string]any)) []byte {
+		body := map[string]any{}
+		raw, err := json.Marshal(HailBody{Ref: "sdk-ORD-0001-3", Category: CategoryBudget, Question: "Over budget: extend or stop?",
+			Options: []string{OptionExtend, OptionStop}})
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(raw, &body))
+		raw, err = json.Marshal(BudgetContext{Used: 1_200_000, Limit: 1_000_000, TurnsUsed: 140, TurnsLimit: 150})
+		require.NoError(t, err)
+		ctx := map[string]any{}
+		require.NoError(t, json.Unmarshal(raw, &ctx))
+		body["context"] = ctx
+		fn(body, ctx)
+		m, err := json.Marshal(map[string]any{"v": 1, "seq": 3, "crew": "sorell", "order": "ORD-0001", "type": "hail",
+			"ts": "2026-11-13T09:00:00Z", "body": body})
+		require.NoError(t, err)
+		return m
+	}
+	require.NoError(t, validate(sch, hail(func(_, _ map[string]any) {})))
+	for _, tc := range []struct {
+		name string
+		fn   func(body, ctx map[string]any)
+	}{
+		{"no context", func(b, _ map[string]any) { delete(b, "context") }},
+		{"no options", func(b, _ map[string]any) { delete(b, "options") }},
+		{"allow and deny", func(b, _ map[string]any) { b["options"] = []string{OptionAllow, OptionDeny} }},
+		{"options reversed", func(b, _ map[string]any) { b["options"] = []string{OptionStop, OptionExtend} }},
+		{"no turns_limit", func(_, c map[string]any) { delete(c, "turns_limit") }},
+		{"negative used", func(_, c map[string]any) { c["used"] = -1 }},
+		{"unknown context field", func(_, c map[string]any) { c["note"] = "x" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Error(t, validate(sch, hail(tc.fn)))
+		})
+	}
+
+	zero := 0
+	m, err := NewMessage(TypeAnswer, AnswerBody{Ref: "sdk-ORD-0001-3", HailID: "H-0007", DecidedBy: DecidedByCaptain,
+		Decision: OptionExtend, Option: &zero, Budget: &BudgetLimit{Tokens: 2_000_000, Turns: 300}})
+	require.NoError(t, err)
+	m.Seq, m.Crew, m.Order = 9, "sorell", "ORD-0001"
+	raw, err := json.Marshal(m)
+	require.NoError(t, err)
+	require.NoError(t, validate(sch, raw), string(raw))
+	require.Contains(t, string(raw), `"budget":{"tokens":2000000,"turns":300}`)
+	bad := strings.Replace(string(raw), `"budget":{"tokens":2000000,"turns":300}`, `"budget":{"tokens":2000000}`, 1)
+	require.Error(t, validate(sch, []byte(bad)))
+}

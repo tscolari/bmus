@@ -3,7 +3,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
-import { escalate, Stopped } from "./harness/common.js";
+import { BudgetExceeded, escalate, Stopped } from "./harness/common.js";
 import { harnesses } from "./harness/index.js";
 import { loadEnvFile } from "./env.js";
 import { acquireLock } from "./lock.js";
@@ -171,11 +171,12 @@ async function start(opts: ServeOptions, release: () => void): Promise<Server> {
     // An error after a stand_down or recall was relayed (the harness couldn't
     // checkpoint, say) records the order stopped, not completed: the bridge
     // parks it on its earlier checkpoints and may send it here again.
-    const finish = <T extends "report" | "error">(type: T, body: BeamToBridgeBodies[T]) => {
+    const finish = <T extends "report" | "error">(type: T, body: BeamToBridgeBodies[T], err?: unknown) => {
       done = true;
       run = undefined;
       emit(type, body, id);
-      const stopped = type === "error" && state.stopping === id;
+      // A budget stop (#119) ends the order whatever stop came meanwhile.
+      const stopped = type === "error" && state.stopping === id && !(err instanceof BudgetExceeded);
       state.record(stopped ? { running: null, stopped: id } : { running: null, completed: id });
     };
     // A stand_down or recall ended the run after its stopping checkpoint:
@@ -213,7 +214,13 @@ async function start(opts: ServeOptions, release: () => void): Promise<Server> {
     result.then(
       (report) => finish("report", report),
       (err: unknown) =>
-        err instanceof Stopped ? stop() : finish("error", { reason: err instanceof Error ? err.message : String(err) }),
+        err instanceof Stopped
+          ? stop()
+          : finish(
+              "error",
+              { reason: err instanceof Error ? err.message : String(err), ...(err instanceof BudgetExceeded && { code: err.code }) },
+              err,
+            ),
     );
   }
 

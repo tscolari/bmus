@@ -176,8 +176,10 @@ func (d *Daemon) CreateOrder(ctx context.Context, o store.Order) (string, error)
 // AnswerHail delivers the captain's decision on an open hail to the mission
 // waiting on it (order/<order>, topic from-crew, as a comms answer). option,
 // if set, indexes the hail's options; an empty decision then defaults to that
-// option's text. It fails with store.ErrHailClosed (wrapped) if the hail
-// isn't open and ErrNotFound if it doesn't exist.
+// option's text. A budget hail (#119) needs an option: a decision naming
+// one, in any case, picks it, and any other text is a bad request. It
+// fails with store.ErrHailClosed (wrapped) if the hail isn't open and
+// ErrNotFound if it doesn't exist.
 //
 // The decision (hails.status = decided), the crew member back away, its
 // captain's log entry and the message to the mission commit in one store
@@ -208,6 +210,14 @@ func (d *Daemon) AnswerHail(ctx context.Context, hailID, decision string, option
 	}
 	if decision == "" {
 		return badRequest("a decision or an option is required")
+	}
+	if h.Category == comms.CategoryBudget && option == nil {
+		// The harness acts on the option: extend or stop (#119).
+		i := slices.IndexFunc(h.Options, func(o string) bool { return strings.EqualFold(o, strings.TrimSpace(decision)) })
+		if i < 0 {
+			return badRequest("hail %s is a budget hail: answer with an option (%s)", hailID, strings.Join(h.Options, " or "))
+		}
+		option, decision = &i, h.Options[i]
 	}
 	msg, err := comms.NewMessage(comms.TypeAnswer, comms.AnswerBody{
 		HailID: hailID, DecidedBy: comms.DecidedByCaptain, Decision: decision, Option: option,
@@ -363,15 +373,8 @@ var errBelaySplit = errors.New("split order")
 func (d *Daemon) belayOrder(ctx context.Context, id, reason string) (children int, settled bool, err error) {
 	err = d.requestOrder(ctx, id, comms.TypeBelay, comms.BelayBody{Reason: reason}, "belay requested", reason,
 		func(o store.Order, _ string) error {
-			switch {
-			case o.State == store.OrderAway || o.State == store.OrderHailing:
-			case (o.State == store.OrderPool || o.State == store.OrderDirected) && o.ParkedAt != nil:
-			case o.State == store.OrderPool || o.State == store.OrderDirected:
-				return badRequest("order %s is %s and has no mission to belay: withdraw it (`bmus order withdraw`)", o.ID, o.State)
-			case o.State == store.OrderSplit:
-				return errBelaySplit
-			default:
-				return badRequest("order %s is %s, too late to belay", o.ID, o.State)
+			if err := belayCheck(o); err != nil {
+				return err
 			}
 			children = o.OpenChildren
 			return nil
@@ -381,6 +384,24 @@ func (d *Daemon) belayOrder(ctx context.Context, id, reason string) (children in
 		return children, err == nil, err
 	}
 	return children, false, err
+}
+
+// belayCheck is BelayOrder's check on order o: nil for an order whose
+// mission can take a belay (away or hailing, or unclaimed and parked: a
+// recalled order), errBelaySplit for a split order, and a bad request for
+// any other.
+func belayCheck(o store.Order) error {
+	switch {
+	case o.State == store.OrderAway || o.State == store.OrderHailing:
+	case (o.State == store.OrderPool || o.State == store.OrderDirected) && o.ParkedAt != nil:
+	case o.State == store.OrderPool || o.State == store.OrderDirected:
+		return badRequest("order %s is %s and has no mission to belay: withdraw it (`bmus order withdraw`)", o.ID, o.State)
+	case o.State == store.OrderSplit:
+		return errBelaySplit
+	default:
+		return badRequest("order %s is %s, too late to belay", o.ID, o.State)
+	}
+	return nil
 }
 
 // belaySplit belays split order id (#146): its mission has ended, so
@@ -500,31 +521,39 @@ func (d *Daemon) RecallOrder(ctx context.Context, id, reason string) error {
 // crew member; the mission takes it whoever it runs on.
 func (d *Daemon) requestOrder(ctx context.Context, id, typ string, body any, what, reason string,
 	check func(o store.Order, assigneeStatus string) error) error {
-	msg, err := syntheticMessage(typ, body, "", id)
-	if err != nil {
-		return err
-	}
-	text := what
-	if reason != "" {
-		text += ": " + reason
-	}
-	err = d.store.RequestOrder(ctx, id, func(tx *sql.Tx, o store.Order, assigneeStatus string) (store.LogEntry, error) {
+	err := d.store.RequestOrder(ctx, id, func(tx *sql.Tx, o store.Order, assigneeStatus string) (store.LogEntry, error) {
 		if err := check(o, assigneeStatus); err != nil {
 			return store.LogEntry{}, err
 		}
-		entry, err := logEntry(logOrder, o.Assignee, id, text, map[string]string{"reason": reason})
-		if err != nil {
-			return store.LogEntry{}, err
-		}
-		if err := dbos.Send(d.dbos, missionWorkflowID(id), msg, fromCrewTopic, dbos.WithSendTransaction(tx)); err != nil {
-			return store.LogEntry{}, fmt.Errorf("deliver %s to %s: %w", typ, missionWorkflowID(id), err)
-		}
-		return entry, nil
+		return d.orderRequest(tx, o, typ, body, what, reason)
 	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("order %s: %w", id, ErrNotFound)
 	}
 	return err
+}
+
+// orderRequest sends order o's mission a synthetic message of type typ
+// with body in tx, and returns the log entry "<what>[: <reason>]" for the
+// caller to append in tx: requestOrder's, and the budget backstop's in
+// its inbox transaction (budgetCeiling).
+func (d *Daemon) orderRequest(tx *sql.Tx, o store.Order, typ string, body any, what, reason string) (store.LogEntry, error) {
+	msg, err := syntheticMessage(typ, body, "", o.ID)
+	if err != nil {
+		return store.LogEntry{}, err
+	}
+	text := what
+	if reason != "" {
+		text += ": " + reason
+	}
+	entry, err := logEntry(logOrder, o.Assignee, o.ID, text, map[string]string{"reason": reason})
+	if err != nil {
+		return store.LogEntry{}, err
+	}
+	if err := dbos.Send(d.dbos, missionWorkflowID(o.ID), msg, fromCrewTopic, dbos.WithSendTransaction(tx)); err != nil {
+		return store.LogEntry{}, fmt.Errorf("deliver %s to %s: %w", typ, missionWorkflowID(o.ID), err)
+	}
+	return entry, nil
 }
 
 // WithdrawOrder takes back order id before any crew member claims it
