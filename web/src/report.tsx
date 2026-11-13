@@ -160,12 +160,31 @@ export function CopyButton(props: { text: string; label: string; initial?: CopyN
   );
 }
 
-/** One repo's section: its name and base, a truncation note, a block per file and, past maxLines, a note. */
+/**
+ * One repo's section: its name and base, a truncation note, a block per
+ * file and, past maxLines, a note. A jettisoned repo's section says the
+ * branch is gone instead (#108).
+ */
 function RepoSection(props: { repo: RepoDiff; branch: string; cap: number; maxLines: number }) {
   const r = props.repo;
+  const hid = `diff-repo-${r.name}`;
+  if (r.jettisoned) {
+    return (
+      <section class="panel diff-repo" aria-labelledby={hid}>
+        <h2 id={hid} class="sect">
+          <span class="tab bg-blue" aria-hidden="true" />
+          {r.name}
+          <span class="count mono">branch jettisoned</span>
+        </h2>
+        <p class="empty" role="note">
+          Branch jettisoned: <span class="mono">{props.branch}</span> was deleted from the bridge's clone of {r.name} by{" "}
+          <span class="mono">bmus jettison</span>, and its diff with it.
+        </p>
+      </section>
+    );
+  }
   const parsed = parseDiff(r.diff);
   const { files, omitted } = capLines(parsed, props.maxLines);
-  const hid = `diff-repo-${r.name}`;
   return (
     <section class="panel diff-repo" aria-labelledby={hid}>
       <h2 id={hid} class="sect">

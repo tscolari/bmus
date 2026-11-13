@@ -353,12 +353,15 @@ var rpcHandlers = map[string]rpcHandler{
 
 	"command.guidance.get": rpcCommandGuidanceGet,
 	"command.guidance.set": rpcCommandGuidanceSet,
+
+	"bridge.jettison": rpcBridgeJettison,
 }
 
 // rpcHandlerTimeouts are the handlers that may take longer than
 // rpcHandlerTimeout.
 var rpcHandlerTimeouts = map[string]time.Duration{
-	"order.push": gitPushTimeout,
+	"order.push":      gitPushTimeout,
+	"bridge.jettison": jettisonTimeout,
 }
 
 // handlerTimeout bounds command cmd's handler.
@@ -879,6 +882,28 @@ func rpcCommandGuidanceSet(ctx context.Context, d *Daemon, raw json.RawMessage) 
 		return nil, err
 	}
 	return CommandGuidanceResult{Guidance: g}, nil
+}
+
+// rpcBridgeJettison is bridge.jettison (#108): JettisonArgs, a
+// JettisonResult.
+func rpcBridgeJettison(ctx context.Context, d *Daemon, raw json.RawMessage) (any, error) {
+	var a JettisonArgs
+	if err := decodeArgs(raw, &a); err != nil {
+		return nil, err
+	}
+	if a.OlderThan == "" {
+		a.OlderThan = DefaultJettisonAge
+	}
+	age, err := ParseAge(a.OlderThan)
+	if err != nil {
+		return nil, badRequest("older_than: %v", err)
+	}
+	res, err := d.Jettison(ctx, age, a.Yes)
+	if err != nil {
+		return nil, err
+	}
+	res.OlderThan = a.OlderThan
+	return res, nil
 }
 
 // rpcServer serves the RPC socket.

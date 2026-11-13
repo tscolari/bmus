@@ -46,8 +46,8 @@ const diff: OrderReport = {
   pushes: [{ repo: "app", branch: "bmus/ORD-0007", commit: "0123456789abcdef", force: false, at: "2026-11-12T11:00:00Z" }],
   cap: 2 << 20,
   repos: [
-    { name: "app", base, diff: appDiff, truncated: false },
-    { name: "lib", base, diff: "", truncated: true },
+    { name: "app", base, diff: appDiff, truncated: false, jettisoned: false },
+    { name: "lib", base, diff: "", truncated: true, jettisoned: false },
   ],
 };
 
@@ -149,8 +149,19 @@ describe("ReportView", () => {
     expect(html).toContain('<p class="empty">No changes.</p>');
   });
 
+  it("marks a jettisoned repo's branch as gone, with no diff and no error (#108)", () => {
+    const jettisoned = renderToString(
+      <ReportView report={{ ...diff, repos: [diff.repos[0]!, { name: "lib", base, diff: "", truncated: false, jettisoned: true }] }} />,
+    );
+    expect(jettisoned).toContain('<span class="count mono">branch jettisoned</span>');
+    expect(jettisoned).toContain("Branch jettisoned: <span class=\"mono\">bmus/ORD-0007</span> was deleted from the bridge's clone of lib");
+    expect(jettisoned).not.toContain("No changes.");
+    expect(jettisoned).not.toContain('role="alert"');
+    expect(html).not.toContain("jettisoned");
+  });
+
   it("copies the raw diff of every repo", () => {
-    expect(rawDiff({ ...diff, repos: [diff.repos[0]!, { name: "lib", base, diff: "diff --git a/l b/l\n", truncated: false }] })).toBe(
+    expect(rawDiff({ ...diff, repos: [diff.repos[0]!, { name: "lib", base, diff: "diff --git a/l b/l\n", truncated: false, jettisoned: false }] })).toBe(
       `${appDiff}diff --git a/l b/l\n`,
     );
     expect(html).toContain('<button type="button" class="btn ghost small" aria-label="Copy the diff of ORD-0007">Copy</button>');

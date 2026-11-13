@@ -194,12 +194,18 @@ export interface PushedRepo {
   readonly commit: string;
 }
 
-/** One repo's diff in GET /api/orders/{id}/diff: bridge.RepoDiff. diff is unified, from base to the work; truncated says it stops at the bridge's cap. */
+/**
+ * One repo's diff in GET /api/orders/{id}/report: bridge.RepoDiff. diff is
+ * unified, from base to the work; truncated says it stops at the bridge's
+ * cap; jettisoned says `bmus jettison` deleted the order's branch from the
+ * bridge's clone (#108), and diff is then empty.
+ */
 export interface RepoDiff {
   readonly name: string;
   readonly base: string;
   readonly diff: string;
   readonly truncated: boolean;
+  readonly jettisoned: boolean;
 }
 
 /** A push of the order's work in GET /api/orders/{id}/report: bridge.ReportPush. */
