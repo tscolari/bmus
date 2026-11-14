@@ -178,6 +178,11 @@ func TestBelayLine(t *testing.T) {
 	require.Equal(t, "order ORD-0001 belay requested, and its 2 open child orders", line(2))
 	split := bridge.OrderBelayResult{OrderView: bridge.OrderView{ID: "ORD-0001", State: store.OrderBelayed}, Children: 2, Belayed: true}
 	require.Equal(t, "order ORD-0001 belayed, and its 2 open child orders", belayLine(split))
+	// The orders waiting on it it withdraws (#142).
+	split.Waiting = []string{"ORD-0005"}
+	require.Equal(t, "order ORD-0001 belayed, and its 2 open child orders, and 1 order waiting on it (ORD-0005)", belayLine(split))
+	waiting := bridge.OrderBelayResult{OrderView: bridge.OrderView{ID: "ORD-0001"}, Waiting: []string{"ORD-0002", "ORD-0003"}}
+	require.Equal(t, "order ORD-0001 belay requested, and 2 orders waiting on it (ORD-0002, ORD-0003)", belayLine(waiting))
 }
 
 // #142's acceptance through the CLI: an order created with --after waits,
@@ -204,7 +209,7 @@ func TestOrderAfter(t *testing.T) {
 	require.Equal(t, []string{"ORD-0001"}, orders.Orders[1].WaitingOn)
 	require.Empty(t, orders.Orders[0].After)
 
-	e.run(t, "order", "withdraw", "ORD-0001")
+	require.Equal(t, "order ORD-0001 withdrawn, and 1 order waiting on it (ORD-0002)\n", e.run(t, "order", "withdraw", "ORD-0001"))
 	e.runJSON(t, &orders, "order", "list")
 	require.Equal(t, store.OrderWithdrawn, orders.Orders[1].State, "withdrawn with the order it waits on")
 	require.Contains(t, e.fail(t, "order", "create", second, "--after", "ORD-0001"),

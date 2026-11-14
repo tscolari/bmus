@@ -551,11 +551,46 @@ func TestOrderCreateAfter(t *testing.T) {
 	}
 	require.Equal(t, []string{first.ID, second.ID}, ids)
 
-	require.NoError(t, r.d.WithdrawOrder(ctx, first.ID, ""))
+	var third OrderCreateResult
+	require.NoError(t, call(t, home, "order.create", OrderCreateArgs{Title: "third", Division: "ops", Repos: repos,
+		After: []string{second.ID}}, &third))
+	var withdrawn OrderWithdrawResult
+	require.NoError(t, call(t, home, "order.withdraw", OrderActionArgs{ID: first.ID}, &withdrawn))
+	require.Equal(t, store.OrderWithdrawn, withdrawn.State)
+	require.Equal(t, []string{second.ID, third.ID}, withdrawn.Waiting, "down the chain")
 	o, err := r.d.store.GetOrder(ctx, second.ID)
 	require.NoError(t, err)
 	require.Equal(t, store.OrderWithdrawn, o.State)
 	re := requireRPCError(t, call(t, home, "order.create", OrderCreateArgs{Title: "t", Division: "ops", Repos: repos,
 		After: []string{first.ID}}, nil), CodeBadRequest)
 	require.Equal(t, "after ORD-0001: it ended withdrawn and will never be done", re.Message)
+}
+
+// order.belay of an order on its mission names the orders waiting on it,
+// down the chain, as the request read them (#142); one with none has an
+// empty list.
+func TestOrderBelayWaiting(t *testing.T) {
+	t.Parallel()
+	home := privateHome(t)
+	r := startDaemon(t, home)
+	defer r.stop(t)
+	repos := []OrderRepo{{Name: "app", BaseRef: "main"}}
+	require.NoError(t, call(t, home, "crew.add", CrewAddArgs{ID: "sorell", Name: "Sorell"}, nil))
+	var first, second, third OrderCreateResult
+	require.NoError(t, call(t, home, "order.create", OrderCreateArgs{Title: "first", Assignee: "sorell", Repos: repos}, &first))
+	require.NoError(t, call(t, home, "order.create", OrderCreateArgs{Title: "second", Division: "ops", Repos: repos,
+		After: []string{first.ID}}, &second))
+	require.NoError(t, call(t, home, "order.create", OrderCreateArgs{Title: "third", Division: "ops", Repos: repos,
+		After: []string{second.ID}}, &third))
+	requirePending(t, r.d, missionWorkflowID(first.ID))
+
+	var res OrderBelayResult
+	require.NoError(t, call(t, home, "order.belay", OrderActionArgs{ID: first.ID}, &res))
+	require.False(t, res.Belayed)
+	require.Equal(t, []string{second.ID, third.ID}, res.Waiting)
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		o, err := r.d.store.GetOrder(context.Background(), third.ID)
+		require.NoError(c, err)
+		require.Equal(c, store.OrderWithdrawn, o.State)
+	}, 60*time.Second, 20*time.Millisecond)
 }

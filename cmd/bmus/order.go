@@ -223,7 +223,10 @@ ended, is belayed at once.
 
 The belay cascades to the order's child orders: those not claimed yet are
 withdrawn, those in flight are belayed, and those already ended are left
-alone. The output says how many open child orders it reaches.`,
+alone. The output says how many open child orders it reaches.
+
+Orders waiting on it (their after, down the chain) that no crew member has
+claimed are withdrawn when the belay settles it; the output names them.`,
 		belayLine)
 	recall := orderActionCmd(a, "recall", "order.recall",
 		"Return an order to its division's pool from its last checkpoint",
@@ -236,8 +239,12 @@ change or beam loss can be recalled only while its crew member is in sickbay.`,
 	withdraw := orderActionCmd(a, "withdraw", "order.withdraw",
 		"Take back an order no crew member has claimed yet",
 		`Take back an order no crew member has claimed yet (pool or directed). A
-recalled order still has its parked mission: belay it instead.`,
-		func(v bridge.OrderView) string { return "order " + v.ID + " withdrawn" })
+recalled order still has its parked mission: belay it instead. Orders waiting
+on it (their after, down the chain) that no crew member has claimed are
+withdrawn with it; the output names them.`,
+		func(res bridge.OrderWithdrawResult) string {
+			return "order " + res.ID + " withdrawn" + waitingPart(res.Waiting)
+		})
 
 	var (
 		budgetJSON                bool
@@ -411,7 +418,7 @@ func orderActionCmd[T any](a *app, use, rpc, short, long string, say func(T) str
 // requested", or "order ORD-0001 belayed" for a split order the call
 // belayed itself (res.Belayed, not the state: a mission may settle its
 // order before the reply reads it), with ", and its 2 open child orders"
-// when the belay reaches any (#146). The CLI has no confirm prompt: the
+// when the belay reaches any (#146), then waitingPart (#142). The CLI has no confirm prompt: the
 // count is in the output.
 func belayLine(res bridge.OrderBelayResult) string {
 	line := "order " + res.ID + " belay requested"
@@ -424,7 +431,20 @@ func belayLine(res bridge.OrderBelayResult) string {
 	case res.Children > 1:
 		line += fmt.Sprintf(", and its %d open child orders", res.Children)
 	}
-	return line
+	return line + waitingPart(res.Waiting)
+}
+
+// waitingPart ends a withdraw's or a belay's line with the orders waiting
+// on it that it withdraws (#142): ", and 2 orders waiting on it (ORD-0002,
+// ORD-0003)", or nothing for none.
+func waitingPart(ids []string) string {
+	switch len(ids) {
+	case 0:
+		return ""
+	case 1:
+		return ", and 1 order waiting on it (" + ids[0] + ")"
+	}
+	return fmt.Sprintf(", and %d orders waiting on it (%s)", len(ids), strings.Join(ids, ", "))
 }
 
 // progressCell is an order's PROGRESS cell: "waiting on ORD-0001" for an

@@ -169,10 +169,24 @@ type (
 	// sent a belay of their own. Belayed is true when the call belayed
 	// the order itself (a split order, which has no mission), false when
 	// it queued the belay for the order's mission.
+	//
+	// Waiting are the orders waiting on it (#142), down the chain, that
+	// the belay withdraws: as the request read them for a belay queued
+	// for its mission, or those its cascade withdrew for a split order.
+	// Always present.
 	OrderBelayResult struct {
 		OrderView
-		Children int  `json:"children"`
-		Belayed  bool `json:"belayed"`
+		Children int      `json:"children"`
+		Belayed  bool     `json:"belayed"`
+		Waiting  []string `json:"waiting"`
+	}
+	// OrderWithdrawResult is order.withdraw's result: the order as an
+	// OrderView and Waiting, the orders waiting on it, down the chain,
+	// that its withdraw withdrew in the same transaction (#142). Always
+	// present.
+	OrderWithdrawResult struct {
+		OrderView
+		Waiting []string `json:"waiting"`
 	}
 	// OrderRouteArgs are order.route's args. An absent assignee or
 	// division keeps the order's, and an empty one clears it; at least one
@@ -564,18 +578,30 @@ func rpcOrderBelay(ctx context.Context, d *Daemon, raw json.RawMessage) (any, er
 // POST /api/orders/{id}/belay. It adds the open child orders the belay
 // reaches (#146).
 func (d *Daemon) belayAction(ctx context.Context, a OrderActionArgs) (OrderBelayResult, error) {
-	var (
-		n       int
-		belayed bool
-	)
+	var r belayReach
 	v, err := d.orderAction(ctx, a, func(ctx context.Context, id, reason string) (err error) {
-		n, belayed, err = d.belayOrder(ctx, id, reason)
+		r, err = d.belayOrder(ctx, id, reason)
 		return err
 	})
 	if err != nil {
 		return OrderBelayResult{}, err
 	}
-	return OrderBelayResult{OrderView: v, Children: n, Belayed: belayed}, nil
+	return OrderBelayResult{OrderView: v, Children: r.Children, Belayed: r.Settled, Waiting: orEmpty(r.Waiting)}, nil
+}
+
+// withdrawAction is orderAction for a withdraw: order.withdraw and the
+// console's POST /api/orders/{id}/withdraw. It adds the orders waiting on
+// it that the withdraw withdrew (#142).
+func (d *Daemon) withdrawAction(ctx context.Context, a OrderActionArgs) (OrderWithdrawResult, error) {
+	var waiting []string
+	v, err := d.orderAction(ctx, a, func(ctx context.Context, id, reason string) (err error) {
+		waiting, err = d.withdrawOrder(ctx, id, reason)
+		return err
+	})
+	if err != nil {
+		return OrderWithdrawResult{}, err
+	}
+	return OrderWithdrawResult{OrderView: v, Waiting: orEmpty(waiting)}, nil
 }
 
 func rpcOrderRecall(ctx context.Context, d *Daemon, raw json.RawMessage) (any, error) {
@@ -583,7 +609,15 @@ func rpcOrderRecall(ctx context.Context, d *Daemon, raw json.RawMessage) (any, e
 }
 
 func rpcOrderWithdraw(ctx context.Context, d *Daemon, raw json.RawMessage) (any, error) {
-	return rpcOrderAction(ctx, d, raw, d.WithdrawOrder)
+	var a OrderActionArgs
+	if err := decodeArgs(raw, &a); err != nil {
+		return nil, err
+	}
+	v, err := d.withdrawAction(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
 func rpcOrderAction(ctx context.Context, d *Daemon, raw json.RawMessage, act func(ctx context.Context, id, reason string) error) (any, error) {

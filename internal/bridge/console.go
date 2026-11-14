@@ -296,9 +296,18 @@ func (c consoleSource) RecallOrder(ctx context.Context, id string, args json.Raw
 	return c.orderAction(ctx, id, args, c.d.RecallOrder)
 }
 
-// WithdrawOrder is order.withdraw for order id.
+// WithdrawOrder is order.withdraw for order id: args are
+// OrderActionArgs' reason, and the result an OrderWithdrawResult.
 func (c consoleSource) WithdrawOrder(ctx context.Context, id string, args json.RawMessage) (any, error) {
-	return c.orderAction(ctx, id, args, c.d.WithdrawOrder)
+	return c.act(ctx, func(ctx context.Context) (any, error) {
+		var a struct {
+			Reason string `json:"reason,omitempty"`
+		}
+		if err := decodeArgs(args, &a); err != nil {
+			return nil, err
+		}
+		return c.d.withdrawAction(ctx, OrderActionArgs{ID: id, Reason: a.Reason})
+	})
 }
 
 // orderAction runs act as Daemon.orderAction does for order.belay,

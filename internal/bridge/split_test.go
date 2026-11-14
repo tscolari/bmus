@@ -531,7 +531,7 @@ func TestSplitQuestion(t *testing.T) {
 			comms.OrderSplitChild{Title: "UI\nand docs"})))
 	require.Equal(t, "Split ORD-0001 into 3 orders: 1) API [ops, yellow]; 2) UI [ops, yellow, after 1]; 3) docs [ops, yellow, after 1 and 2]",
 		splitQuestion(o, raw(comms.OrderSplitChild{Title: "API"}, comms.OrderSplitChild{Title: "UI", After: []int{0}},
-			comms.OrderSplitChild{Title: "docs", After: []int{0, 1}})))
+			comms.OrderSplitChild{Title: "docs", After: []int{0, 1, 0}})))
 	require.Contains(t, splitQuestion(o, raw(comms.OrderSplitChild{Title: strings.Repeat("é", maxSplitTitle)})),
 		strings.Repeat("é", maxSplitTitle)+" [", "a title checkSplit takes is shown whole")
 	long := strings.Repeat("x", maxSplitQuestionTitle+1)

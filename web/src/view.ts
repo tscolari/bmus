@@ -137,7 +137,7 @@ export function openOrders(state: State): OrderView[] {
  */
 export function openOrderState(o: OrderView): string {
   const base = o.state === "pool" ? "In the pool" : `Queued for ${shortName(o.assignee)}`;
-  return o.waiting_on.length > 0 ? `${base}, waiting on ${o.waiting_on.join(", ")}` : base;
+  return o.waiting_on?.length ? `${base}, waiting on ${o.waiting_on.join(", ")}` : base;
 }
 
 /**

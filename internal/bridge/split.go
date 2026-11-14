@@ -245,7 +245,7 @@ const (
 // with, built by the bridge from the hail's context (#155): "Split
 // ORD-0001 into 2 orders: 1) <title> [<division>, <priority>]; 2) <title>
 // [<division>, <priority>, after 1]; ...", a child's after (#142) naming
-// earlier children by the question's own numbering,
+// earlier children by the question's own numbering, each once,
 // each child's title cut to maxSplitQuestionTitle and its division to
 // maxSplitQuestionDivision, one line each, defaults resolved from o. What
 // the captain approves is what the bridge will create; the agent's own
@@ -268,11 +268,13 @@ func splitQuestion(o store.Order, context json.RawMessage) string {
 		}
 		division := cmp.Or(strings.TrimSpace(ch.Division), o.Division, "no division")
 		after := ""
-		if len(ch.After) > 0 {
-			nums := make([]string, len(ch.After))
-			for k, j := range ch.After {
-				nums[k] = strconv.Itoa(j + 1)
+		var nums []string
+		for _, j := range ch.After {
+			if n := strconv.Itoa(j + 1); !slices.Contains(nums, n) {
+				nums = append(nums, n)
 			}
+		}
+		if len(nums) > 0 {
 			after = ", after " + strings.Join(nums, " and ")
 		}
 		parts = append(parts, fmt.Sprintf("%d) %s [%s, %s%s]", i+1, clip(oneLine(strings.TrimSpace(ch.Title)), maxSplitQuestionTitle),

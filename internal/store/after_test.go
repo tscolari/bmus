@@ -134,13 +134,13 @@ func TestAfterSplitOrder(t *testing.T) {
 	_, _, err := f.s.SettleOrder(ctx, f.children[0], OrderDone, testEntry, nil)
 	require.NoError(t, err)
 	require.Equal(t, OrderDone, f.state(t, f.parent).State)
-	ready, err := f.s.HasReadyDependents(ctx)
+	ready, err := f.s.HasReadyDependents(ctx, f.children[0])
 	require.NoError(t, err)
-	require.True(t, ready)
+	require.True(t, ready, "through the split parent the child's settle made done")
 	got, found := claimPool(t, f.s, "scotty", "eng")
 	require.True(t, found)
 	require.Equal(t, next, got)
-	ready, err = f.s.HasReadyDependents(ctx)
+	ready, err = f.s.HasReadyDependents(ctx, f.children[0])
 	require.NoError(t, err)
 	require.False(t, ready, "claimed")
 }
@@ -286,4 +286,84 @@ func TestInsertChildOrdersAfter(t *testing.T) {
 	deps, err := s.OpenDependents(ctx, ids[0])
 	require.NoError(t, err)
 	require.Equal(t, []string{ids[1], ids[2]}, deps)
+}
+
+// HasReadyDependents looks only at the orders waiting on the order given,
+// once it is done: not at one still waiting on another order, nor at
+// orders waiting on an unrelated order that is ready.
+func TestHasReadyDependents(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := openTest(t)
+	require.NoError(t, s.InsertCrew(ctx, Crew{ID: "sorell", Name: "Sorell", Division: "ops"}, testEntry))
+	a := insertT(t, s, Order{Title: "a", Division: "ops", State: OrderAway, Assignee: "sorell"})
+	b := insertT(t, s, Order{Title: "b", Division: "ops"})
+	both := insertT(t, s, Order{Title: "both", Division: "ops", After: []string{a, b}})
+	done := insertT(t, s, Order{Title: "done", Division: "ops", State: OrderDone})
+	insertT(t, s, Order{Title: "ready elsewhere", Division: "ops", After: []string{done}})
+	ready := func(id string) bool {
+		t.Helper()
+		r, err := s.HasReadyDependents(ctx, id)
+		require.NoError(t, err)
+		return r
+	}
+	require.False(t, ready(a), "a is not done")
+	_, _, err := s.SettleOrder(ctx, a, OrderDone, testEntry, nil)
+	require.NoError(t, err)
+	require.False(t, ready(a), "both still waits on b")
+	require.False(t, ready("ORD-0404"))
+	_, err = s.db.ExecContext(ctx, `UPDATE orders SET state = ? WHERE id = ?`, OrderDone, b)
+	require.NoError(t, err)
+	require.True(t, ready(a))
+	require.True(t, ready(b))
+	require.Equal(t, OrderPool, getT(t, s, both).State)
+}
+
+// A belayed split parent's cascade withdraws a child waiting on a sibling
+// with its own cause, the parent's belay, and an order outside the family
+// waiting on a child with the after's. The withdraw's AfterCascade and
+// WaitingChain name the orders waiting on an order, down the chain.
+func TestAfterCascadeInBelayedFamily(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := openTest(t)
+	require.NoError(t, s.InsertCrew(ctx, Crew{ID: "vance", Name: "Vance", Division: "command"}, testEntry))
+	parent := insertT(t, s, Order{Title: "rfc", Assignee: "vance", State: OrderAway})
+	kids, err := s.InsertChildOrders(ctx, parent, "hail:H-0001", []Order{{Title: "a", Division: "ops"},
+		{Title: "b", Division: "ops", AfterSiblings: []int{0}}}, func([]string) (LogEntry, error) { return testEntry, nil })
+	require.NoError(t, err)
+	outside := insertT(t, s, Order{Title: "outside", Division: "ops", After: []string{kids[1]}})
+	_, _, err = s.SettleOrder(ctx, parent, OrderSplit, testEntry, nil)
+	require.NoError(t, err)
+	commits := hookCommits(t, s)
+
+	cctx, col := WithAfterCascade(ctx)
+	_, cascade, belayed, err := s.BelaySplitOrder(cctx, parent, LogEntry{Kind: "order", OrderID: parent, Text: "order belayed"}, nil)
+	require.NoError(t, err)
+	require.True(t, belayed)
+	require.Equal(t, []ChildBelay{{ID: kids[0], State: OrderPool, Action: CascadeWithdrawn},
+		{ID: kids[1], State: OrderPool, Action: CascadeWithdrawn}}, cascade)
+	require.Equal(t, []string{
+		parent + ": order belayed",
+		kids[0] + ": order withdrawn: its parent " + parent + " was belayed",
+		kids[1] + ": order withdrawn: its parent " + parent + " was belayed",
+		outside + ": order withdrawn: it waits on " + kids[1] + ", which was withdrawn",
+		parent + ": belay cascaded to 2 child orders: " + kids[0] + " withdrawn, " + kids[1] + " withdrawn",
+	}, commits.last())
+	require.Equal(t, []string{outside}, col.IDs())
+
+	first := insertT(t, s, Order{Title: "first", Division: "ops"})
+	second := insertT(t, s, Order{Title: "second", Division: "ops", After: []string{first}})
+	third := insertT(t, s, Order{Title: "third", Division: "ops", After: []string{second, first}})
+	tx, err := s.db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	chain, err := WaitingChain(ctx, tx, first)
+	require.NoError(t, tx.Rollback())
+	require.NoError(t, err)
+	require.Equal(t, []string{second, third}, chain)
+	cctx, col = WithAfterCascade(ctx)
+	_, withdrawn, err := s.WithdrawOrder(cctx, first, testEntry)
+	require.NoError(t, err)
+	require.True(t, withdrawn)
+	require.Equal(t, []string{second, third}, col.IDs())
 }
