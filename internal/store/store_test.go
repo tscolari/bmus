@@ -133,7 +133,8 @@ func TestOpenRejectsBeamsWithoutTour(t *testing.T) {
 
 // A database made before crew.model and orders.model existed (#58) gains
 // both on Open, as it does the later order columns (#100, #141), empty for
-// existing rows, and opening it again leaves them as they are.
+// existing rows, and opening it again leaves them as they are. Its hails
+// table has the shape #151 requires, which Open refuses to upgrade.
 func TestOpenAddsModelColumns(t *testing.T) {
 	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), DBFile)
@@ -151,7 +152,7 @@ func TestOpenAddsModelColumns(t *testing.T) {
 		budget_tokens INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL DEFAULT '');
 		INSERT INTO orders (id, title, state) VALUES ('ORD-0001', 'old', 'done');
 		CREATE TABLE hails (
-		id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(id), crew_id TEXT NOT NULL REFERENCES crew(id),
+		id TEXT PRIMARY KEY, order_id TEXT REFERENCES orders(id), crew_id TEXT REFERENCES crew(id), deliver_to TEXT,
 		category TEXT NOT NULL DEFAULT '', question TEXT NOT NULL, options TEXT NOT NULL DEFAULT '[]',
 		context TEXT NOT NULL DEFAULT '{}', route TEXT NOT NULL DEFAULT 'captain', status TEXT NOT NULL DEFAULT 'open',
 		decided_by TEXT NOT NULL DEFAULT '', decision TEXT NOT NULL DEFAULT '', rationale TEXT NOT NULL DEFAULT '',

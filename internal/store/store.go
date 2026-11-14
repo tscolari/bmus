@@ -187,6 +187,25 @@ func open(ctx context.Context, path string, busyMS int) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Columns ADD COLUMN can't (or shouldn't) add to an older database:
+	// refuse it rather than have every write that needs them fail later.
+	// This runs before the schema, whose indexes may name such a column
+	// (hails_deliver_to), and checks only the tables that exist: the
+	// schema creates the others whole.
+	for _, c := range requiredColumns {
+		var cols, n int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*), COUNT(*) FILTER (WHERE name = ?) FROM pragma_table_info(?)`,
+			c.column, c.table).Scan(&cols, &n); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("apply schema: %w", err)
+		}
+		if cols > 0 && n == 0 {
+			db.Close()
+			return nil, fmt.Errorf("%s predates %s; delete %s and start the bridge again, which makes a fresh database "+
+				"(pre-release databases are disposable, and this one can't be upgraded in place)",
+				filepath.Base(path), c.what, path)
+		}
+	}
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
@@ -195,20 +214,6 @@ func open(ctx context.Context, path string, busyMS int) (*Store, error) {
 		if err := addColumn(ctx, db, c.table, c.column, c.def); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("apply schema: %w", err)
-		}
-	}
-	// Columns ADD COLUMN can't (or shouldn't) add to an older database:
-	// fail here rather than have every write that needs them fail later.
-	for _, c := range requiredColumns {
-		var n int
-		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, c.table, c.column).Scan(&n); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("apply schema: %w", err)
-		}
-		if n == 0 {
-			db.Close()
-			return nil, fmt.Errorf("%s predates %s; delete %s and start again (pre-release databases are disposable)",
-				filepath.Base(path), c.what, path)
 		}
 	}
 	nonce, err := ensureNonce(ctx, db)
@@ -281,6 +286,9 @@ var requiredColumns = []struct{ table, column, what string }{
 	// Part of the checkpoints' keys.
 	{"checkpoints", "beam", "the beam-keyed checkpoints (#100)"},
 	{"checkpoint_repos", "beam", "the beam-keyed checkpoints (#100)"},
+	// SQLite can't drop the NOT NULL on hails.order_id and crew_id in
+	// place. A database with deliver_to has both nullable.
+	{"hails", "deliver_to", "the bridge-raised hails (#151)"},
 }
 
 // addColumn adds column to table unless it is already there. Two processes
@@ -2182,9 +2190,14 @@ func (s *Store) DismissCrew(ctx context.Context, id string, entry LogEntry, fn f
 
 // Hail is a row of the hails table.
 type Hail struct {
-	ID               string
+	ID string
+	// OrderID and CrewID are the order and crew member a hail from a beam
+	// belongs to, both empty on a hail a bridge workflow raised
+	// (InsertBridgeHail), whose DeliverTo is that workflow's id. A hail
+	// from a beam has an empty DeliverTo.
 	OrderID          string
 	CrewID           string
+	DeliverTo        string
 	Category         string
 	Question         string
 	Options          []string
@@ -2240,6 +2253,9 @@ func (h Hail) CountermandedAway() bool {
 // order has at most one open hail. If one already exists for h.OrderID its id
 // is returned and nothing is written, which makes a re-run of the insert
 // (e.g. a replayed DBOS step) a no-op.
+//
+// h.DeliverTo is ignored: a hail from a beam has none. A bridge workflow's
+// hail goes through InsertBridgeHail.
 func (s *Store) InsertHail(ctx context.Context, h Hail, entry LogEntry) (string, error) {
 	if h.Route == "" {
 		h.Route = "captain"
@@ -2294,7 +2310,84 @@ func (s *Store) InsertHail(ctx context.Context, h Hail, entry LogEntry) (string,
 	return id, nil
 }
 
-const hailCols = `id, order_id, crew_id, category, question, options, context, route, status,
+// ErrBridgeHail is returned (wrapped) by InsertBridgeHail for a hail it
+// can't record: no deliver_to or category, or an order or crew member set.
+var ErrBridgeHail = errors.New("invalid bridge hail")
+
+// InsertBridgeHail records an open hail a bridge workflow raises (#151)
+// and returns its generated id. It has no order and no crew member:
+// h.OrderID and h.CrewID must be empty, and h.DeliverTo (the raising
+// workflow's id) and h.Category are required. h.ID and h.Status are
+// ignored; an empty Route defaults to "captain".
+//
+// If a hail with h.DeliverTo and h.Category already exists, open or
+// closed, its id is returned and nothing is written, so a re-run of the
+// raising step raises nothing new. The unique index hails_deliver_to
+// backs this.
+//
+// It appends entry to the captain's log with the hail's id added to its
+// payload as hail_id, in the same transaction. entry.OrderID may name the
+// order the raiser works for; the hail itself names none. The hail's
+// created_at is entry's TS (default now).
+//
+// Unlike InsertHail it changes no crew member's or order's status: no
+// beam waits on the hail, so nothing turns hailing.
+func (s *Store) InsertBridgeHail(ctx context.Context, h Hail, entry LogEntry) (string, error) {
+	switch {
+	case h.DeliverTo == "":
+		return "", fmt.Errorf("%w: deliver_to is required", ErrBridgeHail)
+	case h.Category == "":
+		return "", fmt.Errorf("%w: category is required", ErrBridgeHail)
+	case h.OrderID != "" || h.CrewID != "":
+		return "", fmt.Errorf("%w: it has no order or crew member", ErrBridgeHail)
+	}
+	if h.Route == "" {
+		h.Route = "captain"
+	}
+	if h.Options == nil {
+		h.Options = []string{}
+	}
+	if len(h.Context) == 0 {
+		h.Context = json.RawMessage("{}")
+	}
+	opts, err := json.Marshal(h.Options)
+	if err != nil {
+		return "", err
+	}
+	if entry.TS.IsZero() {
+		entry.TS = time.Now()
+	}
+	var id string
+	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx, `SELECT id FROM hails WHERE deliver_to = ? AND category = ?`,
+			h.DeliverTo, h.Category).Scan(&id)
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if id, err = nextID(ctx, tx, "hails", "H-%04d"); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO hails (id, deliver_to, category, question, options, context, route, status, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			id, h.DeliverTo, h.Category, h.Question, string(opts), string(h.Context), h.Route, HailOpen, entry.TS.UTC())
+		if err != nil {
+			return err
+		}
+		if entry.Payload, err = withField(entry.Payload, "hail_id", id); err != nil {
+			return err
+		}
+		_, err = s.appendLog(ctx, tx, entry)
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// hailCols reads the nullable order_id, crew_id and deliver_to as empty
+// strings (#151).
+const hailCols = `id, COALESCE(order_id, ''), COALESCE(crew_id, ''), COALESCE(deliver_to, ''), category, question, options, context, route, status,
 	decided_by, decision, rationale, confidence, countermand_until, created_at, decided_at, original_decided_by, countermanded_at,
 	countermand_option`
 
@@ -2307,7 +2400,7 @@ func scanHail(row interface{ Scan(...any) error }) (Hail, error) {
 		conf       sql.NullFloat64
 		cmo        sql.NullInt64
 	)
-	err := row.Scan(&h.ID, &h.OrderID, &h.CrewID, &h.Category, &h.Question, &opts, &hctx, &h.Route, &h.Status,
+	err := row.Scan(&h.ID, &h.OrderID, &h.CrewID, &h.DeliverTo, &h.Category, &h.Question, &opts, &hctx, &h.Route, &h.Status,
 		&h.DecidedBy, &h.Decision, &h.Rationale, &conf, &cu, &ca, &da, &h.OriginalDecidedBy, &cma, &cmo)
 	if err != nil {
 		return Hail{}, err
