@@ -35,7 +35,9 @@ type (
 	// mission's latest progress report (#141), omitted without one;
 	// ProgressNote is also omitted when the report has no note.
 	// OpenChildren counts its child orders (ParentID) not yet ended: a
-	// split order waits on them (#155). ParkedAt is set (UTC) while its
+	// split order waits on them (#155). After are the orders it waits on
+	// (#142), WaitingOn those of them not done yet; both always present.
+	// ParkedAt is set (UTC) while its
 	// mission is parked, waiting for a resume (#167).
 	//
 	// BudgetTokens and BudgetTurns are the order's own budget, 0 for none,
@@ -68,6 +70,8 @@ type (
 		ProgressPct    *float64     `json:"progress_pct,omitempty"`
 		ProgressNote   string       `json:"progress_note,omitempty"`
 		OpenChildren   int          `json:"open_children"`
+		After          []string     `json:"after"`
+		WaitingOn      []string     `json:"waiting_on"`
 		ParkedAt       *time.Time   `json:"parked_at,omitempty"`
 	}
 
@@ -143,7 +147,7 @@ func (d *Daemon) orderView(o store.Order) OrderView {
 		Usage:          UsageView{InputTokens: o.Used.InputTokens, OutputTokens: o.Used.OutputTokens, Turns: o.Used.Turns},
 		CreatedBy:      o.CreatedBy, Model: o.Model,
 		Source: o.Source, ProgressPct: o.ProgressPct, ProgressNote: o.ProgressNote, OpenChildren: o.OpenChildren,
-		ParkedAt: utc(o.ParkedAt)}
+		After: orEmpty(o.After), WaitingOn: orEmpty(o.WaitingOn), ParkedAt: utc(o.ParkedAt)}
 }
 
 func hailView(h store.Hail) HailView {
@@ -156,6 +160,14 @@ func hailView(h store.Hail) HailView {
 		Decision: h.Decision, Rationale: h.Rationale, CreatedAt: utc(h.CreatedAt), DecidedAt: utc(h.DecidedAt),
 		OriginalDecidedBy: h.OriginalDecidedBy, Confidence: h.Confidence, CountermandUntil: utc(h.CountermandUntil),
 		CountermandedAt: utc(h.CountermandedAt)}
+}
+
+// orEmpty is ids, or an empty slice for nil: a JSON array either way.
+func orEmpty(ids []string) []string {
+	if ids == nil {
+		return []string{}
+	}
+	return ids
 }
 
 // utc returns t in UTC, or nil for nil.

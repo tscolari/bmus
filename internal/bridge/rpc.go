@@ -139,6 +139,9 @@ type (
 		// Source is where the order comes from, free-form. "tracker:<ref>"
 		// puts the tracker item's text in the body (#54).
 		Source string `json:"source,omitempty"`
+		// After are the orders this one waits on (#142): no crew member
+		// claims it until each has ended done.
+		After []string `json:"after,omitempty"`
 	}
 	// OrderRepo is a repo of an order: a name from the bridge's registry
 	// and the git ref the work starts from. Phase 1 orders name exactly
@@ -527,7 +530,7 @@ func (d *Daemon) createOrder(ctx context.Context, a OrderCreateArgs) (string, er
 	}
 	return d.CreateOrder(ctx, store.Order{Title: a.Title, Body: a.Body, Division: a.Division,
 		Assignee: a.Assignee, Priority: a.Priority, Repos: repos, BudgetTokens: a.BudgetTokens, BudgetTurns: a.BudgetTurns, CreatedBy: "captain", Model: a.Model,
-		Source: a.Source})
+		Source: a.Source, After: a.After})
 }
 
 func rpcOrderList(ctx context.Context, d *Daemon, raw json.RawMessage) (any, error) {

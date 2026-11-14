@@ -159,8 +159,9 @@ func (c consoleSource) LogBefore(ctx context.Context, beforeID int64, limit int)
 func (c consoleSource) LogView(e store.LogEntry) any { return logEntryView(e) }
 
 // Views reads the crew member, order and hail e names: its crew_id, its
-// order_id and its payload's hail_id, and the order's parent, whose open
-// children count a child's change may move (#155).
+// order_id and its payload's hail_id, the order's parent, whose open
+// children count a child's change may move (#155), and the unclaimed
+// orders waiting on it, whose waiting_on its change may move (#142).
 func (c consoleSource) Views(ctx context.Context, e store.LogEntry) ([]console.Event, error) {
 	d := c.d
 	var out []console.Event
@@ -183,6 +184,18 @@ func (c consoleSource) Views(ctx context.Context, e store.LogEntry) ([]console.E
 			p, err := d.store.GetOrder(ctx, o.ParentID)
 			if err == nil {
 				out = append(out, console.Event{Type: "order", Data: d.orderView(p)})
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				return nil, err
+			}
+		}
+		deps, err := d.store.OpenDependents(ctx, e.OrderID)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range deps {
+			w, err := d.store.GetOrder(ctx, id)
+			if err == nil {
+				out = append(out, console.Event{Type: "order", Data: d.orderView(w)})
 			} else if !errors.Is(err, sql.ErrNoRows) {
 				return nil, err
 			}

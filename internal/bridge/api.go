@@ -110,6 +110,10 @@ func (d *Daemon) AddCrew(ctx context.Context, c store.Crew) error {
 // o.Repos must name exactly one repo of the registry (Config.Repos), with
 // a base_ref (checkOrderRepos); anything else is a bad request.
 //
+// o.After are the orders it waits on (#142): no claim takes it until each
+// has ended done. An after naming no order, the order itself, or one that
+// ended failed, belayed or withdrawn is a bad request.
+//
 // o.Source is free-form. One naming a tracker item ("tracker:<ref>", #54)
 // is read from the tracker into the order's title and body once every
 // other check has passed (resolveSource); without a tracker it is a bad
@@ -159,6 +163,9 @@ func (d *Daemon) CreateOrder(ctx context.Context, o store.Order) (string, error)
 		}
 	}
 	id, err := d.store.InsertOrder(ctx, o, entry)
+	if errors.Is(err, store.ErrAfter) {
+		return "", badRequest("%s", strings.TrimSuffix(err.Error(), ": "+store.ErrAfter.Error()))
+	}
 	if err != nil {
 		return "", fmt.Errorf("create order: %w", err)
 	}
@@ -778,6 +785,22 @@ func (d *Daemon) wakeDivision(ctx context.Context, division string) {
 		if err := d.wakeSend(tour, CrewSignal{Kind: SignalOrderAssigned}); err != nil {
 			d.logger.Warn("crew tour not woken for its division's pool", "division", c.Division, "tour", tour, "err", err)
 		}
+	}
+}
+
+// wakeReady wakes every crew member on deck (wakeOnDeck) when an
+// unclaimed order waiting on others (#142) now has each of them done: the
+// order-done step runs it after its settle, which may have finished an
+// order's after, a split parent's included. Its own crew member, still
+// away, claims after its mission. Best effort, as wakeDivision.
+func (d *Daemon) wakeReady(ctx context.Context) {
+	ready, err := d.store.HasReadyDependents(ctx)
+	if err != nil {
+		d.logger.Warn("waiting orders not woken", "err", err)
+		return
+	}
+	if ready {
+		d.wakeOnDeck(ctx, "for an order whose after is done")
 	}
 }
 

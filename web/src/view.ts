@@ -131,6 +131,16 @@ export function openOrders(state: State): OrderView[] {
 }
 
 /**
+ * An open order's line on the open-orders card: "In the pool" or "Queued
+ * for <crew>", then ", waiting on ORD-0001" while orders in its after are
+ * not done (#142).
+ */
+export function openOrderState(o: OrderView): string {
+  const base = o.state === "pool" ? "In the pool" : `Queued for ${shortName(o.assignee)}`;
+  return o.waiting_on.length > 0 ? `${base}, waiting on ${o.waiting_on.join(", ")}` : base;
+}
+
+/**
  * An order's latest progress, from its view (#141): the pct clamped to
  * 0-100 and the note ("" without one). Undefined when the order carries
  * no report.

@@ -130,7 +130,8 @@ func TestRPCCommands(t *testing.T) {
 	o := orders.Orders[0]
 	require.Equal(t, OrderView{ID: "ORD-0001", Title: "survey", Body: "look around", Division: "science", State: o.State,
 		Priority: store.PriorityYellow, Assignee: "sorell", Repos: []OrderRepo{{Name: "app", BaseRef: "main"}}, BudgetTokens: 1000,
-		BudgetTurns: 40, LimitTokens: 1000, LimitTurns: 40, BudgetSource: BudgetSource{Tokens: SourceOrder, Turns: SourceOrder}, CreatedBy: "captain", Model: "model-x"}, o)
+		BudgetTurns: 40, LimitTokens: 1000, LimitTurns: 40, BudgetSource: BudgetSource{Tokens: SourceOrder, Turns: SourceOrder}, CreatedBy: "captain", Model: "model-x",
+		After: []string{}, WaitingOn: []string{}}, o)
 	// The tour claims it and starts its mission.
 	requirePending(t, r.d, missionWorkflowID(created.ID))
 
@@ -511,4 +512,50 @@ func requireRPCErrorOrNil(err error) *RPCError {
 		return re
 	}
 	return nil
+}
+
+// order.create's after (#142): an after naming no order, the order itself
+// or an order that will never be done is a bad request. The view carries
+// after and waiting_on, and the console's Views of an entry on the after
+// carry the order waiting on it. Withdrawing the after withdraws it.
+func TestOrderCreateAfter(t *testing.T) {
+	t.Parallel()
+	home := privateHome(t)
+	r := startDaemon(t, home)
+	defer r.stop(t)
+	ctx := t.Context()
+	repos := []OrderRepo{{Name: "app", BaseRef: "main"}}
+	var first, second OrderCreateResult
+	require.NoError(t, call(t, home, "order.create", OrderCreateArgs{Title: "first", Division: "ops", Repos: repos}, &first))
+	for after, msg := range map[string]string{
+		"ORD-0404": "after ORD-0404: no such order",
+		"ORD-0002": "after ORD-0002: an order can't wait on itself",
+	} {
+		re := requireRPCError(t, call(t, home, "order.create", OrderCreateArgs{Title: "t", Division: "ops", Repos: repos,
+			After: []string{first.ID, after}}, nil), CodeBadRequest)
+		require.Equal(t, msg, re.Message)
+	}
+	require.NoError(t, call(t, home, "order.create", OrderCreateArgs{Title: "second", Division: "ops", Repos: repos,
+		After: []string{first.ID}}, &second))
+	require.Equal(t, "ORD-0002", second.ID)
+	var orders OrderListResult
+	require.NoError(t, call(t, home, "order.list", nil, &orders))
+	require.Equal(t, []string{}, orders.Orders[0].After)
+	require.Equal(t, [2][]string{{first.ID}, {first.ID}}, [2][]string{orders.Orders[1].After, orders.Orders[1].WaitingOn})
+
+	evs, err := consoleSource{d: r.d}.Views(ctx, store.LogEntry{OrderID: first.ID})
+	require.NoError(t, err)
+	var ids []string
+	for _, ev := range evs {
+		ids = append(ids, ev.Data.(OrderView).ID)
+	}
+	require.Equal(t, []string{first.ID, second.ID}, ids)
+
+	require.NoError(t, r.d.WithdrawOrder(ctx, first.ID, ""))
+	o, err := r.d.store.GetOrder(ctx, second.ID)
+	require.NoError(t, err)
+	require.Equal(t, store.OrderWithdrawn, o.State)
+	re := requireRPCError(t, call(t, home, "order.create", OrderCreateArgs{Title: "t", Division: "ops", Repos: repos,
+		After: []string{first.ID}}, nil), CodeBadRequest)
+	require.Equal(t, "after ORD-0001: it ended withdrawn and will never be done", re.Message)
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -30,6 +31,7 @@ type orderFile struct {
 	Body         string          `yaml:"body"`
 	Model        string          `yaml:"model"`
 	Source       string          `yaml:"source"`
+	After        []string        `yaml:"after"`
 }
 
 // orderFileRepo is an entry of an order file's repos: a repo registered on
@@ -96,21 +98,24 @@ func parseOrder(data []byte) (bridge.OrderCreateArgs, error) {
 	}
 	return bridge.OrderCreateArgs{Title: o.Title, Body: o.Body, Division: o.Division, Assignee: o.Assignee,
 		Priority: priority, Repos: repos, BudgetTokens: o.BudgetTokens, BudgetTurns: o.BudgetTurns, Model: o.Model,
-		Source: o.Source}, nil
+		Source: o.Source, After: o.After}, nil
 }
 
 func newOrderCmd(a *app) *cobra.Command {
 	cmd := &cobra.Command{Use: "order", Short: "Manage orders"}
 
-	var createJSON bool
+	var (
+		createJSON bool
+		after      []string
+	)
 	create := &cobra.Command{
 		Use:   "create <order.yaml>",
 		Short: "Create an order from a YAML file and print its id",
 		Long: `Create an order from a YAML file and print its id.
 
 The file's fields: title (required), assignee (a crew id), division, repos
-(required), priority, budget_tokens, budget_turns, body, model and source.
-Unknown fields are an error. model is the model the order runs on,
+(required), priority, budget_tokens, budget_turns, body, model, source and
+after. Unknown fields are an error. model is the model the order runs on,
 overriding the assignee's (` + "`crew add --model`" + `); the harness checks it
 when the order starts. budget_tokens and budget_turns cap what the order
 may spend; 0 or missing takes its division's budget from the roster, and
@@ -136,7 +141,14 @@ orders take exactly one:
 
   repos:
     - name: app
-      base_ref: main`,
+      base_ref: main
+
+after lists orders this one waits on, by id: no crew member claims it until
+each has ended done. --after adds one (repeatable). The bridge refuses an
+after naming no order, or one that already ended failed, belayed or
+withdrawn. If one ends that way later, the bridge withdraws this order too,
+unless a crew member has claimed it. ` + "`bmus order list`" + ` shows a waiting order
+as "waiting on ORD-0001".`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, pos []string) error {
 			data, err := os.ReadFile(pos[0])
@@ -146,6 +158,11 @@ orders take exactly one:
 			args, err := parseOrder(data)
 			if err != nil {
 				return fmt.Errorf("%s: %w", pos[0], err)
+			}
+			for _, id := range after {
+				if !slices.Contains(args.After, id) {
+					args.After = append(args.After, id)
+				}
 			}
 			var res bridge.OrderCreateResult
 			if err := a.call(cmd.Context(), "order.create", args, &res); err != nil {
@@ -159,12 +176,16 @@ orders take exactly one:
 		},
 	}
 	create.Flags().BoolVar(&createJSON, "json", false, "print JSON")
+	create.Flags().StringArrayVar(&after, "after", nil, "an order this one waits on until it is done (repeatable)")
 
 	var listJSON bool
 	list := &cobra.Command{
 		Use:   "list",
 		Short: "List orders",
 		Long: `List orders.
+
+PROGRESS is the order's latest progress report, or "waiting on ORD-0001"
+for an unclaimed order whose after has orders not yet done.
 
 USAGE is what the order's beams spent against its current budget: tokens
 (input and output) and turns, "420k/1M 42/150t", each part shown only when
@@ -184,7 +205,7 @@ budget_tokens and budget_turns the order's own budget.`,
 			w := newTable(cmd.OutOrStdout())
 			fmt.Fprintln(w, "ID\tSTATE\tPROGRESS\tUSAGE\tASSIGNEE\tDIVISION\tTITLE")
 			for _, o := range res.Orders {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", o.ID, stateCell(o), progressCell(o.ProgressPct), usageCell(o),
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", o.ID, stateCell(o), progressCell(o), usageCell(o),
 					dash(o.Assignee), dash(o.Division), o.Title)
 			}
 			return w.Flush()
@@ -406,10 +427,20 @@ func belayLine(res bridge.OrderBelayResult) string {
 	return line
 }
 
-// progressCell shows an order's progress as a table cell: "40%", or "-"
+// progressCell is an order's PROGRESS cell: "waiting on ORD-0001" for an
+// unclaimed order whose after has orders not done yet (#142), else its
+// progress, pctCell.
+func progressCell(o bridge.OrderView) string {
+	if (o.State == store.OrderPool || o.State == store.OrderDirected) && len(o.WaitingOn) > 0 {
+		return "waiting on " + strings.Join(o.WaitingOn, ", ")
+	}
+	return pctCell(o.ProgressPct)
+}
+
+// pctCell shows an order's progress as a table cell: "40%", or "-"
 // without a report (#141). The pct is clamped to 0-100, as the console
 // does, and floored: 99.6 isn't done.
-func progressCell(pct *float64) string {
+func pctCell(pct *float64) string {
 	if pct == nil {
 		return "-"
 	}
