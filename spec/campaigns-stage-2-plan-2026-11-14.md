@@ -4,7 +4,7 @@
 
 Stage 2 of `spec/campaigns-plan-2026-11-03.md` (section 6) lets any crew member file findings as it works. When the order's mission ends, the bridge files them as tracker issues labelled `bmus:unreviewed` and raises one `tracker_review` hail in which the captain keeps or discards them. It builds sections 4.6 and 4.7 of that plan and the first row of its section 5 table. Its exit test is Verification item 5.
 
-Stage 1 (epic #141, tasks #142 and #143) and most of Phase 4 (epic #109) are open. Nothing here waits on either. Section 9 lists where they meet. This plan files no tickets.
+Stage 1 (epic #141) has landed. Most of Phase 4 (epic #109) is open, and nothing here waits on it. Section 9 lists where they meet. The tickets are under epic #150.
 
 What the code has today:
 
@@ -176,7 +176,6 @@ The default `regs.yaml` drops `tracker_create` from `captain_only`. The rules af
 
 ### 9. Stage 1 and Phase 4
 
-- **#142 and #143** don't depend on this stage, nor it on them. All three edit `schema.sql`, `store.Open` and the order views. `order_after` arrives through `CREATE TABLE IF NOT EXISTS`. Whichever lands second rebases.
 - **#125 (egress hails)** adds `checkEgressRequest` to classify and appends `- category: egress` after `tracker_comment`. If it lands first, its rule becomes `captain_only[7]` here, and its tests move with it. Egress hails always have an order.
 - **#128 (security review)** takes in both categories, the review card's rendering of agent text, and the triage answer's exposure to option rules.
 - **#112 and #113 (backups and restore)**: a backup taken before this stage won't open after it, which is fine while nobody keeps a database.
