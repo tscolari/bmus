@@ -1185,7 +1185,7 @@ const reorderOrdersInput = {
             .string()
             .trim()
             .min(1)
-            .max(MAX_REORDER_ONTO)
+            .refine((s) => Buffer.byteLength(s) <= MAX_REORDER_ONTO, `onto is at most ${MAX_REORDER_ONTO} bytes of UTF-8`)
             .regex(ONE_LINE, "onto is one line")
             .refine((s) => !s.startsWith("-"), "onto must not start with '-'")
             .refine((s) => !s.startsWith("order:") || ORDER_ID.test(s.slice("order:".length)), "order: takes an order's id, such as order:ORD-0001")

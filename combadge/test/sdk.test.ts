@@ -522,6 +522,8 @@ describe("sdk harness", () => {
         { changes: [{ order: "ORD-0003", onto: "-x" }], reason: "r" },
         { changes: [{ order: "ORD-0003", onto: "order:first" }], reason: "r" },
         { changes: [{ order: "ORD-0003", onto: "a\nb" }], reason: "r" },
+        // 100 three-byte characters: 300 bytes, over the bridge's 256.
+        { changes: [{ order: "ORD-0003", onto: "\u6f22".repeat(100) }], reason: "r" },
         { changes: [{ order: "ORD-0003", after_add: ["main"] }], reason: "r" },
         { changes: [{ order: "ORD-0003", after_add: ["ORD-0001"], after_remove: ["ORD-0001"] }], reason: "r" },
         { changes: [{ order: "ORD-0003", onto: "main" }, { order: "ORD-0003", after_add: ["ORD-0001"] }], reason: "r" },

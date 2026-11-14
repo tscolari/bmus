@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -203,12 +204,8 @@ func checkReorder(h store.Hail, c store.Crew) (comms.OrderReorderContext, string
 	case n > maxReorderChanges:
 		return rc, fmt.Sprintf("it has %d changes, more than %d", n, maxReorderChanges)
 	}
-	reason := strings.TrimSpace(rc.Reason)
-	switch {
-	case reason == "":
-		return rc, "it gives no reason"
-	case !utf8.ValidString(reason) || utf8.RuneCountInString(reason) > maxReorderReason:
-		return rc, fmt.Sprintf("its reason is longer than %d characters", maxReorderReason)
+	if why := reorderReasonWhy(rc.Reason); why != "" {
+		return rc, why
 	}
 	var seen []string
 	for i, ch := range rc.Changes {
@@ -262,6 +259,23 @@ func checkReorder(h store.Hail, c store.Crew) (comms.OrderReorderContext, string
 	return rc, ""
 }
 
+// reorderReasonWhy says what is wrong with an order_reorder hail's
+// reason: blank, not valid UTF-8, or longer than maxReorderReason runes
+// once trimmed. encoding/json decodes invalid UTF-8 as U+FFFD, so the
+// second can't come from a context; it guards any other caller.
+func reorderReasonWhy(reason string) string {
+	reason = strings.TrimSpace(reason)
+	switch {
+	case reason == "":
+		return "it gives no reason"
+	case !utf8.ValidString(reason):
+		return "its reason is not valid UTF-8"
+	case utf8.RuneCountInString(reason) > maxReorderReason:
+		return fmt.Sprintf("its reason is longer than %d characters", maxReorderReason)
+	}
+	return ""
+}
+
 // orderChange is reorder change ch as the store's OrderChange.
 func orderChange(ch comms.OrderReorderChange) store.OrderChange {
 	oc := store.OrderChange{AfterAdd: ch.AfterAdd, AfterRemove: ch.AfterRemove}
@@ -299,11 +313,14 @@ const (
 
 // reorderQuestion is the question an order_reorder hail is stored with,
 // built by the bridge from its context and the store (#148), never the
-// agent's: "Reorder 2 orders (reason: <reason>): 1) ORD-0003 "<title>"
-// (pool): base main -> order:ORD-0005; after ORD-0001 -> ORD-0005; 2)
-// ...". Each change shows the order's current base and after and the ones
-// it would have (store.OrderChange.Apply), or why it can't apply as read
-// now: no such order, or Apply's refusal. A context that doesn't decode,
+// agent's: "Reorder 2 orders: 1) ORD-0003 "<title>" (pool): base main
+// -> order:ORD-0005; after ORD-0001 -> ORD-0005; 2) .... Command's
+// reason: "<reason>"". Each change shows the order's current base and
+// after and the ones it would have (store.OrderChange.Apply), or why it
+// can't apply as read now: no such order, or Apply's refusal. A line for
+// an order a crew member has started ends "(will be skipped: <why>)"
+// (store.StartedWhy). The reason comes last and quoted, so the agent's
+// text can't pass for part of the change list. A context that doesn't decode,
 // or has no changes, reads as malformed (classify denies it).
 func (d *Daemon) reorderQuestion(ctx context.Context, context json.RawMessage) string {
 	var rc comms.OrderReorderContext
@@ -323,8 +340,8 @@ func (d *Daemon) reorderQuestion(ctx context.Context, context json.RawMessage) s
 	if len(rc.Changes) == 1 {
 		noun = "order"
 	}
-	return fmt.Sprintf("Reorder %d %s (reason: %s): %s", len(rc.Changes), noun,
-		clip(oneLine(strings.TrimSpace(rc.Reason)), maxReorderQuestionReason), strings.Join(parts, "; "))
+	return fmt.Sprintf("Reorder %d %s: %s. Command's reason: %q", len(rc.Changes), noun, strings.Join(parts, "; "),
+		clip(oneLine(strings.TrimSpace(rc.Reason)), maxReorderQuestionReason))
 }
 
 // reorderLine is one change's part of reorderQuestion, for order id.
@@ -334,10 +351,16 @@ func (d *Daemon) reorderLine(ctx context.Context, id string, ch comms.OrderReord
 		return id + ": no such order"
 	}
 	head := fmt.Sprintf("%s %q (%s)", o.ID, clip(oneLine(o.Title), maxReorderQuestionTitle), o.State)
+	skip := ""
+	if why, err := d.store.StartedWhy(ctx, o); err != nil {
+		skip = " (could not read whether it started: " + err.Error() + ")"
+	} else if why != "" {
+		skip = " (will be skipped: " + why + ")"
+	}
 	oc := orderChange(ch)
 	repos, after, err := oc.Apply(o)
 	if err != nil {
-		return head + ": " + strings.TrimSuffix(err.Error(), ": "+store.ErrReorder.Error())
+		return head + ": " + strings.TrimSuffix(err.Error(), ": "+store.ErrReorder.Error()) + skip
 	}
 	var parts []string
 	for i, r := range repos {
@@ -351,7 +374,7 @@ func (d *Daemon) reorderLine(ctx context.Context, id string, ch comms.OrderReord
 		}
 	}
 	parts = append(parts, fmt.Sprintf("after %s -> %s", afterText(o.After), clip(oneLine(afterText(after)), 40*maxReorderIDs)))
-	return head + ": " + strings.Join(parts, "; ")
+	return head + ": " + strings.Join(parts, "; ") + skip
 }
 
 // reorderOutcome is the apply-reorder step's recorded result: the
@@ -363,8 +386,11 @@ type reorderOutcome struct {
 
 // applyReorder is the apply-reorder step (#148), run by the mission for
 // an order_reorder hail answered with option 0 before it relays the
-// answer. A hail no longer decided, a countermand (#153) to anything but
-// option 0, or a context checkReorder now refuses refuses it whole. Else
+// answer, once reorder-window has waited out the hail's countermand
+// window (awaitCountermandWindow). A hail no longer decided, a window
+// still open (longer than the tour's settle wait), a countermand (#153)
+// to anything but option 0, or a context checkReorder now refuses
+// refuses it whole. Else
 // each change goes through reorderOrder in turn, as the captain's own
 // would, rechecked in its own transaction: a change that no longer
 // applies (its order claimed meanwhile, say) is skipped and named. A
@@ -378,7 +404,10 @@ type reorderOutcome struct {
 // applied, the outcome is Refused and the answer takes option deny; a
 // refusal of the whole hail is noted the same way (reorderRefusedMark).
 func applyReorder(ctx context.Context, d *Daemon, in MissionInput, hailID string) (reorderOutcome, error) {
-	h, err := d.store.GetHail(ctx, hailID)
+	// Read under the store's write lock, as trackerRequestCall does: a
+	// countermand in flight lands first, and one started later is too
+	// late.
+	h, now, err := d.store.GetHailLocked(ctx, hailID)
 	if err != nil {
 		return reorderOutcome{}, fmt.Errorf("hail %s: %w", hailID, err)
 	}
@@ -393,6 +422,8 @@ func applyReorder(ctx context.Context, d *Daemon, in MissionInput, hailID string
 	switch {
 	case h.Status != store.HailDecided:
 		why = "hail " + h.ID + " is " + h.Status
+	case h.CountermandUntil != nil && now.Before(*h.CountermandUntil):
+		why = "its countermand window is still open, until " + h.CountermandUntil.UTC().Format(time.RFC3339)
 	case h.CountermandedAway():
 		why = fmt.Sprintf("the captain countermanded it: %s", h.Decision)
 	default:

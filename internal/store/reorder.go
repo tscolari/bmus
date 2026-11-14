@@ -78,7 +78,7 @@ func (ch OrderChange) Apply(o Order) (repos []OrderRepo, after []string, err err
 			return refuse("after %s: it is both added and removed", id)
 		}
 		if slices.Contains(newBases, id) {
-			return refuse("after %s: order %s is based on order:%s, which waits on it; rebase the order to drop the wait", id, o.ID, id)
+			return refuse("after %s: order %s is based on order:%s, so it waits on it; rebase %s to drop the wait", id, o.ID, id, o.ID)
 		}
 		i := slices.Index(after, id)
 		if i < 0 {
@@ -94,11 +94,22 @@ func (ch OrderChange) Apply(o Order) (repos []OrderRepo, after []string, err err
 	return repos, after, nil
 }
 
-// startedWhy says why order o, read in tx, can't be reordered (#148): it
-// ended, it was split, a crew member claimed it, or it was recalled and
+// queryRower is a *sql.DB or a *sql.Tx.
+type queryRower interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// StartedWhy is startedWhy outside a transaction, read-only: for a
+// question shown before the change runs (#148).
+func (s *Store) StartedWhy(ctx context.Context, o Order) (string, error) {
+	return startedWhy(ctx, s.db, o)
+}
+
+// startedWhy says why order o, read through q, can't be reordered (#148):
+// it ended, it was split, a crew member claimed it, or it was recalled and
 // keeps a parked mission or a checkpoint, whose work is built on its
 // current base. "" for an order no crew member has started.
-func startedWhy(ctx context.Context, tx *sql.Tx, o Order) (string, error) {
+func startedWhy(ctx context.Context, q queryRower, o Order) (string, error) {
 	switch {
 	case slices.Contains(endedStates, o.State):
 		return fmt.Sprintf("order %s ended %s", o.ID, o.State), nil
@@ -110,7 +121,7 @@ func startedWhy(ctx context.Context, tx *sql.Tx, o Order) (string, error) {
 		return fmt.Sprintf("order %s was recalled and keeps its parked mission, whose work is built on its current base", o.ID), nil
 	}
 	var n int
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM checkpoints WHERE order_id = ?)`, o.ID).Scan(&n); err != nil {
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM checkpoints WHERE order_id = ?)`, o.ID).Scan(&n); err != nil {
 		return "", err
 	}
 	if n == 1 {
@@ -140,7 +151,8 @@ func waitsOn(ctx context.Context, tx *sql.Tx, from, id string) (bool, error) {
 // parked mission and no checkpoint. ch is applied as OrderChange.Apply
 // says, and each order it adds to after is checked as InsertOrder checks
 // an after (it exists, isn't the order itself, didn't end failed, belayed
-// or withdrawn), as is each new base: it must not have been split. An
+// or withdrawn), as is each new base, already in after or not: it must
+// not have ended that way nor have been split. An
 // added order that waits on this one, directly or down its chain (a split
 // order waiting on its children included), would make a cycle. Each
 // refusal is ErrReorder or ErrAfter, wrapped, and writes nothing. A
@@ -180,7 +192,15 @@ func (s *Store) ReorderOrder(ctx context.Context, id string, ch OrderChange, ent
 			return nil
 		}
 		oldBases := baseOrders(before.Repos)
-		for _, a := range added {
+		// Every order checked here: the added afters, and each new base,
+		// whether or not after named it already.
+		checked := slices.Clone(added)
+		for _, b := range baseOrders(repos) {
+			if !slices.Contains(oldBases, b) && !slices.Contains(checked, b) {
+				checked = append(checked, b)
+			}
+		}
+		for _, a := range checked {
 			if a == id {
 				return fmt.Errorf("after %s: an order can't wait on itself: %w", a, ErrAfter)
 			}
@@ -204,6 +224,8 @@ func (s *Store) ReorderOrder(ctx context.Context, id string, ch OrderChange, ent
 					return fmt.Errorf("base order:%s: %s: %w", a, SplitBaseText(a, children), ErrReorder)
 				}
 			}
+		}
+		for _, a := range added {
 			cycle, err := waitsOn(ctx, tx, a, id)
 			if err != nil {
 				return err

@@ -286,7 +286,7 @@ func TestOrderRebaseCLI(t *testing.T) {
 	require.Equal(t, "order ORD-0002 after ORD-0001, ORD-0003, none done yet\n",
 		e.run(t, "order", "after", "ORD-0002", "--add", "ORD-0001"))
 	require.Contains(t, e.fail(t, "order", "after", "ORD-0002", "--remove", "ORD-0003"),
-		"after ORD-0003: order ORD-0002 is based on order:ORD-0003, which waits on it; rebase the order to drop the wait")
+		"after ORD-0003: order ORD-0002 is based on order:ORD-0003, so it waits on it; rebase ORD-0002 to drop the wait")
 	require.Contains(t, e.fail(t, "order", "after", "ORD-0001", "--add", "ORD-0002"),
 		"after ORD-0002: ORD-0002 waits on ORD-0001, directly or down its chain, so the wait would be a cycle")
 	require.Contains(t, e.fail(t, "order", "rebase", "ORD-0002"), "--onto is required")

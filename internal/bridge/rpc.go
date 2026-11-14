@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -745,11 +746,22 @@ func (d *Daemon) orderAfter(ctx context.Context, a OrderAfterArgs) (OrderView, e
 	if len(a.Add) == 0 && len(a.Remove) == 0 {
 		return OrderView{}, badRequest("nothing to change: give orders to add or remove")
 	}
-	o, err := d.reorderOrder(ctx, a.ID, store.OrderChange{AfterAdd: a.Add, AfterRemove: a.Remove}, reorderSource{})
+	o, err := d.reorderOrder(ctx, a.ID, store.OrderChange{AfterAdd: uniq(a.Add), AfterRemove: uniq(a.Remove)}, reorderSource{})
 	if err != nil {
 		return OrderView{}, err
 	}
 	return d.orderView(o), nil
+}
+
+// uniq is ids with repeats dropped, in first-seen order.
+func uniq(ids []string) []string {
+	var out []string
+	for _, id := range ids {
+		if !slices.Contains(out, id) {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func rpcOrderBudget(ctx context.Context, d *Daemon, raw json.RawMessage) (any, error) {

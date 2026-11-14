@@ -278,7 +278,8 @@ func syntheticMessage(typ string, body any, crewID, orderID string) (comms.Messa
 //     create-children in between (createChildren, #155), whose result
 //     becomes the answer's decision: the children's ids, or why none were
 //     created (option deny). An order_reorder hail answered with option
-//     0 runs apply-reorder there (applyReorder, #148): the decision says
+//     0 runs reorder-window, then apply-reorder there (applyReorder,
+//     #148): the decision says
 //     what applied and what was skipped (option deny when nothing
 //     applied). A tracker request answered with option 0
 //     runs tracker-window, tracker-request and tracker-record there
@@ -737,6 +738,11 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 			// out, so the answer can say what applied and what was
 			// skipped (#148). Once per hail, as create-children.
 			if hail.Category == comms.CategoryOrderReorder && body.Option != nil && *body.Option == 0 {
+				// A decision the captain may still countermand (a captain
+				// timeout's default_option) waits out its window first.
+				if err := awaitCountermandWindow(ctx, body.HailID, "reorder-window"); err != nil {
+					return MissionResult{}, cur.CrewID, err
+				}
 				out, err := dbos.RunAsStep(ctx, func(c context.Context) (reorderOutcome, error) {
 					return applyReorder(c, daemonFrom(c), cur, body.HailID)
 				}, append([]dbos.StepOption{dbos.WithStepName("apply-reorder")}, storeRetries...)...)

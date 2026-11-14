@@ -357,7 +357,7 @@ assignee or a division.`,
 	)
 	rebase := &cobra.Command{
 		Use:   "rebase <id> --onto <base>",
-		Short: "Start an order nobody has started from another base",
+		Short: "Change the base of an order nobody has started",
 		Long: `Set the base_ref of an order no crew member has started: in the pool or
 directed, never claimed, with no parked mission and no checkpoint. --onto is
 order:ORD-0005, to start from that order's work once it is done, or a ref of
@@ -366,10 +366,10 @@ with more than one.
 
 An order:<id> base is checked as at create, and replaces the order: entry the
 old base put in the order's after; a plain ref drops it. Its other after
-entries stay. The bridge refuses an order a crew member has started, since its
-work is built on the old base, an order that ended or was split, and a base
-that would make the order wait on itself or on one of its own dependents.
-To start a started order over from a new base, belay it and create a new one.`,
+entries stay. The bridge refuses an order a crew member has started, an order
+that ended or was split, and a base that would make the order wait on itself
+or on one of its own dependents. A started order's work is built on its old
+base. To start one over from a new base, belay it and create a new one.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, pos []string) error {
 			if rebaseOnto == "" {

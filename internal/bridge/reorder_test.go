@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/tscolari/bmus/internal/comms"
+	"github.com/tscolari/bmus/internal/regs"
 	"github.com/tscolari/bmus/internal/store"
 )
 
@@ -78,7 +79,7 @@ func TestOrderRebaseAndAfter(t *testing.T) {
 	require.Empty(t, v.After, "a plain ref drops the base's wait")
 	require.Equal(t, "order rebased onto main (was order:ORD-0003)", lastOrderEntry(t, st, b).Text)
 
-	v, err = after(b, []string{a, c}, nil)
+	v, err = after(b, []string{a, c, a}, nil)
 	require.NoError(t, err)
 	require.Equal(t, []string{a, c}, v.After)
 	require.Equal(t, "order after: ORD-0001, ORD-0003 (was none)", lastOrderEntry(t, st, b).Text)
@@ -102,7 +103,7 @@ func TestOrderRebaseAndAfter(t *testing.T) {
 
 	_, err = after(b, nil, []string{c})
 	re := requireRPCError(t, err, CodeBadRequest)
-	require.Equal(t, "after ORD-0003: order ORD-0002 is based on order:ORD-0003, which waits on it; rebase the order to drop the wait", re.Message)
+	require.Equal(t, "after ORD-0003: order ORD-0002 is based on order:ORD-0003, so it waits on it; rebase ORD-0002 to drop the wait", re.Message)
 	_, err = after(b, nil, []string{a})
 	re = requireRPCError(t, err, CodeBadRequest)
 	require.Equal(t, "after ORD-0001: order ORD-0002 doesn't wait on it", re.Message)
@@ -404,6 +405,8 @@ func TestCheckReorder(t *testing.T) {
 		_, why := checkReorder(tc.h, tc.crew)
 		require.Equal(t, tc.why, why, tc.name)
 	}
+	require.Equal(t, "its reason is not valid UTF-8", reorderReasonWhy("r\xff"))
+	require.Empty(t, reorderReasonWhy(" r "))
 }
 
 // The bridge's reorder question shows each order's current base and
@@ -416,14 +419,14 @@ func TestReorderQuestion(t *testing.T) {
 		require.NoError(t, err)
 		return d.reorderQuestion(t.Context(), raw)
 	}
-	require.Equal(t, `Reorder 3 orders (reason: the API moved): `+
+	require.Equal(t, `Reorder 3 orders: `+
 		`1) ORD-0002 "api" (pool): base main -> order:ORD-0003; after none -> ORD-0003; `+
-		`2) ORD-0004 "docs" (away): after none -> ORD-0002; `+
-		`3) ORD-0404: no such order`,
+		`2) ORD-0004 "docs" (away): after none -> ORD-0002 (will be skipped: order ORD-0004 is away: a crew member has started it on its current base); `+
+		`3) ORD-0404: no such order. Command's reason: "the API moved"`,
 		q(comms.OrderReorderChange{Order: "ORD-0002", Onto: "order:ORD-0003"},
 			comms.OrderReorderChange{Order: "ORD-0004", AfterAdd: []string{"ORD-0002"}},
 			comms.OrderReorderChange{Order: "ORD-0404", Onto: "main"}))
-	require.Equal(t, `Reorder 1 order (reason: the API moved): 1) ORD-0002 "api" (pool): after ORD-0001: order ORD-0002 doesn't wait on it`,
+	require.Equal(t, `Reorder 1 order: 1) ORD-0002 "api" (pool): after ORD-0001: order ORD-0002 doesn't wait on it. Command's reason: "the API moved"`,
 		q(comms.OrderReorderChange{Order: "ORD-0002", AfterRemove: []string{"ORD-0001"}}))
 	require.Equal(t, "Reorder orders: the request is malformed, and the bridge denies it", d.reorderQuestion(t.Context(), json.RawMessage(`[]`)))
 }
@@ -528,8 +531,8 @@ func TestReorderOrdersHail(t *testing.T) {
 
 	e := hd.waitLog(t, "hail H-0001 for the captain")
 	require.Equal(t, `hail H-0001 for the captain: captain_only[8]: category "order_reorder"`, e.Text)
-	q := `Reorder 2 orders (reason: the API moved): 1) ORD-0002 "pool run" (pool): base main -> order:ORD-0003; after none -> ORD-0003; ` +
-		`2) ORD-0001 "pool run" (pool): after none -> ORD-0003`
+	q := `Reorder 2 orders: 1) ORD-0002 "pool run" (pool): base main -> order:ORD-0003; after none -> ORD-0003; ` +
+		`2) ORD-0001 "pool run" (pool): after none -> ORD-0003. Command's reason: "the API moved"`
 	require.Equal(t, q, hd.hail(t, "H-0001").Question, "the captain reads the bridge's question")
 
 	// sorell claims the order the second change names: its own reorder
@@ -584,4 +587,45 @@ func TestReorderOrdersHail(t *testing.T) {
 	require.GreaterOrEqual(t, i, 0, "%v", steps)
 	require.Equal(t, "applied ORD-0002; skipped "+skip, steps[i]["decision"], "the answer names what applied and what was skipped")
 	require.Equal(t, 1, strings.Count(strings.Join(stepNames(t, hd.d, missionWorkflowID(parent)), ","), "apply-reorder"))
+}
+
+// A reorder allowed by a captain timeout's default_option (order_reorder
+// dropped from captain_only) waits out its countermand window before
+// apply-reorder. Countermanded to deny inside the window, it applies
+// nothing.
+func TestReorderCountermandWindow(t *testing.T) {
+	t.Parallel()
+	b := newHolodeckBridge(t, hailsScript(t, reorderHailBody(comms.OrderReorderChange{Order: "ORD-0001", Onto: "order:ORD-0002"})))
+	cfg := defaultRegs(t)
+	n := len(cfg.CaptainOnly)
+	cfg.CaptainOnly = slices.DeleteFunc(cfg.CaptainOnly, func(r regs.MatchRule) bool { return r.Category == comms.CategoryOrderReorder })
+	require.Len(t, cfg.CaptainOnly, n-1)
+	opt, window := 0, 8*time.Second
+	cfg.Escalation.OnTimeout, cfg.Escalation.CaptainTimeout, cfg.Escalation.DefaultOption = regs.OnTimeoutDefaultOption, time.Second, &opt
+	cfg.CommandMayAnswer.CountermandWindow = &window
+	b.regs = cfg
+	hd := b.start(t)
+	hd.addCommand(t)
+	moved := hd.createPoolOrder(t, "eng", store.PriorityRoutine)
+	onto := hd.createPoolOrder(t, "eng", store.PriorityRoutine)
+	parent := hd.createCommandOrder(t)
+
+	require.Equal(t, HailResult{Decided: true, By: comms.DecidedByPolicy}, hailResult(t, hd.d, "H-0001"))
+	require.NotNil(t, hd.hail(t, "H-0001").CountermandUntil)
+	_, err := hd.d.CountermandHail(t.Context(), "H-0001", "", ptr(1), "not now")
+	require.NoError(t, err)
+
+	require.Equal(t, MissionDone, missionResult(t, hd.d, parent).Status)
+	names := strings.Join(stepNames(t, hd.d, missionWorkflowID(parent)), ",")
+	require.Contains(t, names, "reorder-window")
+	require.Equal(t, 1, strings.Count(names, "apply-reorder"))
+	const why = "the captain countermanded it: deny"
+	steps := hailSteps(t, b.stepLog)
+	require.Len(t, steps, 1)
+	require.Equal(t, "reorder refused: "+why, steps[0]["decision"])
+	require.Equal(t, "not now; reorder refused: "+why, hd.hail(t, "H-0001").Rationale, "the countermand's reason, then the refusal")
+	o := hd.order(t, moved)
+	require.Equal(t, []store.OrderRepo{{Name: "app", BaseRef: "main"}}, o.Repos, "nothing applied")
+	require.Empty(t, o.After)
+	require.Empty(t, hd.order(t, onto).After)
 }
