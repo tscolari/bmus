@@ -72,6 +72,7 @@ import {
   stardate,
   type PushRemote,
   type Tone,
+  type UsageField,
 } from "./view.js";
 
 /** The page of older entries "Load older entries" asks for. */
@@ -1022,6 +1023,29 @@ function RouteControl(props: { state: State; order: OrderView; csrf: string }) {
 /* Away missions --------------------------------------------------------- */
 
 /**
+ * A field of an order's usage against its limit (#120), as a thin meter:
+ * the away-missions card's and the mission report's. Capped at full past
+ * the limit; the text says how far.
+ */
+export function UsageMeter(props: { id: string; field: UsageField }) {
+  const f = props.field;
+  if (f.pct === undefined) return null;
+  return (
+    <div
+      class="bar thin"
+      role="meter"
+      aria-label={`${props.id} ${f.unit} used`}
+      aria-valuemin={0}
+      aria-valuemax={f.limit}
+      aria-valuenow={Math.min(f.used, f.limit)}
+      aria-valuetext={f.text}
+    >
+      <div class={`fill bg-${f.tone}`} style={{ width: `${f.pct}%` }} />
+    </div>
+  );
+}
+
+/**
  * An order's usage against its budget (#120), on its away-missions card:
  * each field with a limit as "420k / 1M tokens" over a thin meter, green,
  * gold from 80% and red from 100%; without a budget, the usage alone.
@@ -1036,19 +1060,7 @@ export function UsageLine(props: { order: OrderView }) {
         fields.map((f) => (
           <div class="usage-field" key={f.unit}>
             <span class={`mono usage-text tone-${f.tone}`}>{f.text}</span>
-            {f.pct !== undefined && (
-              <div
-                class="bar thin"
-                role="meter"
-                aria-label={`${id} ${f.unit} used`}
-                aria-valuemin={0}
-                aria-valuemax={f.limit}
-                aria-valuenow={Math.min(f.used, f.limit)}
-                aria-valuetext={f.text}
-              >
-                <div class={`fill bg-${f.tone}`} style={{ width: `${f.pct}%` }} />
-              </div>
-            )}
+            <UsageMeter id={id} field={f} />
           </div>
         ))
       ) : (

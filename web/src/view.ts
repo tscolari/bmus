@@ -203,6 +203,19 @@ export function orderUsage(o: OrderView): { budgeted: boolean; fields: UsageFiel
   return { budgeted: fields.some((f) => f.limit > 0), fields };
 }
 
+/** Where a limited field's budget comes from, for a person (#120): "order budget", "division budget". */
+export function budgetSourceText(source: string | undefined): string {
+  if (source === "order") return "order budget";
+  if (source === "division") return "division budget";
+  return "no limit";
+}
+
+/** The extensions granted, for a person (#120): "none", or "2: each limit is 3 times its budget". */
+export function extensionsText(extended: number | undefined): string {
+  const n = Math.max(0, extended ?? 0);
+  return n === 0 ? "none" : `${n}: each limit is ${n + 1} times its budget`;
+}
+
 /** Orders on a mission (away and hailing), red alerts first. */
 export function awayOrders(state: State): OrderView[] {
   return [...state.order.values()].filter((o) => o.state === "away" || o.state === "hailing").sort(byPriority);

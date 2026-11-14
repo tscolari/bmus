@@ -104,6 +104,14 @@ func TestConsoleOrderReport(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, pushed, 1)
 
+	// A late usage report still counts: the report's order carries its
+	// final usage against its limits (#120).
+	_, err = d.store.RecordInbox(t.Context(), "sorell", 0, 101, func(tx store.InboxTx) error {
+		_, err := tx.RecordUsage(id, store.Usage{Beam: "fake-1", InputTokens: 3000, OutputTokens: 500, Turns: 8})
+		return err
+	})
+	require.NoError(t, err)
+
 	var got OrderReport
 	status, _ = report(id, &got)
 	require.Equal(t, http.StatusOK, status)
@@ -116,6 +124,9 @@ func TestConsoleOrderReport(t *testing.T) {
 	require.Equal(t, "t", got.Order.Title)
 	require.Equal(t, store.OrderDone, got.Order.State)
 	require.Equal(t, []OrderRepo{{Name: "app", BaseRef: "main"}}, got.Order.Repos)
+	require.Equal(t, UsageView{InputTokens: 3000, OutputTokens: 500, Turns: 8}, got.Order.Usage)
+	require.Equal(t, [3]int64{0, 0, 0}, [3]int64{got.Order.LimitTokens, got.Order.LimitTurns, got.Order.BudgetExtended})
+	require.Equal(t, BudgetSource{Tokens: SourceDefault, Turns: SourceDefault}, got.Order.BudgetSource)
 	require.NotNil(t, got.Order.CreatedAt)
 	require.NotNil(t, got.Order.DoneAt)
 	require.False(t, got.Order.DoneAt.Before(*got.Order.CreatedAt))

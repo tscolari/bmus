@@ -1,7 +1,7 @@
 import { renderToString } from "preact-render-to-string";
 import { describe, expect, it } from "vitest";
 import type { OrderReport } from "../src/api.js";
-import { capLines, CopyButton, copyText, formatBytes, parseDiff, rawDiff, reportPageOrder, reportTime, ReportView } from "../src/report.js";
+import { BudgetFacts, capLines, CopyButton, copyText, formatBytes, parseDiff, rawDiff, reportPageOrder, reportTime, ReportView } from "../src/report.js";
 import { crew, order } from "./fixtures.js";
 
 const base = "0123456789abcdef0123456789abcdef01234567";
@@ -222,5 +222,54 @@ describe("reportPageOrder", () => {
     for (const p of ["/", "/report/", "/report/ORD-0007/", "/report/a/b", "/report/ORD%2F1", "/x/report/ORD-1", "/diff/ORD-0007"]) {
       expect(reportPageOrder(p), p).toBeUndefined();
     }
+  });
+});
+
+describe("the report's budget (#120)", () => {
+  const usage = { input_tokens: 800_000, output_tokens: 20_000, turns: 42 };
+
+  it("shows each field against its limit, with its source, a meter and the extensions", () => {
+    const html = renderToString(
+      <BudgetFacts
+        order={order("ORD-0001", {
+          state: "done",
+          budget_tokens: 500_000,
+          limit_tokens: 1_000_000,
+          limit_turns: 150,
+          budget_source: { tokens: "order", turns: "division" },
+          budget_extended: 1,
+          usage,
+        })}
+      />,
+    );
+    expect(html).toContain('<span class="mono tone-gold">820k / 1M tokens</span> <span class="report-src">order budget</span>');
+    expect(html).toContain('<span class="mono tone-green">42 / 150 turns</span> <span class="report-src">division budget</span>');
+    expect(html).toContain('role="meter" aria-label="ORD-0001 tokens used" aria-valuemin="0" aria-valuemax="1000000" aria-valuenow="820000"');
+    expect(html).toContain("<dt>Extensions</dt><dd>1: each limit is 2 times its budget</dd>");
+    expect(html).not.toContain("No budget");
+  });
+
+  it("marks a field over its limit, and one without a limit", () => {
+    const html = renderToString(
+      <BudgetFacts order={order("ORD-0002", { limit_tokens: 700_000, budget_source: { tokens: "division", turns: "default" }, usage })} />,
+    );
+    expect(html).toContain('<span class="mono tone-red">820k / 700k tokens (over)</span> <span class="report-src">division budget</span>');
+    expect(html).toContain('class="fill bg-red" style="width:100%;"');
+    expect(html).toContain('<span class="mono tone-grey">42 turns</span> <span class="report-src">no limit</span>');
+    expect(html).toContain("<dt>Extensions</dt><dd>none</dd>");
+  });
+
+  it("says No budget and shows the usage without one", () => {
+    const html = renderToString(<BudgetFacts order={order("ORD-0003", { usage })} />);
+    expect(html).toContain("No budget.");
+    expect(html).toContain('<dt>Tokens</dt><dd><span class="mono">820k tokens</span></dd><dt>Turns</dt><dd><span class="mono">42 turns</span></dd>');
+    expect(html).not.toContain('role="meter"');
+    expect(html).not.toContain("Extensions");
+  });
+
+  it("sits in its own panel on the page", () => {
+    const html = renderToString(<ReportView report={{ ...diff, order: { ...diff.order, usage } }} />);
+    expect(html).toContain('aria-labelledby="report-budget-h"');
+    expect(html).toContain("No budget.");
   });
 });

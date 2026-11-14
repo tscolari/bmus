@@ -1140,6 +1140,23 @@ a.btn {
   color: var(--text);
   overflow-wrap: anywhere;
 }
+.report-usage {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  max-width: 480px;
+}
+.report-usage .bar {
+  flex: 0 0 100%;
+}
+.report-nobudget {
+  margin: 0 0 10px;
+}
+.report-src {
+  font-size: 13px;
+  color: var(--muted);
+}
 .report-sub {
   margin: 16px 0 8px;
   font-size: 13px;

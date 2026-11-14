@@ -1,5 +1,6 @@
 [
   { "at_pct": 10, "progress": "surveying the codebase" },
   { "at_pct": 50, "commit": "add retries to the webhook sender" },
+  { "at_pct": 90, "usage": { "input_tokens": 3000, "output_tokens": 500, "turns": 8 } },
   { "at_pct": 100, "report": { "summary": "retries committed", "artifacts": [] } }
 ]

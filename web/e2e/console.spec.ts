@@ -729,7 +729,7 @@ test("a done order's work is pushed from its record row, forced past a diverged 
   await page.goto(url);
   await bridge.bmus("crew", "add", "sorell", "--name", "Lt. Sorell", "--division", "science");
   await expect(page.getByRole("article", { name: "Lt. Sorell" })).toContainText("On deck", { timeout: missionTimeout });
-  const orderId = await bridge.order("sorell", "Add retries");
+  const orderId = await bridge.createOrder({ title: "Add retries", assignee: "sorell", budget_tokens: "1000000" });
   const branch = `bmus/${orderId}`;
 
   const record = page.getByRole("region", { name: "Mission record" });
@@ -788,6 +788,12 @@ test("a done order's work is pushed from its record row, forced past a diverged 
   await expect(crewPanel).toContainText("Lt. Sorell");
   await expect(diffPage.getByRole("region", { name: "Beam" }).getByText(beam, { exact: true })).toBeVisible();
   await expect(diffPage.getByRole("region", { name: "Report" })).toContainText("retries committed");
+  // Its final usage against its budget (#120).
+  const budget = diffPage.getByRole("region", { name: "Budget" });
+  await expect(budget).toContainText(/3\.5k \/ 1M tokens\s*order budget/);
+  await expect(budget).toContainText(/8 turns\s*no limit/);
+  await expect(budget).toContainText(/Extensions\s*none/);
+  await expect(budget.getByRole("meter", { name: `${orderId} tokens used` })).toHaveAttribute("aria-valuenow", "3500");
   await expect(diffPage.getByRole("region", { name: "Pushes" })).toContainText(`app: feature at ${commit.slice(0, 12)}`);
   await expect(diffPage.getByRole("heading", { name: "holodeck.txt" })).toBeVisible();
   await expect(diffPage.getByText(added, { exact: true })).toBeVisible();
