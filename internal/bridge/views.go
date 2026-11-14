@@ -37,25 +37,45 @@ type (
 	// OpenChildren counts its child orders (ParentID) not yet ended: a
 	// split order waits on them (#155). ParkedAt is set (UTC) while its
 	// mission is parked, waiting for a resume (#167).
+	//
+	// BudgetTokens and BudgetTurns are the order's own budget, 0 for none,
+	// as order.create and order.budget take it. LimitTokens and LimitTurns
+	// are its current limits (#120): its budget resolved for its assignee
+	// (resolveBudget), each field times 1 + BudgetExtended, the extensions
+	// granted; 0 for unlimited. BudgetSource says where each resolved
+	// field comes from. Usage is what its beams reported, summed.
 	OrderView struct {
-		ID           string      `json:"id"`
-		Title        string      `json:"title"`
-		Body         string      `json:"body"`
-		Division     string      `json:"division"`
-		Priority     int         `json:"priority"`
-		State        string      `json:"state"`
-		Assignee     string      `json:"assignee"`
-		ParentID     string      `json:"parent_id"`
-		Repos        []OrderRepo `json:"repos"`
-		Branch       string      `json:"branch"`
-		BudgetTokens int64       `json:"budget_tokens"`
-		CreatedBy    string      `json:"created_by"`
-		Model        string      `json:"model"`
-		Source       string      `json:"source,omitempty"`
-		ProgressPct  *float64    `json:"progress_pct,omitempty"`
-		ProgressNote string      `json:"progress_note,omitempty"`
-		OpenChildren int         `json:"open_children"`
-		ParkedAt     *time.Time  `json:"parked_at,omitempty"`
+		ID             string       `json:"id"`
+		Title          string       `json:"title"`
+		Body           string       `json:"body"`
+		Division       string       `json:"division"`
+		Priority       int          `json:"priority"`
+		State          string       `json:"state"`
+		Assignee       string       `json:"assignee"`
+		ParentID       string       `json:"parent_id"`
+		Repos          []OrderRepo  `json:"repos"`
+		Branch         string       `json:"branch"`
+		BudgetTokens   int64        `json:"budget_tokens"`
+		BudgetTurns    int64        `json:"budget_turns"`
+		LimitTokens    int64        `json:"limit_tokens"`
+		LimitTurns     int64        `json:"limit_turns"`
+		BudgetSource   BudgetSource `json:"budget_source"`
+		BudgetExtended int64        `json:"budget_extended"`
+		Usage          UsageView    `json:"usage"`
+		CreatedBy      string       `json:"created_by"`
+		Model          string       `json:"model"`
+		Source         string       `json:"source,omitempty"`
+		ProgressPct    *float64     `json:"progress_pct,omitempty"`
+		ProgressNote   string       `json:"progress_note,omitempty"`
+		OpenChildren   int          `json:"open_children"`
+		ParkedAt       *time.Time   `json:"parked_at,omitempty"`
+	}
+
+	// UsageView is an order's usage, summed over its beams (#120).
+	UsageView struct {
+		InputTokens  int64 `json:"input_tokens"`
+		OutputTokens int64 `json:"output_tokens"`
+		Turns        int64 `json:"turns"`
 	}
 
 	// HailView is a hail. CreatedAt is omitted on a hail from before #147,
@@ -106,14 +126,22 @@ func (d *Daemon) crewView(c store.Crew) CrewView {
 	return v
 }
 
-func orderView(o store.Order) OrderView {
+// orderView is order o's view. Its budget is resolved for its assignee,
+// whose division a directed order without one takes (resolveBudget).
+func (d *Daemon) orderView(o store.Order) OrderView {
 	repos := make([]OrderRepo, len(o.Repos))
 	for i, r := range o.Repos {
 		repos[i] = OrderRepo{Name: r.Name, BaseRef: r.BaseRef}
 	}
+	b, src := d.resolveBudget(o, store.Crew{ID: o.Assignee, Division: o.AssigneeDivision})
+	limit, _ := budgetFor(o, b, nil, "")
 	return OrderView{ID: o.ID, Title: o.Title, Body: o.Body, Division: o.Division,
 		Priority: o.Priority, State: o.State, Assignee: o.Assignee, ParentID: o.ParentID, Repos: repos,
-		Branch: o.Branch, BudgetTokens: o.BudgetTokens, CreatedBy: o.CreatedBy, Model: o.Model,
+		Branch: o.Branch, BudgetTokens: o.BudgetTokens, BudgetTurns: o.BudgetTurns,
+		LimitTokens: limit.Tokens, LimitTurns: limit.Turns, BudgetSource: src,
+		BudgetExtended: o.BudgetExtended,
+		Usage:          UsageView{InputTokens: o.Used.InputTokens, OutputTokens: o.Used.OutputTokens, Turns: o.Used.Turns},
+		CreatedBy:      o.CreatedBy, Model: o.Model,
 		Source: o.Source, ProgressPct: o.ProgressPct, ProgressNote: o.ProgressNote, OpenChildren: o.OpenChildren,
 		ParkedAt: utc(o.ParkedAt)}
 }

@@ -49,7 +49,7 @@ A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026
 - [ ] Create beams through the Beams API, with restricted egress per division
 - [ ] Grant a crew member's beam an extra domain through an egress hail
 - [ ] Reap orphan beams and catch lost ones with a reconcile pass
-- [ ] Cap an order's tokens and turns, and extend or stop it when it runs over
+- [x] Cap an order's tokens and turns, and extend or stop it when it runs over
 - [ ] Hardened console: CSRF on every request, one-time launch codes, session expiry, rate limits
 - [ ] Nightly backups, and an offline restore
 - [ ] Survive a chaos run of beam loss, sleep, login expiry and crashes with zero lost orders
@@ -159,6 +159,7 @@ To change course on an order:
 ./bmus order recall ORD-0001                         # checkpoint and return it to its division's pool
 ./bmus order withdraw ORD-0002                       # take back an order nobody has claimed yet
 ./bmus order route ORD-0002 --assignee tuvok         # or --division ops; only before a claim
+./bmus order budget ORD-0001 --tokens 2000000        # and/or --turns 200; until it ends, and only up while it's away
 ```
 
 A recalled order resumes from its checkpoint on whichever crew member of the division claims it next. Recall needs a division, and an order parked by beam loss can be recalled only while its crew member is in sickbay.
@@ -185,6 +186,10 @@ A crew member's own `--harness` and `--model` override its division's; an order'
 An order's `budget_tokens` and `budget_turns` (in the order file or `order.create`) override its division's budget, field by field; a directed order without a division takes its crew member's division's. Tokens count input, cache reads and writes, and output. The bridge records the usage each beam reports for an order. Each order it sends carries the limit, the budget times one plus the extensions granted, and the usage recorded on the order's other beams.
 
 A crew member over its order's budget is held at its next tool call with a `budget` hail: "ORD-0001 has used 1.2M of 1M tokens and 140 of 150 turns. Extend by its budget again, or stop?". It is always yours to answer, whatever `regs.yaml` says, and `on_timeout: default_option` never decides it. Answer with an option (`bmus hails answer H-0007 --option 0`, or `--decision extend`): `extend` raises the limit by the order's budget once more and the work goes on, `stop` has the agent commit and checkpoint, and the order fails with `budget_exceeded`; its checkpoint is in the cargo bay to continue from. An order already over its budget when it is sent hails at its first tool call. As a backstop, the bridge belays an open order once its recorded usage passes 125% of its budget. Output tokens are counted in full only at the end of an agent's query, so a token limit can be noticed late by that query's output.
+
+`bmus order list` shows each order's usage against its limits in USAGE: `420k/1M 42/150t` is 420k of 1M tokens and 42 of 150 turns, a field without a limit is left out, and `-` means no budget. In `--json`, `budget_tokens` and `budget_turns` are the order's own budget, `limit_tokens` and `limit_turns` its current limits, `budget_source` says where each comes from, and `usage` holds what its beams spent. The console's away-missions card shows the usage against a meter per field, marked "(over)" past the limit, and refreshes as usage reports come in. A done order's mission report shows its final usage the same way, with each limit's source and the extensions granted, or "No budget" and the usage.
+
+`bmus order budget <id> --tokens N --turns N` changes the budget of an order that hasn't ended; 0 hands a field back to the division's budget, and each field is at most 1e15. The extensions already granted still multiply it, and the command prints the limit that results, and, while a budget hail is open, the limit its extend would set. A running beam gets the new limit only with the order's next send, after a recall or a watch change. For that reason an order that is away or hailing may only have its limits raised: a lower limit would stay unknown to its beam, and the 125% backstop would belay it without a checkpoint. Recall it first to lower its budget. To leave one order unlimited in a division with a budget, give it a budget too large to reach, such as `--tokens 1000000000000000`.
 
 ## Regulations
 

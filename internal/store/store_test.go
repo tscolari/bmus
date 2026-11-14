@@ -1678,3 +1678,58 @@ func TestExtendBudget(t *testing.T) {
 	require.NoError(t, s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM budget_extensions`).Scan(&n))
 	require.Equal(t, 2, n, "a failed extension records nothing")
 }
+
+// SetOrderBudget (#120): a field left nil is kept, the check sees the new
+// values and can refuse, and a change that changes nothing writes nothing;
+// budget_extended is kept. An order reads its usage summed over its beams
+// and its assignee's division.
+func TestSetOrderBudget(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := openTest(t)
+	require.NoError(t, s.InsertCrew(ctx, Crew{ID: "a", Name: "A", Division: "science"}, testEntry))
+	id, err := s.InsertOrder(ctx, Order{Title: "t", Assignee: "a", BudgetTokens: 1000, BudgetTurns: 10}, testEntry)
+	require.NoError(t, err)
+	_, err = s.db.ExecContext(ctx, `UPDATE orders SET budget_extended = 2 WHERE id = ?`, id)
+	require.NoError(t, err)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO order_usage (order_id, beam, input_tokens, output_tokens, turns, seq)
+		VALUES (?, 'b1', 100, 10, 2, 1), (?, 'b2', 50, 5, 1, 1)`, id, id)
+	require.NoError(t, err)
+	logged := func() int {
+		t.Helper()
+		var n int
+		require.NoError(t, s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM log WHERE text = 'set'`).Scan(&n))
+		return n
+	}
+	var seen [2]int64
+	check := func(o Order, tokens, turns int64) (LogEntry, error) {
+		seen = [2]int64{tokens, turns}
+		return LogEntry{Kind: "order", OrderID: o.ID, Text: "set"}, nil
+	}
+
+	tokens := int64(5000)
+	o, wrote, err := s.SetOrderBudget(ctx, id, &tokens, nil, check)
+	require.NoError(t, err)
+	require.True(t, wrote)
+	require.Equal(t, [2]int64{5000, 10}, seen)
+	require.Equal(t, [3]int64{5000, 10, 2}, [3]int64{o.BudgetTokens, o.BudgetTurns, o.BudgetExtended})
+	require.Equal(t, UsageTotal{InputTokens: 150, OutputTokens: 15, Turns: 3}, o.Used)
+	require.Equal(t, "science", o.AssigneeDivision)
+	require.Equal(t, 1, logged())
+
+	_, wrote, err = s.SetOrderBudget(ctx, id, &tokens, nil, check)
+	require.NoError(t, err)
+	require.False(t, wrote, "nothing changed")
+	require.Equal(t, 1, logged())
+
+	no := errors.New("refused")
+	turns := int64(0)
+	_, _, err = s.SetOrderBudget(ctx, id, nil, &turns, func(Order, int64, int64) (LogEntry, error) { return LogEntry{}, no })
+	require.ErrorIs(t, err, no)
+	o, err = s.GetOrder(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, int64(10), o.BudgetTurns, "a refused change writes nothing")
+
+	_, _, err = s.SetOrderBudget(ctx, "ORD-9999", &tokens, nil, check)
+	require.ErrorIs(t, err, sql.ErrNoRows)
+}

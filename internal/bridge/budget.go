@@ -58,20 +58,23 @@ func canonBudgetContext(raw json.RawMessage) (json.RawMessage, comms.BudgetConte
 func budgetQuestion(orderID string, c comms.BudgetContext) string {
 	part := func(used, limit uint64, unit string) string {
 		if limit == 0 {
-			return shortCount(used) + " " + unit
+			return ShortCount(used) + " " + unit
 		}
-		return shortCount(used) + " of " + shortCount(limit) + " " + unit
+		return ShortCount(used) + " of " + ShortCount(limit) + " " + unit
 	}
 	return fmt.Sprintf("%s has used %s and %s. Extend by its budget again, or stop?", orderID,
 		part(c.Used, c.Limit, "tokens"), part(c.TurnsUsed, c.TurnsLimit, "turns"))
 }
 
-// shortCount is n for a person to read: 950, 3.5k, 420k, 1M, 1.2M.
-func shortCount(n uint64) string {
+// ShortCount is n for a person to read: 950, 3.5k, 420k, 1M, 1.2M, 2B. The
+// CLI's USAGE column uses it too (#120).
+func ShortCount(n uint64) string {
 	f := func(v float64, unit string) string {
 		return strings.TrimSuffix(strconv.FormatFloat(v, 'f', 1, 64), ".0") + unit
 	}
 	switch {
+	case n >= 1_000_000_000:
+		return f(float64(n)/1e9, "B")
 	case n >= 1_000_000:
 		return f(float64(n)/1e6, "M")
 	case n >= 1000:
@@ -87,7 +90,7 @@ func limitText(limit Budget) string {
 		if n <= 0 {
 			return "unlimited " + unit
 		}
-		return shortCount(uint64(n)) + " " + unit
+		return ShortCount(uint64(n)) + " " + unit
 	}
 	return field(limit.Tokens, "tokens") + ", " + field(limit.Turns, "turns")
 }
@@ -188,4 +191,97 @@ func (d *Daemon) budgetCeiling(ctx context.Context, tx store.InboxTx, crewID, id
 	d.logger.Warn("budget: recorded usage passed 125% of the order's budget; belaying it", "order", id,
 		"tokens", used.Tokens, "token_limit", limit.Tokens, "turns", used.Turns, "turn_limit", limit.Turns)
 	return nil
+}
+
+// SetOrderBudget sets open order id's own budget (#120): tokens and turns,
+// each left as it is when nil, 0 handing the field back to its division's
+// budget (resolveBudget), each at most MaxBudget. An ended order is
+// refused, and so is a split one, whose mission has ended: its child
+// orders carry budgets of their own. budget_extended is kept, so the new
+// limit is the new budget times 1 + budget_extended; the log entry and the
+// view say so. A change is logged "budget set: limit now ..." and reaches
+// a running beam with the order's next send (sendOrder), a recall or a
+// watch change; a budget hail already raised is answered as before, its
+// extend carrying the new budget. A change that changes nothing writes
+// nothing.
+//
+// An order that is away or hailing may not have a current limit lowered:
+// its beam keeps the limit it was sent and would never hail, and the
+// bridge's 125% backstop (budgetCeiling) would belay it without a
+// checkpoint at its next usage report. Raising one is allowed.
+func (d *Daemon) SetOrderBudget(ctx context.Context, id string, tokens, turns *int64) (store.Order, error) {
+	if tokens == nil && turns == nil {
+		return store.Order{}, badRequest("nothing to set: give tokens or turns")
+	}
+	for _, f := range []struct {
+		name string
+		v    *int64
+	}{{"budget tokens", tokens}, {"budget turns", turns}} {
+		if f.v == nil {
+			continue
+		}
+		if err := CheckBudgetField(f.name, *f.v); err != nil {
+			return store.Order{}, badRequest("%v", err)
+		}
+	}
+	o, _, err := d.store.SetOrderBudget(ctx, id, tokens, turns, func(o store.Order, tok, tur int64) (store.LogEntry, error) {
+		switch {
+		case store.OrderEnded(o.State):
+			return store.LogEntry{}, badRequest("order %s is %s, too late to change its budget", id, o.State)
+		case o.State == store.OrderSplit:
+			return store.LogEntry{}, badRequest("order %s has split into child orders: change their budgets instead", id)
+		}
+		before := d.orderLimit(o)
+		o.BudgetTokens, o.BudgetTurns = tok, tur
+		limit := d.orderLimit(o)
+		if (o.State == store.OrderAway || o.State == store.OrderHailing) &&
+			(lowered(before.Tokens, limit.Tokens) || lowered(before.Turns, limit.Turns)) {
+			return store.LogEntry{}, badRequest("order %s is %s: recall it before lowering its budget", id, o.State)
+		}
+		_, src := d.resolveBudget(o, store.Crew{ID: o.Assignee, Division: o.AssigneeDivision})
+		text := "budget set: limit now " + limitText(limit)
+		switch {
+		case o.BudgetExtended == 1:
+			text += ", with 1 extension"
+		case o.BudgetExtended > 1:
+			text += fmt.Sprintf(", with %d extensions", o.BudgetExtended)
+		}
+		return logEntry(logOrder, o.Assignee, id, text, map[string]any{"budget": Budget{Tokens: tok, Turns: tur},
+			"source": src, "budget_extended": o.BudgetExtended, "limit": limit})
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return store.Order{}, fmt.Errorf("order %s: %w", id, ErrNotFound)
+	}
+	return o, err
+}
+
+// orderLimit is order o's current limit: its budget resolved for its
+// assignee times 1 + budget_extended, as its view shows it.
+func (d *Daemon) orderLimit(o store.Order) Budget {
+	b, _ := d.resolveBudget(o, store.Crew{ID: o.Assignee, Division: o.AssigneeDivision})
+	limit, _ := budgetFor(o, b, nil, "")
+	return limit
+}
+
+// lowered reports whether a limit going from before to after is lower,
+// 0 being unlimited: a new limit on an unlimited field lowers it.
+func lowered(before, after int64) bool {
+	return after > 0 && (before == 0 || after < before)
+}
+
+// openBudgetHail returns order id's open budget hail and the limit its
+// extend would set, the order's budget times 2 + budget_extended (#120);
+// ok is false without one.
+func (d *Daemon) openBudgetHail(ctx context.Context, o store.Order) (hailID string, extend Budget, ok bool, err error) {
+	hails, err := d.store.ListHails(ctx, store.HailOpen)
+	if err != nil {
+		return "", Budget{}, false, err
+	}
+	for _, h := range hails {
+		if h.OrderID == o.ID && h.Category == comms.CategoryBudget {
+			o.BudgetExtended++
+			return h.ID, d.orderLimit(o), true, nil
+		}
+	}
+	return "", Budget{}, false, nil
 }

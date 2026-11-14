@@ -9,8 +9,9 @@
 
 import { Fragment, type ComponentChildren } from "preact";
 import { useEffect, useState } from "preact/hooks";
-import { orderReport, type CrewView, type OrderReport, type RepoDiff } from "./api.js";
-import { divisionInfo, orderBranch, priorityInfo } from "./view.js";
+import { orderReport, type CrewView, type OrderReport, type OrderView, type RepoDiff } from "./api.js";
+import { UsageMeter } from "./panels.js";
+import { budgetSourceText, divisionInfo, extensionsText, orderBranch, orderUsage, priorityInfo } from "./view.js";
 
 /**
  * The most diff lines a repo's section renders: an agent can write a
@@ -278,6 +279,44 @@ function CrewFacts(props: { crew: CrewView | null }) {
   );
 }
 
+/**
+ * The order's final usage against its limits (#120): each field's usage,
+ * its limit's source and a meter, and the extensions granted; without a
+ * budget, "No budget" and the usage.
+ */
+export function BudgetFacts(props: { order: OrderView }) {
+  const o = props.order;
+  const { budgeted, fields } = orderUsage(o);
+  const source = (unit: string) => (unit === "tokens" ? o.budget_source?.tokens : o.budget_source?.turns);
+  const label = (unit: string) => (unit === "tokens" ? "Tokens" : "Turns");
+  if (!budgeted) {
+    return (
+      <>
+        <p class="empty report-nobudget">No budget.</p>
+        <Facts rows={fields.map((f) => [label(f.unit), <span class="mono">{f.text}</span>] as const)} />
+      </>
+    );
+  }
+  return (
+    <Facts
+      rows={[
+        ...fields.map(
+          (f) =>
+            [
+              label(f.unit),
+              <div class="report-usage">
+                <span class={`mono tone-${f.tone}`}>{f.text}</span>{" "}
+                <span class="report-src">{f.limit > 0 ? budgetSourceText(source(f.unit)) : "no limit"}</span>
+                <UsageMeter id={o.id} field={f} />
+              </div>,
+            ] as const,
+        ),
+        ["Extensions", extensionsText(o.budget_extended)] as const,
+      ]}
+    />
+  );
+}
+
 /** A loaded mission report: the header, the order, crew, beam, report and pushes, then the diff with Copy, each repo rendering at most maxLines lines. */
 export function ReportView(props: { report: OrderReport; copy?: CopyNote; maxLines?: number }) {
   const r = props.report;
@@ -337,6 +376,9 @@ export function ReportView(props: { report: OrderReport; copy?: CopyNote; maxLin
           )}
         </Panel>
       </div>
+      <Panel id="report-budget-h" title="Budget" class="report-wide">
+        <BudgetFacts order={o} />
+      </Panel>
       <Panel id="report-report-h" title="Report" class="report-wide">
         {r.report === null ? (
           <p class="empty">Report: {unknown}.</p>

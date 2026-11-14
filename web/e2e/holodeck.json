@@ -1,4 +1,5 @@
 [
+  { "at_pct": 10, "usage": { "input_tokens": 3000, "output_tokens": 500, "turns": 8 } },
   { "at_pct": 10, "progress": "surveying the codebase" },
   { "at_pct": 10, "sleep_ms": 1500 },
   {

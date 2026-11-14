@@ -66,7 +66,7 @@ func (d *Daemon) OrderReport(ctx context.Context, id string, limit int) (OrderRe
 	if err != nil {
 		return OrderReport{}, err
 	}
-	out := OrderReport{Order: ReportOrder{OrderView: orderView(o)}, Beams: []string{}, Pushes: []ReportPush{}}
+	out := OrderReport{Order: ReportOrder{OrderView: d.orderView(o)}, Beams: []string{}, Pushes: []ReportPush{}}
 	if o.Assignee != "" {
 		c, err := d.store.GetCrew(ctx, o.Assignee)
 		switch {

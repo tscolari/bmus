@@ -341,10 +341,14 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return // dropped: the client catches up on reconnect
 			}
-			if e.ID <= st.sent {
+			switch {
+			case e.ID == 0 && e.Kind == store.RefreshKind:
+				err = st.views(ctx, e)
+			case e.ID <= st.sent:
 				continue
+			default:
+				err = st.entry(ctx, e)
 			}
-			err = st.entry(ctx, e)
 			if err == nil && len(sub.C()) == 0 {
 				if err = st.checkStatus(ctx); err == nil {
 					err = st.flush()
@@ -484,6 +488,12 @@ func (st *stream) entry(ctx context.Context, e store.LogEntry) error {
 		return err
 	}
 	st.sent = e.ID
+	return st.views(ctx, e)
+}
+
+// views sends the views e names, with no event id. For a refresh
+// (store.RefreshKind), which writes no log entry, that is all it sends.
+func (st *stream) views(ctx context.Context, e store.LogEntry) error {
 	views, err := st.src.Views(ctx, e)
 	if err != nil {
 		return err

@@ -511,6 +511,18 @@ type Order struct {
 	// OpenChildren counts the order's child orders (parent_id) not yet
 	// ended (endedStates), read with the order.
 	OpenChildren int
+	// Used is the order's usage (order_usage), summed over its beams,
+	// and AssigneeDivision its assignee's division, "" without one; both
+	// read with the order (#120).
+	Used             UsageTotal
+	AssigneeDivision string
+}
+
+// UsageTotal is an order's usage summed over its beams (#120).
+type UsageTotal struct {
+	InputTokens  int64
+	OutputTokens int64
+	Turns        int64
 }
 
 // OrderRepo is a row of the order_repos table: a repo of the bridge's
@@ -521,7 +533,11 @@ type OrderRepo struct {
 }
 
 const orderCols = `id, title, body, division, priority, state, assignee, parent_id, branch, budget_tokens, budget_turns, budget_extended, created_by, model, source, parked_at, progress_pct, progress_note,
-	(SELECT COUNT(*) FROM orders c WHERE c.parent_id = orders.id AND c.state NOT IN ` + endedSQL + `)`
+	(SELECT COUNT(*) FROM orders c WHERE c.parent_id = orders.id AND c.state NOT IN ` + endedSQL + `),
+	(SELECT COALESCE(SUM(u.input_tokens), 0) FROM order_usage u WHERE u.order_id = orders.id),
+	(SELECT COALESCE(SUM(u.output_tokens), 0) FROM order_usage u WHERE u.order_id = orders.id),
+	(SELECT COALESCE(SUM(u.turns), 0) FROM order_usage u WHERE u.order_id = orders.id),
+	COALESCE((SELECT a.division FROM crew a WHERE a.id = orders.assignee), '')`
 
 func scanOrder(row interface{ Scan(...any) error }) (Order, error) {
 	var (
@@ -530,7 +546,8 @@ func scanOrder(row interface{ Scan(...any) error }) (Order, error) {
 		pct    sql.NullFloat64
 	)
 	err := row.Scan(&o.ID, &o.Title, &o.Body, &o.Division, &o.Priority, &o.State, &o.Assignee, &o.ParentID, &o.Branch,
-		&o.BudgetTokens, &o.BudgetTurns, &o.BudgetExtended, &o.CreatedBy, &o.Model, &o.Source, &parked, &pct, &o.ProgressNote, &o.OpenChildren)
+		&o.BudgetTokens, &o.BudgetTurns, &o.BudgetExtended, &o.CreatedBy, &o.Model, &o.Source, &parked, &pct, &o.ProgressNote, &o.OpenChildren,
+		&o.Used.InputTokens, &o.Used.OutputTokens, &o.Used.Turns, &o.AssigneeDivision)
 	if parked.Valid {
 		o.ParkedAt = &parked.Time
 	}
@@ -749,6 +766,56 @@ func (s *Store) ExtendBudget(ctx context.Context, orderID, hailID string, entry 
 		}
 		_, err = s.appendLog(ctx, tx, e)
 		return err
+	})
+	if err != nil {
+		return Order{}, false, err
+	}
+	return o, wrote, nil
+}
+
+// SetBudgetFunc checks a budget change on order o, as read in the
+// transaction, to tokens and turns, and returns the log entry to append
+// (SetOrderBudget). An error aborts the change.
+type SetBudgetFunc func(o Order, tokens, turns int64) (LogEntry, error)
+
+// SetOrderBudget sets order id's own budget (#120): tokens and turns,
+// each kept as it is when nil, 0 meaning none of its own. check runs on
+// the order as read, with the new values, in the same transaction; the
+// update and the entry it returns are written only when a value changes.
+// budget_extended is kept. It returns the order (without its repos) and
+// whether it wrote. A missing order returns sql.ErrNoRows.
+func (s *Store) SetOrderBudget(ctx context.Context, id string, tokens, turns *int64, check SetBudgetFunc) (o Order, wrote bool, err error) {
+	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		read := func() (err error) {
+			o, err = scanOrder(tx.QueryRowContext(ctx, `SELECT `+orderCols+` FROM orders WHERE id = ?`, id))
+			return err
+		}
+		if err := read(); err != nil {
+			return err
+		}
+		tok, tur := o.BudgetTokens, o.BudgetTurns
+		if tokens != nil {
+			tok = *tokens
+		}
+		if turns != nil {
+			tur = *turns
+		}
+		entry, err := check(o, tok, tur)
+		if err != nil {
+			return err
+		}
+		if tok == o.BudgetTokens && tur == o.BudgetTurns {
+			return nil
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE orders SET budget_tokens = ?, budget_turns = ? WHERE id = ?`,
+			tok, tur, id); err != nil {
+			return err
+		}
+		wrote = true
+		if _, err := s.appendLog(ctx, tx, entry); err != nil {
+			return err
+		}
+		return read()
 	})
 	if err != nil {
 		return Order{}, false, err
@@ -2895,6 +2962,10 @@ type InboxTx struct {
 	crewID string
 	tourNo int
 	seq    uint64
+	// usage collects the orders whose usage rows RecordUsage wrote:
+	// RecordInbox hands them to the log hook as refreshes once the
+	// transaction commits (#120).
+	usage *[]string
 }
 
 // SQL returns the underlying transaction, e.g. for dbos.WithSendTransaction:
@@ -2952,7 +3023,13 @@ func (t InboxTx) RecordUsage(id string, u Usage) (bool, error) {
 		return false, err
 	}
 	n, err := res.RowsAffected()
-	return n > 0, err
+	if err != nil {
+		return false, err
+	}
+	if n > 0 && t.usage != nil {
+		*t.usage = append(*t.usage, id)
+	}
+	return n > 0, nil
 }
 
 // OrderUsage returns order id's usage rows, one per beam that reported
@@ -3016,6 +3093,7 @@ func orderUsage(ctx context.Context, q interface {
 // fn runs holding the store's write slot: it must not call a Store write
 // method (it would wait forever).
 func (s *Store) RecordInbox(ctx context.Context, crewID string, tourNo int, seq uint64, fn func(InboxTx) error) (recorded bool, err error) {
+	var usage []string
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO inbox (crew_id, tour_no, seq, received_at) VALUES (?, ?, ?, ?)`,
 			crewID, tourNo, int64(seq), time.Now().UTC())
@@ -3030,11 +3108,12 @@ func (s *Store) RecordInbox(ctx context.Context, crewID string, tourNo int, seq 
 		if fn == nil {
 			return nil
 		}
-		return fn(InboxTx{ctx: ctx, tx: tx, s: s, crewID: crewID, tourNo: tourNo, seq: seq})
+		return fn(InboxTx{ctx: ctx, tx: tx, s: s, crewID: crewID, tourNo: tourNo, seq: seq, usage: &usage})
 	})
 	if err != nil {
 		return false, err
 	}
+	s.publishRefresh(usage)
 	return recorded, nil
 }
 
@@ -3135,7 +3214,8 @@ func isBusy(err error) bool {
 // committing goroutine (#72). Entries already in the log aren't handed
 // over. fn must not block: it holds up the writer and every other
 // commit's hook. Calls to fn don't overlap, and each holds the entries
-// above the previous call's.
+// above the previous call's. A call may instead hold refreshes, entries
+// with ID 0 and kind RefreshKind that are in no log (publishRefresh).
 //
 // SQLite has a single writer, and _txlock=immediate takes the write lock
 // at BEGIN, so log ids rise in commit order: after any commit every entry
@@ -3172,6 +3252,30 @@ func (s *Store) publishLog(ctx context.Context) {
 		return
 	}
 	s.logHookLast = entries[len(entries)-1].ID
+	s.logHook(entries)
+}
+
+// RefreshKind is the kind of a refresh on the log hook (#120): a LogEntry
+// with ID 0 that is in no log, naming an order whose view changed without
+// an entry, as a usage report changes it. The console sends that order's
+// view with no event id.
+const RefreshKind = "refresh"
+
+// publishRefresh hands the log hook a refresh (RefreshKind) for each of
+// orders, if a hook is set and there are any. Called after a commit.
+func (s *Store) publishRefresh(orders []string) {
+	if len(orders) == 0 {
+		return
+	}
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	if s.logHook == nil {
+		return
+	}
+	entries := make([]LogEntry, len(orders))
+	for i, id := range orders {
+		entries[i] = LogEntry{Kind: RefreshKind, OrderID: id}
+	}
 	s.logHook(entries)
 }
 

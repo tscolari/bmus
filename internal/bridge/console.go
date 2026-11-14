@@ -114,7 +114,7 @@ func (c consoleSource) Snapshot(ctx context.Context) (console.Snapshot, error) {
 	orderViews := []OrderView{}
 	for _, o := range orders {
 		if slices.Contains([]string{store.OrderPool, store.OrderDirected, store.OrderAway, store.OrderHailing, store.OrderSplit}, o.State) || named[o.ID] {
-			orderViews = append(orderViews, orderView(o))
+			orderViews = append(orderViews, d.orderView(o))
 		}
 	}
 	hailViews := []HailView{}
@@ -175,14 +175,14 @@ func (c consoleSource) Views(ctx context.Context, e store.LogEntry) ([]console.E
 	if e.OrderID != "" {
 		o, err := d.store.GetOrder(ctx, e.OrderID)
 		if err == nil {
-			out = append(out, console.Event{Type: "order", Data: orderView(o)})
+			out = append(out, console.Event{Type: "order", Data: d.orderView(o)})
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
 		}
 		if o.ParentID != "" {
 			p, err := d.store.GetOrder(ctx, o.ParentID)
 			if err == nil {
-				out = append(out, console.Event{Type: "order", Data: orderView(p)})
+				out = append(out, console.Event{Type: "order", Data: d.orderView(p)})
 			} else if !errors.Is(err, sql.ErrNoRows) {
 				return nil, err
 			}
@@ -217,7 +217,7 @@ func (c consoleSource) CreateOrder(ctx context.Context, args json.RawMessage) (a
 		if err != nil {
 			return nil, err
 		}
-		return orderView(o), nil
+		return c.d.orderView(o), nil
 	})
 }
 

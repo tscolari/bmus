@@ -80,11 +80,13 @@ func parseOrder(data []byte) (bridge.OrderCreateArgs, error) {
 	if !ok {
 		return bridge.OrderCreateArgs{}, fmt.Errorf("unknown priority %q (want routine, yellow or red)", o.Priority)
 	}
-	if o.BudgetTokens < 0 {
-		return bridge.OrderCreateArgs{}, errors.New("budget_tokens must not be negative")
-	}
-	if o.BudgetTurns < 0 {
-		return bridge.OrderCreateArgs{}, errors.New("budget_turns must not be negative")
+	for _, f := range []struct {
+		name string
+		v    int64
+	}{{"budget_tokens", o.BudgetTokens}, {"budget_turns", o.BudgetTurns}} {
+		if err := bridge.CheckBudgetField(f.name, f.v); err != nil {
+			return bridge.OrderCreateArgs{}, err
+		}
 	}
 	// The bridge checks the repos against its registry, and that Phase 1
 	// orders name exactly one.
@@ -162,7 +164,15 @@ orders take exactly one:
 	list := &cobra.Command{
 		Use:   "list",
 		Short: "List orders",
-		Args:  cobra.NoArgs,
+		Long: `List orders.
+
+USAGE is what the order's beams spent against its current budget: tokens
+(input and output) and turns, "420k/1M 42/150t", each part shown only when
+that field has a limit, and "-" with neither. The limits are the order's
+budget, else its division's, times 1 + the extensions granted. --json has
+every count, budget or not: limit_tokens and limit_turns are the limits,
+budget_tokens and budget_turns the order's own budget.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			var res bridge.OrderListResult
 			if err := a.call(cmd.Context(), "order.list", nil, &res); err != nil {
@@ -172,9 +182,10 @@ orders take exactly one:
 				return printJSON(cmd.OutOrStdout(), res)
 			}
 			w := newTable(cmd.OutOrStdout())
-			fmt.Fprintln(w, "ID\tSTATE\tPROGRESS\tASSIGNEE\tDIVISION\tTITLE")
+			fmt.Fprintln(w, "ID\tSTATE\tPROGRESS\tUSAGE\tASSIGNEE\tDIVISION\tTITLE")
 			for _, o := range res.Orders {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", o.ID, stateCell(o), progressCell(o.ProgressPct), dash(o.Assignee), dash(o.Division), o.Title)
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", o.ID, stateCell(o), progressCell(o.ProgressPct), usageCell(o),
+					dash(o.Assignee), dash(o.Division), o.Title)
 			}
 			return w.Flush()
 		},
@@ -206,6 +217,59 @@ change or beam loss can be recalled only while its crew member is in sickbay.`,
 		`Take back an order no crew member has claimed yet (pool or directed). A
 recalled order still has its parked mission: belay it instead.`,
 		func(v bridge.OrderView) string { return "order " + v.ID + " withdrawn" })
+
+	var (
+		budgetJSON                bool
+		budgetTokens, budgetTurns int64
+	)
+	budget := &cobra.Command{
+		Use:   "budget <id>",
+		Short: "Change an open order's budget",
+		Long: `Change the budget of an order that hasn't ended: --tokens caps its tokens
+(input and output), --turns its main-loop turns. At least one is required; the
+other stays as it is. 0 hands the field back to the division's budget from the
+roster, and none there means unlimited. Each is at most 1e15. To leave an order
+unlimited while its division has a budget, give it a budget too large to reach,
+such as --tokens 1000000000000000.
+
+The extensions already granted are kept: the order's limit is its budget
+times 1 + the extensions, and the output prints the limit that results. A
+running beam gets the change with the order's next send (a recall or a watch
+change); until then it runs on the limit it was sent. An order that is away or
+hailing may only have its limits raised: lowering one would leave its beam
+unaware, and the bridge's backstop would belay it without a checkpoint once its
+usage passed 125% of the lower limit. Recall it first. A budget hail already
+raised is answered as usual: the output names it and the limit its extend
+would set, which carries the new budget.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, pos []string) error {
+			args := bridge.OrderBudgetArgs{ID: pos[0]}
+			if cmd.Flags().Changed("tokens") {
+				args.Tokens = &budgetTokens
+			}
+			if cmd.Flags().Changed("turns") {
+				args.Turns = &budgetTurns
+			}
+			if args.Tokens == nil && args.Turns == nil {
+				return errors.New("--tokens or --turns is required")
+			}
+			var res bridge.OrderBudgetResult
+			if err := a.call(cmd.Context(), "order.budget", args, &res); err != nil {
+				return err
+			}
+			if budgetJSON {
+				return printJSON(cmd.OutOrStdout(), res)
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), budgetLine(res.OrderView))
+			if h := res.BudgetHail; h != nil {
+				fmt.Fprintln(cmd.OutOrStdout(), budgetHailLine(*h))
+			}
+			return nil
+		},
+	}
+	budget.Flags().Int64Var(&budgetTokens, "tokens", 0, "token budget; 0 takes the division's")
+	budget.Flags().Int64Var(&budgetTurns, "turns", 0, "turn budget; 0 takes the division's")
+	budget.Flags().BoolVar(&budgetJSON, "json", false, "print the order as JSON")
 
 	var (
 		routeJSON          bool
@@ -288,7 +352,7 @@ the push. Each push is logged.`,
 	push.Flags().BoolVar(&pushForce, "force", false, "overwrite the target branch even if it has diverged")
 	push.Flags().BoolVar(&pushJSON, "json", false, "print JSON")
 
-	cmd.AddCommand(create, list, belay, recall, withdraw, route, push)
+	cmd.AddCommand(create, list, belay, recall, withdraw, route, budget, push)
 	return cmd
 }
 
@@ -359,4 +423,65 @@ func stateCell(o bridge.OrderView) string {
 		return fmt.Sprintf("%s (%d open)", o.State, o.OpenChildren)
 	}
 	return o.State
+}
+
+// usageCell is an order's USAGE cell (#120): its tokens (input and
+// output) and turns against their current limits, "420k/1M 42/150t",
+// each part only when that field has a limit, "-" with neither.
+func usageCell(o bridge.OrderView) string {
+	var parts []string
+	if o.LimitTokens > 0 {
+		used := max(o.Usage.InputTokens+o.Usage.OutputTokens, 0)
+		parts = append(parts, bridge.ShortCount(uint64(used))+"/"+bridge.ShortCount(uint64(o.LimitTokens)))
+	}
+	if o.LimitTurns > 0 {
+		parts = append(parts, fmt.Sprintf("%d/%dt", max(o.Usage.Turns, 0), o.LimitTurns))
+	}
+	if len(parts) == 0 {
+		return "-"
+	}
+	return strings.Join(parts, " ")
+}
+
+// limitField is one field of a limit for a person: "2M tokens", or
+// "unlimited tokens" for 0.
+func limitField(n int64, unit string) string {
+	if n <= 0 {
+		return "unlimited " + unit
+	}
+	return bridge.ShortCount(uint64(n)) + " " + unit
+}
+
+// limitCells is limit for a person: "15M tokens, 300 turns".
+func limitCells(limit bridge.Budget) string {
+	return limitField(limit.Tokens, "tokens") + ", " + limitField(limit.Turns, "turns")
+}
+
+// budgetHailLine is `bmus order budget`'s second line when the order has
+// an open budget hail: "H-0007 is open: extend makes the limit 15M
+// tokens, 300 turns".
+func budgetHailLine(h bridge.OpenBudgetHail) string {
+	return h.ID + " is open: extend makes the limit " + limitCells(h.ExtendLimit)
+}
+
+// budgetLine is `bmus order budget`'s output: "order ORD-0001 limit now
+// 2M tokens (order), 150 turns (division)", each field's current limit
+// and where its budget comes from, "unlimited" for none, and ", with 1
+// extension" when the captain granted any: they multiply the budget.
+func budgetLine(v bridge.OrderView) string {
+	field := func(n int64, unit, src string) string {
+		if n <= 0 {
+			return limitField(n, unit)
+		}
+		return limitField(n, unit) + " (" + src + ")"
+	}
+	line := "order " + v.ID + " limit now " + field(v.LimitTokens, "tokens", v.BudgetSource.Tokens) + ", " +
+		field(v.LimitTurns, "turns", v.BudgetSource.Turns)
+	switch {
+	case v.BudgetExtended == 1:
+		line += ", with 1 extension"
+	case v.BudgetExtended > 1:
+		line += fmt.Sprintf(", with %d extensions", v.BudgetExtended)
+	}
+	return line
 }
