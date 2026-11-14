@@ -196,6 +196,23 @@ type (
 		Assignee *string `json:"assignee,omitempty"`
 		Division *string `json:"division,omitempty"`
 	}
+	// OrderRebaseArgs are order.rebase's args (#148): an order no crew
+	// member has started and the new base_ref of its repo Repo, which may
+	// be empty for an order with one repo. Onto is order:<id> or a plain
+	// ref. It returns the rebased OrderView.
+	OrderRebaseArgs struct {
+		ID   string `json:"id"`
+		Onto string `json:"onto"`
+		Repo string `json:"repo,omitempty"`
+	}
+	// OrderAfterArgs are order.after's args (#148): an order no crew
+	// member has started, and the orders to add to and remove from its
+	// after; at least one must be given. It returns the OrderView.
+	OrderAfterArgs struct {
+		ID     string   `json:"id"`
+		Add    []string `json:"add,omitempty"`
+		Remove []string `json:"remove,omitempty"`
+	}
 	// OrderBudgetArgs are order.budget's args (#120): an open order's id
 	// and its own budget's new tokens and turns. An absent field keeps the
 	// order's, 0 hands it back to the division's budget; at least one must
@@ -383,6 +400,8 @@ var rpcHandlers = map[string]rpcHandler{
 	"order.withdraw":    rpcOrderWithdraw,
 	"order.route":       rpcOrderRoute,
 	"order.budget":      rpcOrderBudget,
+	"order.rebase":      rpcOrderRebase,
+	"order.after":       rpcOrderAfter,
 	"order.push":        rpcOrderPush,
 	"hails.list":        rpcHailsList,
 	"hails.answer":      rpcHailsAnswer,
@@ -671,6 +690,62 @@ func (d *Daemon) routeOrder(ctx context.Context, a OrderRouteArgs) (OrderView, e
 		return OrderView{}, err
 	}
 	o, err := d.store.GetOrder(ctx, a.ID)
+	if err != nil {
+		return OrderView{}, err
+	}
+	return d.orderView(o), nil
+}
+
+func rpcOrderRebase(ctx context.Context, d *Daemon, raw json.RawMessage) (any, error) {
+	var a OrderRebaseArgs
+	if err := decodeArgs(raw, &a); err != nil {
+		return nil, err
+	}
+	v, err := d.rebaseOrder(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// rebaseOrder sets the base of the order a names (reorderOrder) and
+// returns its OrderView: order.rebase.
+func (d *Daemon) rebaseOrder(ctx context.Context, a OrderRebaseArgs) (OrderView, error) {
+	if a.ID == "" {
+		return OrderView{}, badRequest("order id is required")
+	}
+	if a.Onto == "" {
+		return OrderView{}, badRequest("onto is required: order:<id> or a ref")
+	}
+	o, err := d.reorderOrder(ctx, a.ID, store.OrderChange{Repo: a.Repo, Base: &a.Onto}, reorderSource{})
+	if err != nil {
+		return OrderView{}, err
+	}
+	return d.orderView(o), nil
+}
+
+func rpcOrderAfter(ctx context.Context, d *Daemon, raw json.RawMessage) (any, error) {
+	var a OrderAfterArgs
+	if err := decodeArgs(raw, &a); err != nil {
+		return nil, err
+	}
+	v, err := d.orderAfter(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// orderAfter changes the after of the order a names (reorderOrder) and
+// returns its OrderView: order.after.
+func (d *Daemon) orderAfter(ctx context.Context, a OrderAfterArgs) (OrderView, error) {
+	if a.ID == "" {
+		return OrderView{}, badRequest("order id is required")
+	}
+	if len(a.Add) == 0 && len(a.Remove) == 0 {
+		return OrderView{}, badRequest("nothing to change: give orders to add or remove")
+	}
+	o, err := d.reorderOrder(ctx, a.ID, store.OrderChange{AfterAdd: a.Add, AfterRemove: a.Remove}, reorderSource{})
 	if err != nil {
 		return OrderView{}, err
 	}

@@ -206,6 +206,7 @@ captain_only:
   - tag: opaque
   - match: deploy # read in answers too
   - category: tracker_comment
+  - category: order_reorder
 
 
 auto_allow:

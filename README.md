@@ -68,6 +68,7 @@ A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026
 - [x] Stage 1: chain orders, so one waits for another and starts from its work
   - [x] An order waits for the orders in its `after` ([#142](https://github.com/tscolari/bmus/issues/142))
   - [x] An order starts from another order's work ([#143](https://github.com/tscolari/bmus/issues/143))
+  - [x] Rebase or reorder orders nobody has started, from the CLI or through Command ([#148](https://github.com/tscolari/bmus/issues/148))
 - [ ] Stage 2: crew file findings as issues, and you discard the ones you don't want
 - [ ] Stage 3: `bmus campaign run --issue <ref>` implements, reviews, fixes and lands one task
 - [ ] Stage 4: run a campaign over a backlog query with an in-flight limit, respecting blockers
@@ -170,6 +171,15 @@ repos:
     base_ref: order:ORD-0001          # starts from ORD-0001's work, once it is done
 body: Run the migration ORD-0001 drafted.
 ```
+
+An order nobody has started yet (in the pool or directed, never claimed, with no parked mission and no checkpoint) can be moved onto new work or made to wait on other orders:
+
+```sh
+./bmus order rebase ORD-0003 --onto order:ORD-0005   # or a ref such as main; --repo <name> for an order with several repos
+./bmus order after ORD-0003 --add ORD-0004 --remove ORD-0001
+```
+
+`order rebase` sets the repo's `base_ref`. A new `order:<id>` base is checked as at create and replaces the order the old base put in `after`; a plain ref drops that wait, and the order's other `after` entries stay. `order after` adds and removes waits by id, and refuses to remove the one a base of `order:<id>` implies. Both refuse an order a crew member has started, since its work is built on the old base, an order that ended or was split, and a change that would make the order wait on itself or on one of its own dependents. Each change is one entry in the captain's log, and the console's open orders show the new base and wait at once. Command can ask for the same changes with its `reorder_orders` tool: you get an `order_reorder` hail showing each order's current and proposed base and wait, and once you allow it the bridge applies each change it still can, skipping and naming any order a crew member has claimed meanwhile. Like any hail from Command it is yours to answer. The default `regs.yaml` lists `order_reorder` under `captain_only`, so `on_timeout: default_option` never decides one; drop that rule to let it.
 
 To change course on an order:
 

@@ -352,6 +352,85 @@ assignee or a division.`,
 	route.Flags().BoolVar(&routeJSON, "json", false, "print the order as JSON")
 
 	var (
+		rebaseJSON             bool
+		rebaseOnto, rebaseRepo string
+	)
+	rebase := &cobra.Command{
+		Use:   "rebase <id> --onto <base>",
+		Short: "Start an order nobody has started from another base",
+		Long: `Set the base_ref of an order no crew member has started: in the pool or
+directed, never claimed, with no parked mission and no checkpoint. --onto is
+order:ORD-0005, to start from that order's work once it is done, or a ref of
+the repo (a branch, a tag or a commit id). --repo names the repo of an order
+with more than one.
+
+An order:<id> base is checked as at create, and replaces the order: entry the
+old base put in the order's after; a plain ref drops it. Its other after
+entries stay. The bridge refuses an order a crew member has started, since its
+work is built on the old base, an order that ended or was split, and a base
+that would make the order wait on itself or on one of its own dependents.
+To start a started order over from a new base, belay it and create a new one.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, pos []string) error {
+			if rebaseOnto == "" {
+				return errors.New("--onto is required")
+			}
+			var res bridge.OrderView
+			if err := a.call(cmd.Context(), "order.rebase", bridge.OrderRebaseArgs{ID: pos[0], Onto: rebaseOnto, Repo: rebaseRepo}, &res); err != nil {
+				return err
+			}
+			if rebaseJSON {
+				return printJSON(cmd.OutOrStdout(), res)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "order %s rebased onto %s%s\n", res.ID, rebaseOnto, waitText(res))
+			return nil
+		},
+	}
+	rebase.Flags().StringVar(&rebaseOnto, "onto", "", "the new base: order:<id> or a ref")
+	rebase.Flags().StringVar(&rebaseRepo, "repo", "", "the repo to rebase, for an order with more than one")
+	rebase.Flags().BoolVar(&rebaseJSON, "json", false, "print the order as JSON")
+
+	var (
+		afterJSON             bool
+		afterAdd, afterRemove []string
+	)
+	afterCmd := &cobra.Command{
+		Use:   "after <id>",
+		Short: "Change which orders an order nobody has started waits on",
+		Long: `Change the after of an order no crew member has started, as rebase requires:
+--add adds an order it waits on, --remove drops one (both repeatable). The
+bridge refuses an order that doesn't exist or already ended failed, belayed or
+withdrawn, a wait that would be a cycle, and removing the order an order:<id>
+base waits on: rebase the order to drop that one.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, pos []string) error {
+			if len(afterAdd) == 0 && len(afterRemove) == 0 {
+				return errors.New("--add or --remove is required")
+			}
+			var res bridge.OrderView
+			if err := a.call(cmd.Context(), "order.after", bridge.OrderAfterArgs{ID: pos[0], Add: afterAdd, Remove: afterRemove}, &res); err != nil {
+				return err
+			}
+			if afterJSON {
+				return printJSON(cmd.OutOrStdout(), res)
+			}
+			if len(res.After) == 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "order %s waits on no order\n", res.ID)
+				return nil
+			}
+			wait := waitText(res)
+			if slices.Equal(res.WaitingOn, res.After) {
+				wait = ", none done yet"
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "order %s after %s%s\n", res.ID, strings.Join(res.After, ", "), wait)
+			return nil
+		},
+	}
+	afterCmd.Flags().StringArrayVar(&afterAdd, "add", nil, "an order to wait on (repeatable)")
+	afterCmd.Flags().StringArrayVar(&afterRemove, "remove", nil, "an order to stop waiting on (repeatable)")
+	afterCmd.Flags().BoolVar(&afterJSON, "json", false, "print the order as JSON")
+
+	var (
 		pushJSON, pushForce bool
 		pushTarget          string
 	)
@@ -389,7 +468,7 @@ the push. Each push is logged.`,
 	push.Flags().BoolVar(&pushForce, "force", false, "overwrite the target branch even if it has diverged")
 	push.Flags().BoolVar(&pushJSON, "json", false, "print JSON")
 
-	cmd.AddCommand(create, list, belay, recall, withdraw, route, budget, push)
+	cmd.AddCommand(create, list, belay, recall, withdraw, route, budget, rebase, afterCmd, push)
 	return cmd
 }
 
@@ -454,6 +533,15 @@ func waitingPart(ids []string) string {
 		return ", and 1 order waiting on it (" + ids[0] + ")"
 	}
 	return fmt.Sprintf(", and %d orders waiting on it (%s)", len(ids), strings.Join(ids, ", "))
+}
+
+// waitText ends `order rebase` and `order after`'s line with the orders
+// the order still waits on: ", waiting on ORD-0005", or nothing.
+func waitText(o bridge.OrderView) string {
+	if len(o.WaitingOn) == 0 {
+		return ""
+	}
+	return ", waiting on " + strings.Join(o.WaitingOn, ", ")
 }
 
 // progressCell is an order's PROGRESS cell: "waiting on ORD-0001" for an

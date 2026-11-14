@@ -52,6 +52,13 @@
  *     children; the answer's decision lists their ids. The tool is neither
  *     registered nor pre-allowed without the role: bypassPermissions would
  *     run a registered one.
+ *   - `reorder_orders({changes, reason})`, only with `--role command`
+ *     (#148): asks the captain to change the base (`onto`, order:<id> or a
+ *     ref) and the after (`after_add`, `after_remove`) of orders nobody has
+ *     started, as an `order_reorder` hail (allow/deny, context {changes,
+ *     reason}), and holds until it is answered. The bridge applies an
+ *     allowed one change by change; the decision says what applied and what
+ *     was skipped, and option 1 means nothing applied.
  *   - `request_handover(note)` writes a checkpoint to
  *     `<work-dir>/<order>/<n>/` (n counts from 1 per order): a git bundle of
  *     each repo's `bmus/<order>` from its base commit (`<name>.bundle`, see
@@ -105,7 +112,7 @@
  * (`query({resume})`) with one message carrying every answer (resumeText).
  * An allowed or denied call leaves a single-use entry for the resumed query
  * (Grant), so the agent's re-issue of it is decided without a second hail.
- * - A query that raised an `order_split` hail never parks, so the split's
+ * - A query that raised an `order_split` or `order_reorder` hail never parks, so the split's
  *   result reaches the agent: a resumed Command could split twice. Its other
  *   hails hold until answered. The same goes for a tracker request: a resumed
  *   agent could ask for it again. A budget hail holds off a park only while
@@ -182,14 +189,20 @@ import { z } from "zod";
 import {
   CATEGORY_BUDGET,
   CATEGORY_CLARIFYING_QUESTION,
+  CATEGORY_ORDER_REORDER,
   CATEGORY_ORDER_SPLIT,
   CATEGORY_TOOL_APPROVAL,
   CATEGORY_TRACKER_CLOSE,
   CATEGORY_TRACKER_COMMENT,
+  MAX_REORDER_CHANGES,
+  MAX_REORDER_IDS,
+  MAX_REORDER_ONTO,
+  MAX_REORDER_REASON,
   MAX_SPLIT_CHILDREN,
   MAX_SPLIT_TITLE,
   OPTION_ALLOW,
   OPTION_DENY,
+  type OrderReorderChange,
   type OrderSplitChild,
   type TrackerCloseContext,
   type TrackerCommentContext,
@@ -241,10 +254,12 @@ export const MCP_SERVER = "combadge";
 export const ALLOWED_TOOLS = ["progress", "report", "request_handover", "tracker_comment", "tracker_close"].map((t) => `mcp__${MCP_SERVER}__${t}`);
 /** Command's tool for splitting its order into child orders (#155). */
 export const SPLIT_ORDER_TOOL = `mcp__${MCP_SERVER}__split_order`;
+/** Command's tool for changing the base and after of orders nobody has started (#148). */
+export const REORDER_ORDERS_TOOL = `mcp__${MCP_SERVER}__reorder_orders`;
 
-/** The in-process tools pre-allowed for role: ALLOWED_TOOLS, plus split_order for command. */
+/** The in-process tools pre-allowed for role: ALLOWED_TOOLS, plus split_order and reorder_orders for command. */
 export function allowedTools(role: Role | undefined): string[] {
-  return role === "command" ? [...ALLOWED_TOOLS, SPLIT_ORDER_TOOL] : ALLOWED_TOOLS;
+  return role === "command" ? [...ALLOWED_TOOLS, SPLIT_ORDER_TOOL, REORDER_ORDERS_TOOL] : ALLOWED_TOOLS;
 }
 
 export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): Harness {
@@ -1156,6 +1171,66 @@ export function splitHail(order: Order, children: z.infer<z.ZodObject<typeof spl
   };
 }
 
+/** An order id as the bridge makes them. */
+const ORDER_ID = /^ORD-[0-9]{4,}$/;
+
+/** reorder_orders's input schema; the bridge checks it again (bridge.checkReorder). */
+const reorderOrdersInput = {
+  changes: z
+    .array(
+      z
+        .object({
+          order: z.string().regex(ORDER_ID, "an order id, such as ORD-0001"),
+          onto: z
+            .string()
+            .trim()
+            .min(1)
+            .max(MAX_REORDER_ONTO)
+            .regex(ONE_LINE, "onto is one line")
+            .refine((s) => !s.startsWith("-"), "onto must not start with '-'")
+            .refine((s) => !s.startsWith("order:") || ORDER_ID.test(s.slice("order:".length)), "order: takes an order's id, such as order:ORD-0001")
+            .optional(),
+          after_add: z.array(z.string().regex(ORDER_ID, "an order id, such as ORD-0001")).min(1).max(MAX_REORDER_IDS).optional(),
+          after_remove: z.array(z.string().regex(ORDER_ID, "an order id, such as ORD-0001")).min(1).max(MAX_REORDER_IDS).optional(),
+        })
+        .refine((c) => c.onto !== undefined || c.after_add !== undefined || c.after_remove !== undefined, "a change needs onto, after_add or after_remove")
+        .refine((c) => !c.after_add?.some((id) => c.after_remove?.includes(id)), "an order can't be both added and removed"),
+    )
+    .min(1)
+    .max(MAX_REORDER_CHANGES)
+    .refine((cs) => new Set(cs.map((c) => c.order)).size === cs.length, "one change per order"),
+  reason: z.string().trim().min(1).max(MAX_REORDER_REASON),
+};
+
+/**
+ * The order_reorder hail reorder_orders raises. The bridge stores it with a
+ * question of its own, built from the orders' current and proposed state
+ * (bridge.reorderQuestion): the captain approves what the bridge will apply.
+ */
+export function reorderHail(input: z.infer<z.ZodObject<typeof reorderOrdersInput>>): Omit<HailBody, "ref"> {
+  const changes: OrderReorderChange[] = input.changes.map((c) => ({
+    order: c.order,
+    ...(c.onto !== undefined && { onto: c.onto }),
+    ...(c.after_add !== undefined && { after_add: [...new Set(c.after_add)] }),
+    ...(c.after_remove !== undefined && { after_remove: [...new Set(c.after_remove)] }),
+  }));
+  const lines = changes.map((c) => {
+    const parts = [
+      ...(c.onto !== undefined ? [`onto ${c.onto}`] : []),
+      ...(c.after_add ?? []).map((id) => `+${id}`),
+      ...(c.after_remove ?? []).map((id) => `-${id}`),
+    ];
+    return `${c.order} ${parts.join(" ")}`;
+  });
+  const n = changes.length;
+  return {
+    category: CATEGORY_ORDER_REORDER,
+    question: `Reorder ${n} order${n === 1 ? "" : "s"}? ${lines.join("; ")} (${input.reason})`,
+    options: [OPTION_ALLOW, OPTION_DENY],
+    context: { changes, reason: input.reason },
+  };
+}
+
 /** tracker_comment's input schema; the bridge checks it again (bridge.checkTrackerRequest). */
 const trackerCommentInput = {
   ref: z.string().trim().min(1),
@@ -1193,9 +1268,9 @@ function combadgeServer(
   dirs: { repo: string; workDir: string },
   /** The query's own abort: once it fires (a park, a belay, a stop), every tool call is dropped. */
   live: AbortSignal,
-  /** Raises the hails of split_order and the tracker tools. */
+  /** Raises the hails of split_order, reorder_orders and the tracker tools. */
   hails: Hail,
-  /** Command (--role command) gets split_order. */
+  /** Command (--role command) gets split_order and reorder_orders. */
   role?: Role,
 ) {
   const dropped = () => Promise.resolve(text("dropped: this session was paused or stopped before the call arrived", true));
@@ -1250,6 +1325,21 @@ function combadgeServer(
               a.option === 0
                 ? text(`Split approved; the bridge created child orders ${a.decision}.`)
                 : text(`Split not approved: ${a.decision || "denied by the captain"}`, true),
+            ),
+        ),
+        tool(
+          "reorder_orders",
+          `Ask the captain to change when and from what orders nobody has started yet will run (at most ${MAX_REORDER_CHANGES} orders). ` +
+            "Each change names an order by id, with onto, its new base_ref (order:<id> starts it from that order's work once that order is done, a branch or commit starts it from there), " +
+            "and after_add and after_remove, orders it waits on to add or drop; an order:<id> base already waits on that order. " +
+            "Give the reason. This waits for the captain. When it is approved, the bridge applies each change it still can, and the result says what applied and what was skipped: " +
+            "an order a crew member started meanwhile is skipped.",
+          reorderOrdersInput,
+          async (input, extra) =>
+            ask(reorderHail(input), extra, (a) =>
+              a.option === 0
+                ? text(`Reorder approved; the bridge ${a.decision}.`)
+                : text(`Reorder not applied: ${a.decision || "denied by the captain"}`, true),
             ),
         ),
       ]
@@ -1501,7 +1591,7 @@ function instructions(order: Order, checkout: RepoCheckout, role?: Role): string
   ];
   if (role === "command") {
     lines.push(
-      `You are Command. When this order is too big for one crew member, split it with mcp__${MCP_SERVER}__split_order: each child becomes an order of its own, for whoever its division sends. Children run side by side unless a child's after names earlier children it must wait for. The captain approves every split.`,
+      `You are Command. When this order is too big for one crew member, split it with mcp__${MCP_SERVER}__split_order: each child becomes an order of its own, for whoever its division sends. Children run side by side unless a child's after names earlier children it must wait for. The captain approves every split. To change the base or the wait of orders nobody has started yet, use mcp__${MCP_SERVER}__reorder_orders; the captain approves it too.`,
     );
   }
   if (order.body.dossier) lines.push("", "Your dossier (conventions learned on earlier orders):", order.body.dossier);

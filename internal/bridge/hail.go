@@ -126,6 +126,9 @@ type hailRouting struct {
 	// InvalidSplit is why an order_split hail is malformed (checkSplit):
 	// deny-split decides it by policy at once.
 	InvalidSplit string `json:",omitempty"`
+	// InvalidReorder is why an order_reorder hail is malformed
+	// (checkReorder): deny-reorder decides it by policy at once (#148).
+	InvalidReorder string `json:",omitempty"`
 	// InvalidRequest is why the bridge refuses a tracker request
 	// (checkTrackerRequest), no tracker included: deny-request decides it
 	// by policy at once.
@@ -162,7 +165,8 @@ func (c hailCheck) result() HailResult {
 //
 //   - classify reads the hail, its order and its crew member. A malformed
 //     order_split hail (checkSplit) is denied at once by policy
-//     (deny-split), with or without regs.yaml, and so is a tracker
+//     (deny-split), with or without regs.yaml, and so is a malformed
+//     order_reorder hail (checkReorder, deny-reorder) and a tracker
 //     request the bridge can't run (checkTrackerRequest: no tracker, a
 //     malformed context) (deny-request). Without regs.yaml every
 //     other hail is the captain's ("regs.yaml not configured").
@@ -189,6 +193,15 @@ func hailWorkflow(ctx dbos.Context, in HailInput) (HailResult, error) {
 		decided, err := dbos.RunAsStep(ctx, func(c context.Context) (bool, error) {
 			return daemonFrom(c).denySplit(c, in.HailID, r.InvalidSplit)
 		}, append([]dbos.StepOption{dbos.WithStepName("deny-split")}, storeRetries...)...)
+		if err != nil || decided {
+			return HailResult{Decided: decided, By: comms.DecidedByPolicy}, err
+		}
+		r.Open = false
+	}
+	if r.Open && r.InvalidReorder != "" {
+		decided, err := dbos.RunAsStep(ctx, func(c context.Context) (bool, error) {
+			return daemonFrom(c).denyReorder(c, in.HailID, r.InvalidReorder)
+		}, append([]dbos.StepOption{dbos.WithStepName("deny-reorder")}, storeRetries...)...)
 		if err != nil || decided {
 			return HailResult{Decided: decided, By: comms.DecidedByPolicy}, err
 		}
@@ -247,6 +260,12 @@ func (d *Daemon) classifyHail(ctx context.Context, id string) (hailRouting, erro
 	if h.Category == comms.CategoryOrderSplit {
 		// A malformed split is denied whatever regs.yaml says (#155).
 		if r.InvalidSplit, err = d.splitInvalid(ctx, h); err != nil || r.InvalidSplit != "" {
+			return r, err
+		}
+	}
+	if h.Category == comms.CategoryOrderReorder {
+		// A malformed reorder is denied whatever regs.yaml says (#148).
+		if r.InvalidReorder, err = d.reorderInvalid(ctx, h); err != nil || r.InvalidReorder != "" {
 			return r, err
 		}
 	}

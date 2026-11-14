@@ -3,6 +3,7 @@ package comms
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -326,6 +327,64 @@ func TestSchemaOrderSplit(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			require.Error(t, validate(sch, split(tc.fn)))
+		})
+	}
+}
+
+// An order_reorder hail (#148) carries options [allow, deny] and an
+// OrderReorderContext the schema checks.
+func TestSchemaOrderReorder(t *testing.T) {
+	sch := compileSchema(t)
+	reorder := func(fn func(body, ctx map[string]any)) []byte {
+		body := map[string]any{}
+		raw, err := json.Marshal(HailBody{Ref: "sdk-ORD-0001-1", Category: CategoryOrderReorder, Question: "Reorder 2 orders?",
+			Options: []string{OptionAllow, OptionDeny}})
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(raw, &body))
+		raw, err = json.Marshal(OrderReorderContext{Reason: "the API moved", Changes: []OrderReorderChange{
+			{Order: "ORD-0003", Onto: "order:ORD-0005"}, {Order: "ORD-0004", AfterAdd: []string{"ORD-0003"}, AfterRemove: []string{"ORD-0002"}},
+		}})
+		require.NoError(t, err)
+		ctx := map[string]any{}
+		require.NoError(t, json.Unmarshal(raw, &ctx))
+		body["context"] = ctx
+		fn(body, ctx)
+		m, err := json.Marshal(map[string]any{"v": 1, "seq": 3, "crew": "vance", "order": "ORD-0001", "type": "hail",
+			"ts": "2026-11-14T09:00:00Z", "body": body})
+		require.NoError(t, err)
+		return m
+	}
+	change := func(ctx map[string]any) map[string]any { return ctx["changes"].([]any)[0].(map[string]any) }
+	require.NoError(t, validate(sch, reorder(func(_, _ map[string]any) {})))
+	require.NoError(t, validate(sch, reorder(func(_, c map[string]any) { change(c)["onto"] = "main" })))
+
+	for _, tc := range []struct {
+		name string
+		fn   func(body, ctx map[string]any)
+	}{
+		{"no context", func(b, _ map[string]any) { delete(b, "context") }},
+		{"options reversed", func(b, _ map[string]any) { b["options"] = []string{OptionDeny, OptionAllow} }},
+		{"no reason", func(_, c map[string]any) { delete(c, "reason") }},
+		{"empty reason", func(_, c map[string]any) { c["reason"] = "" }},
+		{"no changes", func(_, c map[string]any) { c["changes"] = []any{} }},
+		{"eleven changes", func(_, c map[string]any) {
+			changes := make([]any, 11)
+			for i := range changes {
+				changes[i] = map[string]any{"order": fmt.Sprintf("ORD-%04d", i+1), "onto": "main"}
+			}
+			c["changes"] = changes
+		}},
+		{"a change asking for nothing", func(_, c map[string]any) { delete(change(c), "onto") }},
+		{"no order", func(_, c map[string]any) { delete(change(c), "order") }},
+		{"not an order id", func(_, c map[string]any) { change(c)["order"] = "ord-3" }},
+		{"empty onto", func(_, c map[string]any) { change(c)["onto"] = "" }},
+		{"after_add not an id", func(_, c map[string]any) { change(c)["after_add"] = []string{"main"} }},
+		{"after_remove repeated", func(_, c map[string]any) { change(c)["after_remove"] = []string{"ORD-0002", "ORD-0002"} }},
+		{"unknown change field", func(_, c map[string]any) { change(c)["repo"] = "app" }},
+		{"unknown context field", func(_, c map[string]any) { c["note"] = "x" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Error(t, validate(sch, reorder(tc.fn)))
 		})
 	}
 }
