@@ -27,9 +27,8 @@ Where the campaigns plan has gone stale:
 
 ### 1. Schema
 
-**Hails.** `order_id` and `crew_id` become nullable, and `hails` gains `deliver_to TEXT`: the workflow id of the bridge workflow that raised the hail, NULL for a hail from a beam. SQLite can't drop a `NOT NULL`, so an existing table has to be rebuilt or refused. The campaigns plan refuses it through a `requiredColumns` entry, the store's precedent for pre-release databases. I'd rebuild instead. Phase 4's backups (#112) and offline restore (#113) make the database something the captain keeps, and a refused database could not take a restored backup either.
+**Hails.** `order_id` and `crew_id` become nullable, and `hails` gains `deliver_to TEXT`: the workflow id of the bridge workflow that raised the hail, NULL for a hail from a beam. SQLite can't drop a `NOT NULL` in place. Nobody runs bmus on a database worth keeping yet, so this changes `schema.sql` directly, with no migration, and a `requiredColumns` entry for `hails.deliver_to` refuses an older database with a message to start a fresh one.
 
-`Open` rebuilds `hails` when `pragma_table_info` reports `order_id` as `NOT NULL`. It runs on one dedicated connection with `PRAGMA foreign_keys = OFF` set before `BEGIN`, in one transaction: create `hails_new` as `schema.sql` defines `hails`, copy every row, drop `hails`, rename `hails_new`, recreate `hails_countermand_until`, then `PRAGMA foreign_key_check` before the commit. `budget_extensions` and `order_egress` reference `hails` by name and keep working. Two processes opening the same old database race as `addColumn`'s do: the loser finds the new shape and does nothing. Open question 1 keeps the refusal on the table.
 
 A new unique index, `hails_deliver_to ON hails (deliver_to, category) WHERE deliver_to IS NOT NULL`, makes one hail per raiser and category. `store.Hail` scans the nullable columns as empty strings.
 
@@ -177,10 +176,10 @@ The default `regs.yaml` drops `tracker_create` from `captain_only`. The rules af
 
 ### 9. Stage 1 and Phase 4
 
-- **#142 and #143** don't depend on this stage, nor it on them. All three edit `schema.sql`, `store.Open` and the order views. `order_after` arrives through `CREATE TABLE IF NOT EXISTS` and sits beside the rebuild. Whichever lands second rebases.
+- **#142 and #143** don't depend on this stage, nor it on them. All three edit `schema.sql`, `store.Open` and the order views. `order_after` arrives through `CREATE TABLE IF NOT EXISTS`. Whichever lands second rebases.
 - **#125 (egress hails)** adds `checkEgressRequest` to classify and appends `- category: egress` after `tracker_comment`. If it lands first, its rule becomes `captain_only[7]` here, and its tests move with it. Egress hails always have an order.
 - **#128 (security review)** takes in both categories, the review card's rendering of agent text, and the triage answer's exposure to option rules.
-- **#112 and #113 (backups and restore)** are the reason for the rebuild in section 1. A backup taken before this stage restores and is rebuilt on the next open.
+- **#112 and #113 (backups and restore)**: a backup taken before this stage won't open after it, which is fine while nobody keeps a database.
 - **#127 (chaos)** could script findings and check that each order's findings are filed once. I'd add that after its exit run, outside this stage.
 - Command's consults spend tokens outside any order budget (Phase 4 plan, open question 3). Triage adds one consult per order with findings.
 
@@ -197,7 +196,7 @@ The default `regs.yaml` drops `tracker_create` from `captain_only`. The rules af
 ## Verification
 
 1. `go build ./... && go vet ./... && go test ./...`; `cd combadge && npm run build && npm test`; `cd web && npm test && npm run e2e`.
-2. Store: a database made from `testdata/schema-before-<n>.sql`, a copy of today's `schema.sql` with hails and budget extensions in it, opens twice. Its rows survive, `foreign_key_check` is clean, and `hails` matches a new database's columns. `InsertBridgeHail` twice returns one id. `RecordFinding` keeps, replaces and drops as section 3 says.
+2. Store: a database made from today's `schema.sql` is refused with the fresh-database message. `InsertBridgeHail` twice returns one id. `RecordFinding` keeps, replaces and drops as section 3 says.
 3. Regs: `tracker_review` routes to the captain under a `captain_only` rule for it, without one, unchecked, and under an `auto_allow` that fits any command. The default no longer lists `tracker_create`.
 4. Bridge, orderless: classify reads no order. The consult matches `consult.orderless.json`. `skip-advisory` closes a triage hail for each reason. `AnswerHail` wakes the raiser and sends no mission anything. A countermand of an orderless hail inside its window writes the row and sends nothing.
 5. Exit test (holodeck, fake tracker, default `regs.yaml`, Command scripted to answer `{}`): an order's script files five findings, two blocked by earlier keys and one by an existing issue, then reports. Once the order ends the fake holds five issues labelled `bmus:unreviewed` with those blockers, and a `tracker_review` hail is open. Answering `discard #2 #4` closes both as not planned and removes the label from the other three.
@@ -208,13 +207,15 @@ The default `regs.yaml` drops `tracker_create` from `captain_only`. The rules af
 10. CLI and console: `bmus hails review` with and without flags and its bad requests; vitest for `ReviewCard`; Playwright answers a review from the page.
 11. Manual, once: one order on a real bridge files two findings to a scratch GitHub repository, and the review keeps one and discards the other.
 
-## Open questions
+## Decisions
 
-1. **Rebuild or refuse the hails table?** I'd rebuild (section 1). Refusing is a two-line `requiredColumns` entry and matches every earlier change of this kind, at the cost of the captain's database and any backup taken before it.
-2. **Should `default_option` ever decide a review?** I'd keep `tracker_review` fixed to the captain with no timeout. If captains leave reviews open for weeks, a separate "unanswered means keep after N days" could come later.
-3. **Should a failed or belayed order's findings be filed?** I'd file them: the review lets the captain discard noise, and a belay says nothing about whether a finding is true.
-4. **Should a skipped triage ask the captain instead?** I'd skip it. The captain already reviews every issue, and a second hail per order costs more attention than duplicates do.
-5. **Are 20 findings per order and 200 backlog items the right caps?** They are starting points.
+The captain settled the open questions on 2026-11-14:
+
+1. **No migration.** The hails change goes into `schema.sql` directly and an older database is refused (section 1).
+2. **`tracker_review` stays fixed to the captain**, with no timeout.
+3. **A failed or belayed order's findings are filed.**
+4. **A skipped triage files everything** without asking the captain.
+5. **The caps stand:** 20 findings per order and 200 backlog items.
 
 ## Assumptions
 
