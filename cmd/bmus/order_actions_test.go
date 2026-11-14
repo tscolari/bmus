@@ -216,6 +216,30 @@ func TestOrderAfter(t *testing.T) {
 		"after ORD-0001: it ended withdrawn and will never be done")
 }
 
+// An order based on order:<id> (#143) waits on that order; an unknown
+// order, a malformed id and a repo the order doesn't work on are refused.
+func TestOrderBaseCLI(t *testing.T) {
+	t.Parallel()
+	e := newE2E(t)
+	e.startBridge(t)
+	dir := t.TempDir()
+	file := func(name, base string) string {
+		p := filepath.Join(dir, name+".yaml")
+		require.NoError(t, os.WriteFile(p, []byte("title: "+name+"\ndivision: ops\nrepos:\n  - name: app\n    base_ref: "+base+"\n"), 0o600))
+		return p
+	}
+	require.Equal(t, "ORD-0001\n", e.run(t, "order", "create", file("first", "main")))
+	require.Contains(t, e.fail(t, "order", "create", file("unknown", "order:ORD-0009")), "repo app: base_ref order:ORD-0009: no such order")
+	require.Contains(t, e.fail(t, "order", "create", file("malformed", "order:first")),
+		`repo app: base_ref "order:first": order: takes an order's id, such as order:ORD-0001`)
+	require.Equal(t, "ORD-0002\n", e.run(t, "order", "create", file("second", "order:ORD-0001")))
+	require.Regexp(t, `(?m)^ORD-0002\s+pool\s+waiting on ORD-0001\s`, e.run(t, "order", "list"))
+	var orders bridge.OrderListResult
+	e.runJSON(t, &orders, "order", "list")
+	require.Equal(t, []string{"ORD-0001"}, orders.Orders[1].After)
+	require.Equal(t, []bridge.OrderRepo{{Name: "app", BaseRef: "order:ORD-0001"}}, orders.Orders[1].Repos)
+}
+
 // order list's PROGRESS cell: "waiting on" an unclaimed order's afters not
 // yet done (#142), else its progress.
 func TestProgressCellWaiting(t *testing.T) {

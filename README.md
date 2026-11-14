@@ -65,9 +65,9 @@ A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026
 
 ### Campaigns
 
-- [ ] Stage 1: chain orders, so one waits for another and starts from its work
+- [x] Stage 1: chain orders, so one waits for another and starts from its work
   - [x] An order waits for the orders in its `after` ([#142](https://github.com/tscolari/bmus/issues/142))
-  - [ ] An order starts from another order's work ([#143](https://github.com/tscolari/bmus/issues/143))
+  - [x] An order starts from another order's work ([#143](https://github.com/tscolari/bmus/issues/143))
 - [ ] Stage 2: crew file findings as issues, and you discard the ones you don't want
 - [ ] Stage 3: `bmus campaign run --issue <ref>` implements, reviews, fixes and lands one task
 - [ ] Stage 4: run a campaign over a backlog query with an in-flight limit, respecting blockers
@@ -158,6 +158,17 @@ An order can wait for others: `after: [ORD-0001]` in the file, or `--after ORD-0
 
 ```sh
 ./bmus order create migrate.yaml --after ORD-0001
+```
+
+An order can also start from another order's work. With `base_ref: order:ORD-0001` on a repo, the order starts from the commit ORD-0001 brought back on that repo, on its own `bmus/<order>` branch, and waits for ORD-0001 as if `after` named it. The bridge refuses an order it doesn't have, an id that isn't one (`order:ORD-0001` is the form), an order that doesn't work on that repo or ended without work on it, one whose branch `bmus jettison` deleted, and a split order, naming its children to base on instead. Splitting an order withdraws the unclaimed orders based on it. If the commit is missing from the bridge's clone when the order starts, the order fails with `repo_failed`. An order that resumes from its own checkpoint starts from that checkpoint. `bmus jettison` keeps ORD-0001's branch while an open order names it, and the mission report shows the base as `order:ORD-0001 (<commit>)`.
+
+```yaml
+title: Run the schema migration
+division: ops
+repos:
+  - name: bmus
+    base_ref: order:ORD-0001          # starts from ORD-0001's work, once it is done
+body: Run the migration ORD-0001 drafted.
 ```
 
 To change course on an order:

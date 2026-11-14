@@ -708,6 +708,9 @@ var ErrParentEnded = errors.New("parent order no longer away")
 // step that made them makes no more. The parent must be away or hailing
 // (ErrParentEnded, wrapped, otherwise); a missing parent returns
 // sql.ErrNoRows.
+//
+// The same transaction withdraws the unclaimed orders based on the
+// parent's work, order:<parent> (cascadeBase, #143).
 func (s *Store) InsertChildOrders(ctx context.Context, parent, createdBy string, children []Order,
 	entry func(ids []string) (LogEntry, error)) (ids []string, err error) {
 	if createdBy == "" {
@@ -749,13 +752,96 @@ func (s *Store) InsertChildOrders(ctx context.Context, parent, createdBy string,
 			return err
 		}
 		e.OrderID = parent
-		_, err = s.appendLog(ctx, tx, e)
-		return err
+		if _, err = s.appendLog(ctx, tx, e); err != nil {
+			return err
+		}
+		return s.cascadeBase(ctx, tx, parent, ids)
 	})
 	if err != nil {
 		return nil, err
 	}
 	return ids, nil
+}
+
+// OrderBasePrefix starts a repo's base_ref that names another order's
+// work (#143): order:<id>.
+const OrderBasePrefix = "order:"
+
+// cascadeBase withdraws, in tx, the unclaimed orders (pool or directed, no
+// parked mission) with a repo based on order:<parent>, which has just been
+// split into children (#143): a split order brings back no work of its
+// own. Each is logged "order withdrawn: ORD-0001 was split into ORD-0003,
+// ORD-0004: base it on one of them" (kind order, payload reason and base),
+// in rowid order, and its withdraw cascades to the orders waiting on it
+// (settleFamily). A claimed dependent is left alone; its ship-repos fails
+// with repo_failed. Each order withdrawn is added to ctx's AfterCascade,
+// if any.
+func (s *Store) cascadeBase(ctx context.Context, tx *sql.Tx, parent string, children []string) error {
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT o.id, o.assignee, o.rowid FROM order_repos r JOIN orders o ON o.id = r.order_id
+		WHERE r.base_ref = ? AND o.state IN (?, ?) AND o.parked_at IS NULL ORDER BY o.rowid`,
+		OrderBasePrefix+parent, OrderPool, OrderDirected)
+	if err != nil {
+		return err
+	}
+	type dep struct{ ID, Assignee string }
+	var deps []dep
+	for rows.Next() {
+		var d dep
+		var rowid int64
+		if err := rows.Scan(&d.ID, &d.Assignee, &rowid); err != nil {
+			rows.Close()
+			return err
+		}
+		deps = append(deps, d)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(deps) == 0 {
+		return err
+	}
+	reason := SplitBaseText(parent, children)
+	payload, err := json.Marshal(map[string]string{"reason": reason, "base": parent})
+	if err != nil {
+		return err
+	}
+	col, _ := ctx.Value(afterCascadeKey{}).(*AfterCascade)
+	for _, d := range deps {
+		at := col.add(d.ID)
+		withdrawn, err := s.withdraw(ctx, tx, d.ID, LogEntry{Kind: logKindOrder, CrewID: d.Assignee, OrderID: d.ID,
+			Text: "order withdrawn: " + reason, Payload: payload})
+		if err != nil {
+			return err
+		}
+		if !withdrawn {
+			col.dropAt(at) // an earlier dependent's chain withdrew it
+		}
+	}
+	return nil
+}
+
+// SplitBaseText says that order id, named as a base (#143), was split into
+// children: "ORD-0001 was split into ORD-0003, ORD-0004: base it on one of
+// them".
+func SplitBaseText(id string, children []string) string {
+	return id + " was split into " + strings.Join(children, ", ") + ": base it on one of them"
+}
+
+// ChildIDs returns the ids of order parent's child orders, in creation
+// order; none when it has none.
+func (s *Store) ChildIDs(ctx context.Context, parent string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM orders WHERE parent_id = ? ORDER BY rowid`, parent)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // ChildBatch returns the ids of order parent's children created by

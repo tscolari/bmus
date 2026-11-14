@@ -143,6 +143,15 @@ orders take exactly one:
     - name: app
       base_ref: main
 
+base_ref: order:ORD-0001 starts from another order's work: the commit
+ORD-0001 brought back on the same repo. It adds ORD-0001 to after, so the
+order waits until ORD-0001 is done. The bridge refuses an order it doesn't
+have, one that doesn't work on that repo or ended without work on it, one
+whose branch was jettisoned, a split order (base it on a child) and an id
+that isn't one. Splitting an order withdraws the unclaimed orders based
+on it. The bridge fails the mission with repo_failed if that commit isn't
+in its clone when the order starts.
+
 after lists orders this one waits on, by id: no crew member claims it until
 each has ended done. --after adds one (repeatable). The bridge refuses an
 after naming no order, or one that already ended failed, belayed or

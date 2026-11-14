@@ -14,6 +14,8 @@ package bridge
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -137,8 +139,207 @@ func (d *Daemon) checkOrderRepos(repos []store.OrderRepo) error {
 		if strings.HasPrefix(r.BaseRef, "-") {
 			return badRequest("repo %s: base_ref %q must not start with '-'", r.Name, r.BaseRef)
 		}
+		if id, ok := orderBase(r.BaseRef); ok && !orderIDRE.MatchString(id) {
+			return badRequest("repo %s: base_ref %q: %s takes an order's id, such as %sORD-0001", r.Name, r.BaseRef, orderBasePrefix, orderBasePrefix)
+		}
 	}
 	return nil
+}
+
+// orderBasePrefix starts a base_ref naming another order's work (#143):
+// order:<id> starts the work from the commit order <id>'s done entry
+// records for the same repo.
+const orderBasePrefix = store.OrderBasePrefix
+
+// orderIDRE matches an order id as the store makes them (ORD-%04d).
+var orderIDRE = regexp.MustCompile(`^ORD-[0-9]{4,}$`)
+
+// orderBase returns the order id a base_ref of the form order:<id> names,
+// and whether it has that form. git refs can't hold ':', so no git ref
+// has it.
+func orderBase(baseRef string) (string, bool) {
+	return strings.CutPrefix(baseRef, orderBasePrefix)
+}
+
+// checkOrderBases checks the repos whose base_ref is order:<id> (#143)
+// against the store and the bridge's clone, and returns those orders' ids,
+// each once, for the new order's after. The named order must exist and
+// must not have ended failed, belayed or withdrawn, nor have been split
+// (splitWhy): a split order brings back no work of its own. A done order's
+// done entry must name the repo with its work fetched into the clone
+// (orderWork), its branch must not have been jettisoned, and the commit
+// must be in the clone. An open order must list the repo among its own
+// repos; its work is checked when the new order is shipped. Each refusal
+// is a bad request.
+func (d *Daemon) checkOrderBases(ctx context.Context, repos []store.OrderRepo) ([]string, error) {
+	var ids []string
+	for _, r := range repos {
+		id, ok := orderBase(r.BaseRef)
+		if !ok {
+			continue
+		}
+		refuse := func(why string) error { return badRequest("repo %s: base_ref %s: %s", r.Name, r.BaseRef, why) }
+		o, err := d.store.GetOrder(ctx, id)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, refuse("no such order")
+		}
+		if err != nil {
+			return nil, err
+		}
+		if o.State == store.OrderFailed || o.State == store.OrderBelayed || o.State == store.OrderWithdrawn {
+			return nil, refuse("it ended " + o.State + " and will never be done")
+		}
+		split, err := d.splitWhy(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case split != "":
+			return nil, refuse(split)
+		case o.State == store.OrderSplit:
+			return nil, refuse("it was split, so its work is in its child orders; name one of them")
+		case o.State == store.OrderDone:
+			why, err := d.doneBaseWhy(ctx, id, r.Name)
+			if err != nil {
+				return nil, err
+			}
+			if why != "" {
+				return nil, refuse(why)
+			}
+		case !slices.ContainsFunc(o.Repos, func(or store.OrderRepo) bool { return or.Name == r.Name }):
+			return nil, refuse(fmt.Sprintf("%s doesn't work on repo %s", id, r.Name))
+		}
+		if !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+// splitWhy says, for an order with child orders, that it was split and
+// into which (store.SplitBaseText); "" for an order with none.
+func (d *Daemon) splitWhy(ctx context.Context, id string) (string, error) {
+	children, err := d.store.ChildIDs(ctx, id)
+	if err != nil || len(children) == 0 {
+		return "", err
+	}
+	return store.SplitBaseText(id, children), nil
+}
+
+// doneBaseWhy says why done order id's work on repo can't be a new
+// order's base at create: orderWork's reasons, its branch jettisoned
+// (branchJettisoned), or its commit missing from the clone. "" when it
+// can.
+func (d *Daemon) doneBaseWhy(ctx context.Context, id, repo string) (string, error) {
+	commit, why, err := d.orderWork(ctx, id, repo)
+	if err != nil || why != "" {
+		return why, err
+	}
+	dir := d.repoDir(repo)
+	_, rerr := runGit(ctx, dir, "rev-parse", "--verify", "--quiet", "--end-of-options", "refs/heads/"+orderBranch(id)+"^{commit}")
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	at, jettisoned, err := d.branchJettisoned(ctx, id, repo, rerr)
+	if err != nil {
+		return "", err
+	}
+	if jettisoned {
+		return fmt.Sprintf("%s's branch was jettisoned on %s; its work may be gone", id, at.UTC().Format(time.DateOnly)), nil
+	}
+	if _, err := runGit(ctx, dir, "rev-parse", "--verify", "--quiet", "--end-of-options", commit+"^{commit}"); err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return fmt.Sprintf("%s's commit %s is not in the bridge's clone of %s", id, commit[:12], repo), nil
+	}
+	return "", nil
+}
+
+// orderWork returns the commit done order id's done entry records for
+// repo: its work as fetched into the bridge's clone. why says, when it
+// isn't there, what is missing: no done entry (an order settled done
+// without a report of its own), no work on repo, work that was rejected
+// or never fetched, or no full commit id. err is for a store that can't
+// be read.
+func (d *Daemon) orderWork(ctx context.Context, id, repo string) (commit, why string, err error) {
+	e, err := d.store.LastOrderLog(ctx, id, logDone)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", id + " brought back no work of its own", nil
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("order %s's done entry: %w", id, err)
+	}
+	var p donePayload
+	if err := json.Unmarshal(e.Payload, &p); err != nil {
+		return "", "", fmt.Errorf("order %s's done entry: %w", id, err)
+	}
+	i := slices.IndexFunc(p.Repos, func(l landedRepo) bool { return l.Name == repo })
+	if i < 0 {
+		return "", fmt.Sprintf("%s brought back no work on repo %s", id, repo), nil
+	}
+	l := p.Repos[i]
+	switch {
+	case l.RejectError != "":
+		return "", fmt.Sprintf("%s's work on repo %s was rejected and never fetched into the bridge's clone", id, repo), nil
+	case l.FetchError != "":
+		return "", fmt.Sprintf("%s's work on repo %s could not be fetched into the bridge's clone", id, repo), nil
+	case !fullCommitRE.MatchString(l.Commit):
+		return "", fmt.Sprintf("%s's done entry has no commit for repo %s", id, repo), nil
+	}
+	return l.Commit, "", nil
+}
+
+// orderBaseCommit resolves base_ref order:<id> for repo name, whose clone
+// is dir, to the commit order <id>'s done entry records for the repo
+// (#143). The order must be done and not split (splitWhy), its done entry
+// must name the repo (orderWork), and the commit must be in the clone
+// with every object it reaches (`git rev-list --objects`), so the bundle
+// can be made. Each of those failing is errRepoPermanent: the mission
+// fails with repo_failed instead of retrying.
+func (d *Daemon) orderBaseCommit(ctx context.Context, dir, name, baseRef string) (string, error) {
+	id, _ := orderBase(baseRef)
+	permanent := func(why string) error { return fmt.Errorf("base_ref %s: %s: %w", baseRef, why, errRepoPermanent) }
+	o, err := d.store.GetOrder(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", permanent("no such order")
+	}
+	if err != nil {
+		return "", err
+	}
+	split, err := d.splitWhy(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if split != "" {
+		return "", permanent(split)
+	}
+	if o.State != store.OrderDone {
+		return "", permanent(fmt.Sprintf("%s is %s, not done", id, o.State))
+	}
+	commit, why, err := d.orderWork(ctx, id, name)
+	if err != nil {
+		return "", err
+	}
+	if why != "" {
+		return "", permanent(why)
+	}
+	if _, err := runGit(ctx, dir, "rev-parse", "--verify", "--quiet", "--end-of-options", commit+"^{commit}"); err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if refMissing(err) {
+			return "", permanent(fmt.Sprintf("%s's commit %s is not in the bridge's clone of %s", id, commit[:12], name))
+		}
+		return "", err
+	}
+	if _, err := runGit(ctx, dir, "rev-list", "--objects", "--quiet", "--end-of-options", commit); err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", permanent(fmt.Sprintf("%s's work at %s is incomplete in the bridge's clone of %s: %s", id, commit[:12], name, firstLine(err.Error())))
+	}
+	return commit, nil
 }
 
 // orderBranch is the branch an order works on, in the bridge's clone and on
@@ -173,7 +374,8 @@ var errTourEnded = errors.New("the crew member's tour ended")
 // The work starts from the order's latest checkpoint (#100): a resumed
 // order picks up on its new beam where the old one stopped. When the order
 // has no checkpoint, or the check of every checkpoint's bundle rejects it
-// (see bundleRepoFrom), it starts from base_ref. The checkpoint's note goes
+// (see bundleRepoFrom), it starts from base_ref, or from another order's
+// work for a base_ref of order:<id> (#143). The checkpoint's note goes
 // into the order as its handover. Orders take one repo, so the first
 // repo's checkpoint is the order's.
 //
@@ -313,6 +515,12 @@ func (d *Daemon) bundleRepo(ctx context.Context, name, url, orderID, baseRef, ou
 // older one is tried, and base_ref last, as bundleRepo does. It returns the
 // commit and the checkpoint shipped from, nil for base_ref. A checkpoint
 // without a bundle for name is skipped.
+//
+// A base_ref of order:<id> (#143) starts from the commit order <id>'s
+// done entry records for the repo (orderBaseCommit), with no fetch: that
+// work is in the clone already. It is read only when no checkpoint is
+// shipped, so an order that resumes from its own checkpoint never looks
+// at it again.
 func (d *Daemon) bundleRepoFrom(ctx context.Context, in MissionInput, name, url, baseRef, out string, cps []store.Checkpoint) (string, *store.Checkpoint, error) {
 	unlock, err := d.lockRepo(ctx, name)
 	if err != nil {
@@ -370,7 +578,15 @@ func (d *Daemon) bundleRepoFrom(ctx context.Context, in MissionInput, name, url,
 		}
 	}
 
-	if from == nil {
+	if _, ok := orderBase(baseRef); ok && from == nil {
+		// Another order's work (#143) is already in the clone: no fetch.
+		if commit, err = d.orderBaseCommit(ctx, dir, name, baseRef); err != nil {
+			return "", nil, err
+		}
+		if _, err := runGit(ctx, dir, "update-ref", branch, commit); err != nil {
+			return "", nil, err
+		}
+	} else if from == nil {
 		// Tags are forced too: an upstream that moves a tag must not make every
 		// later fetch fail with "would clobber existing tag".
 		fctx, cancel := context.WithTimeout(ctx, gitFetchTimeout)
