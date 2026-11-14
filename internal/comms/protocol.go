@@ -128,12 +128,14 @@ type OrderSplitContext struct {
 
 // OrderSplitChild is one child order of an order_split hail. An empty
 // Division and a nil Priority take the parent order's. Priority is 0
-// routine, 1 yellow or 2 red.
+// routine, 1 yellow or 2 red. After names earlier children of the same
+// split by their 0-based index: the child waits until each is done (#142).
 type OrderSplitChild struct {
 	Title    string `json:"title"`
 	Body     string `json:"body"`
 	Division string `json:"division,omitempty"`
 	Priority *int   `json:"priority,omitempty"`
+	After    []int  `json:"after,omitempty"`
 }
 
 // Options of a tool_approval hail, in this order. AnswerBody.Option 0

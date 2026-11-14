@@ -84,6 +84,8 @@ export interface OrderSplitChild {
   division?: string;
   /** 0 routine, 1 yellow, 2 red. */
   priority?: number;
+  /** Earlier children of the same split, by 0-based index, this one waits on until each is done (#142). */
+  after?: number[];
 }
 
 /** An order_split hail's context. */

@@ -442,7 +442,7 @@ describe("sdk harness", () => {
     const dir = tempDir();
     const children = [
       { title: "API half", body: "Build the API.", division: "ops", priority: "yellow" },
-      { title: "UI half", body: "Build the UI." },
+      { title: "UI half", body: "Build the UI.", after: [0, 0] },
     ];
     const run = start(async function* (agent) {
       yield init;
@@ -461,6 +461,10 @@ describe("sdk harness", () => {
         [{ title: "a\nb", body: "b" }],
         [{ title: "t", body: "" }],
         [{ title: "t", body: "b", priority: "urgent" }],
+        // after names earlier children only (#142).
+        [{ title: "t", body: "b", after: [0] }],
+        [{ title: "t", body: "b" }, { title: "u", body: "b", after: [2] }],
+        [{ title: "t", body: "b" }, { title: "u", body: "b", after: [-1] }],
       ]) {
         expect((await agent.callTool("split_order", { children: bad })).isError).toBe(true);
       }
@@ -472,13 +476,13 @@ describe("sdk harness", () => {
       body: {
         ref: `sdk-${ORDER}-1`,
         category: "order_split",
-        question: `Split ${ORDER} into 2 child orders? 1. API half (ops, yellow); 2. UI half (this order's division, this order's priority)`,
+        question: `Split ${ORDER} into 2 child orders? 1. API half (ops, yellow); 2. UI half (this order's division, this order's priority, after 1)`,
         options: ["allow", "deny"],
         context: {
           parent: ORDER,
           children: [
             { title: "API half", body: "Build the API.", division: "ops", priority: 1 },
-            { title: "UI half", body: "Build the UI." },
+            { title: "UI half", body: "Build the UI.", after: [0] },
           ],
         },
       },

@@ -178,4 +178,59 @@ func TestBelayLine(t *testing.T) {
 	require.Equal(t, "order ORD-0001 belay requested, and its 2 open child orders", line(2))
 	split := bridge.OrderBelayResult{OrderView: bridge.OrderView{ID: "ORD-0001", State: store.OrderBelayed}, Children: 2, Belayed: true}
 	require.Equal(t, "order ORD-0001 belayed, and its 2 open child orders", belayLine(split))
+	// The orders waiting on it it withdraws (#142).
+	split.Waiting = []string{"ORD-0005"}
+	require.Equal(t, "order ORD-0001 belayed, and its 2 open child orders, and 1 order waiting on it (ORD-0005)", belayLine(split))
+	waiting := bridge.OrderBelayResult{OrderView: bridge.OrderView{ID: "ORD-0001"}, Waiting: []string{"ORD-0002", "ORD-0003"}}
+	require.Equal(t, "order ORD-0001 belay requested, and 2 orders waiting on it (ORD-0002, ORD-0003)", belayLine(waiting))
+}
+
+// #142's acceptance through the CLI: an order created with --after waits,
+// and `bmus order list` shows "waiting on ORD-0001" in its PROGRESS cell;
+// an after the bridge refuses fails the create. Withdrawing the first
+// withdraws the one waiting on it.
+func TestOrderAfter(t *testing.T) {
+	t.Parallel()
+	e := newE2E(t)
+	e.startBridge(t)
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.yaml")
+	require.NoError(t, os.WriteFile(first, []byte("title: first\ndivision: ops\nrepos:\n  - name: app\n    base_ref: main\n"), 0o600))
+	second := filepath.Join(dir, "second.yaml")
+	require.NoError(t, os.WriteFile(second, []byte("title: second\ndivision: ops\nrepos:\n  - name: app\n    base_ref: main\n"), 0o600))
+	require.Equal(t, "ORD-0001\n", e.run(t, "order", "create", first))
+	require.Contains(t, e.fail(t, "order", "create", second, "--after", "ORD-0404"), "after ORD-0404: no such order")
+	require.Equal(t, "ORD-0002\n", e.run(t, "order", "create", second, "--after", "ORD-0001"))
+	require.Regexp(t, `(?m)^ORD-0001\s+pool\s+-\s+-\s+-\s+ops\s+first\nORD-0002\s+pool\s+waiting on ORD-0001\s+-\s+-\s+ops\s+second\n`,
+		e.run(t, "order", "list"))
+	var orders bridge.OrderListResult
+	e.runJSON(t, &orders, "order", "list")
+	require.Equal(t, []string{"ORD-0001"}, orders.Orders[1].After)
+	require.Equal(t, []string{"ORD-0001"}, orders.Orders[1].WaitingOn)
+	require.Empty(t, orders.Orders[0].After)
+
+	require.Equal(t, "order ORD-0001 withdrawn, and 1 order waiting on it (ORD-0002)\n", e.run(t, "order", "withdraw", "ORD-0001"))
+	e.runJSON(t, &orders, "order", "list")
+	require.Equal(t, store.OrderWithdrawn, orders.Orders[1].State, "withdrawn with the order it waits on")
+	require.Contains(t, e.fail(t, "order", "create", second, "--after", "ORD-0001"),
+		"after ORD-0001: it ended withdrawn and will never be done")
+}
+
+// order list's PROGRESS cell: "waiting on" an unclaimed order's afters not
+// yet done (#142), else its progress.
+func TestProgressCellWaiting(t *testing.T) {
+	t.Parallel()
+	pct := 40.0
+	for _, tc := range []struct {
+		o    bridge.OrderView
+		want string
+	}{
+		{bridge.OrderView{State: store.OrderPool, WaitingOn: []string{"ORD-0001"}}, "waiting on ORD-0001"},
+		{bridge.OrderView{State: store.OrderDirected, WaitingOn: []string{"ORD-0001", "ORD-0003"}}, "waiting on ORD-0001, ORD-0003"},
+		{bridge.OrderView{State: store.OrderPool, After: []string{"ORD-0001"}, WaitingOn: []string{}}, "-"},
+		{bridge.OrderView{State: store.OrderAway, WaitingOn: []string{"ORD-0001"}, ProgressPct: &pct}, "40%"},
+		{bridge.OrderView{State: store.OrderWithdrawn, WaitingOn: []string{"ORD-0001"}}, "-"},
+	} {
+		require.Equal(t, tc.want, progressCell(tc.o), "%+v", tc.o)
+	}
 }

@@ -66,6 +66,8 @@ A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026
 ### Campaigns
 
 - [ ] Stage 1: chain orders, so one waits for another and starts from its work
+  - [x] An order waits for the orders in its `after` ([#142](https://github.com/tscolari/bmus/issues/142))
+  - [ ] An order starts from another order's work ([#143](https://github.com/tscolari/bmus/issues/143))
 - [ ] Stage 2: crew file findings as issues, and you discard the ones you don't want
 - [ ] Stage 3: `bmus campaign run --issue <ref>` implements, reviews, fixes and lands one task
 - [ ] Stage 4: run a campaign over a backlog query with an in-flight limit, respecting blockers
@@ -150,6 +152,12 @@ body: Find out why CI fails one run in ten and fix it.
 ./bmus crew add tuvok --name Tuvok --division ops
 ./bmus standing-orders on
 ./bmus order create pool.yaml
+```
+
+An order can wait for others: `after: [ORD-0001]` in the file, or `--after ORD-0001` (repeatable). No crew member claims it until each of those orders is done, and a split order counts as done only once all its children are. `bmus order list` shows it as `waiting on ORD-0001` in the PROGRESS column, and the console's open orders say the same. The bridge refuses an `after` naming no order, or one that already ended failed, belayed or withdrawn. If one ends that way later, the bridge withdraws the waiting order, and the orders waiting on that one in turn. An order a crew member has already claimed runs on.
+
+```sh
+./bmus order create migrate.yaml --after ORD-0001
 ```
 
 To change course on an order:

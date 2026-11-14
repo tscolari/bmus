@@ -22,6 +22,7 @@ func TestStatusConditions(t *testing.T) {
 		name      string
 		crew      []store.Crew
 		red       []string // open red orders
+		redWait   map[string][]string
 		login     string   // the login's reason
 		waits     []string // crew members whose provisioning waits for a login
 		command   bool     // Command down
@@ -48,6 +49,9 @@ func TestStatusConditions(t *testing.T) {
 			condition: ConditionGreen, reasons: []string{}},
 		{name: "red alert", red: []string{"ORD-0002", "ORD-0005"},
 			condition: ConditionRed, reasons: []string{"ORD-0002 red alert", "ORD-0005 red alert"}},
+		{name: "red alert waiting on others", red: []string{"ORD-0002", "ORD-0005"},
+			redWait: map[string][]string{"ORD-0005": {"ORD-0001", "ORD-0003"}}, condition: ConditionRed,
+			reasons: []string{"ORD-0002 red alert", "ORD-0005 red alert (waiting on ORD-0001, ORD-0003)"}},
 		{name: "red alert after sickbay, outranking hailing",
 			crew: []store.Crew{crew("kirk", store.CrewHailing, "b1"), crew("sorell", store.CrewSickbay, "")},
 			red:  []string{"ORD-0001"}, condition: ConditionRed, reasons: []string{"sorell in sickbay", "ORD-0001 red alert"},
@@ -85,7 +89,7 @@ func TestStatusConditions(t *testing.T) {
 			for _, id := range tc.waits {
 				waits[id] = true
 			}
-			s := statusOf(store.StatusSnapshot{Crew: tc.crew, RedOrders: tc.red, CommandDown: tc.command}, tc.login, waits)
+			s := statusOf(store.StatusSnapshot{Crew: tc.crew, RedOrders: tc.red, RedWaiting: tc.redWait, CommandDown: tc.command}, tc.login, waits)
 			require.Equal(t, tc.condition, s.Condition)
 			require.Equal(t, tc.reasons, s.Reasons)
 			require.Equal(t, tc.counts, s.Crew)
@@ -120,6 +124,7 @@ func TestStatusReadsStore(t *testing.T) {
 		{Title: "done", State: store.OrderDone, Priority: store.PriorityRed},
 		{Title: "failed", State: store.OrderFailed},
 		{Title: "red pool", Priority: store.PriorityRed},
+		{Title: "red waiting", Priority: store.PriorityRed, After: []string{"ORD-0003", "ORD-0004"}},
 	} {
 		_, err := st.InsertOrder(ctx, o, e)
 		require.NoError(t, err)
@@ -136,10 +141,10 @@ func TestStatusReadsStore(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, BridgeStatus{
 		Condition: ConditionRed,
-		Reasons:   []string{"kirk in sickbay", "ORD-0001 red alert", "ORD-0006 red alert"},
+		Reasons:   []string{"kirk in sickbay", "ORD-0001 red alert", "ORD-0006 red alert", "ORD-0007 red alert (waiting on ORD-0003)"},
 		Info:      []string{"regs.yaml not configured"},
 		Crew:      CrewCounts{Hailing: 1, Sickbay: 1},
-		Orders:    OrderCounts{Open: 3, Away: 1},
+		Orders:    OrderCounts{Open: 4, Away: 1},
 		HailsOpen: 1,
 		BeamsLive: 1,
 		LastLogID: last,

@@ -1128,7 +1128,7 @@ func completeMission(ctx dbos.Context, in MissionInput, beam string, hail *openH
 		if err != nil {
 			return doneOutcome{}, err
 		}
-		current, _, err := d.store.SettleOrder(c, in.OrderID, state, entry, &late)
+		current, err := d.settleReport(c, in.OrderID, state, entry, late)
 		return doneOutcome{Split: state == store.OrderSplit && current == store.OrderSplit}, err
 	}, append([]dbos.StepOption{dbos.WithStepName("order-done")}, storeRetries...)...)
 	if err != nil {

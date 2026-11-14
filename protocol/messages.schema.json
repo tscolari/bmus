@@ -223,7 +223,8 @@
               "title": {"type": "string", "minLength": 1, "maxLength": 200},
               "body": {"type": "string", "minLength": 1},
               "division": {"description": "Absent: the parent order's.", "type": "string", "minLength": 1},
-              "priority": {"description": "0 routine, 1 yellow, 2 red. Absent: the parent order's.", "type": "integer", "minimum": 0, "maximum": 2}
+              "priority": {"description": "0 routine, 1 yellow, 2 red. Absent: the parent order's.", "type": "integer", "minimum": 0, "maximum": 2},
+              "after": {"description": "Earlier children of the same split, by 0-based index, this child waits on until each is done (#142). The bridge refuses its own or a later index.", "type": "array", "uniqueItems": true, "maxItems": 9, "items": {"type": "integer", "minimum": 0, "maximum": 8}}
             }
           }
         }

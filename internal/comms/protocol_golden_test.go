@@ -281,7 +281,7 @@ func TestSchemaOrderSplit(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, json.Unmarshal(raw, &body))
 		raw, err = json.Marshal(OrderSplitContext{Parent: "ORD-0001", Children: []OrderSplitChild{
-			{Title: "API", Body: "the API half", Division: "ops", Priority: &yellow}, {Title: "UI", Body: "the UI half"},
+			{Title: "API", Body: "the API half", Division: "ops", Priority: &yellow}, {Title: "UI", Body: "the UI half", After: []int{0}},
 		}})
 		require.NoError(t, err)
 		ctx := map[string]any{}
@@ -316,6 +316,12 @@ func TestSchemaOrderSplit(t *testing.T) {
 		{"no body", func(_, c map[string]any) { delete(child(c), "body") }},
 		{"priority 3", func(_, c map[string]any) { child(c)["priority"] = 3 }},
 		{"unknown child field", func(_, c map[string]any) { child(c)["assignee"] = "sorell" }},
+		{"after not a list", func(_, c map[string]any) { child(c)["after"] = 0 }},
+		{"after negative", func(_, c map[string]any) { child(c)["after"] = []int{-1} }},
+		{"after repeated", func(_, c map[string]any) { child(c)["after"] = []int{0, 0} }},
+		{"after not an index", func(_, c map[string]any) { child(c)["after"] = []string{"ORD-0001"} }},
+		{"after 9", func(_, c map[string]any) { child(c)["after"] = []int{9} }},
+		{"after ten items", func(_, c map[string]any) { child(c)["after"] = []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9} }},
 		{"unknown context field", func(_, c map[string]any) { c["note"] = "x" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

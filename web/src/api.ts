@@ -65,6 +65,10 @@ export interface OrderView {
   readonly progress_note?: string;
   /** Child orders (parent_id this order) not yet ended: a split order waits on them (#155). */
   readonly open_children: number;
+  /** The orders this one waits on (#142): no claim takes it until each is done. */
+  readonly after: readonly string[];
+  /** Those of after not done yet. */
+  readonly waiting_on: readonly string[];
   /** Set while its mission is parked, waiting for a resume (#167); absent otherwise. */
   readonly parked_at?: string;
 }

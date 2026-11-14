@@ -75,6 +75,15 @@ CREATE TABLE IF NOT EXISTS order_repos (
     UNIQUE (order_id, name)
 );
 
+-- The orders an order waits on (#142): it is claimed only once each has
+-- ended done. A table, so a database made before it gains it through
+-- CREATE TABLE IF NOT EXISTS.
+CREATE TABLE IF NOT EXISTS order_after (
+    order_id TEXT NOT NULL REFERENCES orders(id),
+    after_id TEXT NOT NULL REFERENCES orders(id),
+    PRIMARY KEY (order_id, after_id)
+);
+
 -- An order's usage as each beam that ran it reported it (#111): the
 -- beam's running totals for the order, the latest seq's. The order's usage
 -- is the sum over its rows.
@@ -210,3 +219,6 @@ CREATE INDEX IF NOT EXISTS log_order ON log (order_id, id);
 CREATE INDEX IF NOT EXISTS hails_countermand_until ON hails (countermand_until);
 -- A split order's children (#155): open children counts and settleSplit.
 CREATE INDEX IF NOT EXISTS orders_parent ON orders (parent_id, state);
+-- An order's dependents (#142): the cascade when it ends failed, belayed
+-- or withdrawn.
+CREATE INDEX IF NOT EXISTS order_after_after ON order_after (after_id);

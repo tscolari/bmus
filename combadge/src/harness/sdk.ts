@@ -47,7 +47,8 @@
  *   - `split_order({children})`, only with `--role command` (Command's crew
  *     members, #155): asks the captain to split the order into child orders,
  *     as an `order_split` hail (allow/deny, context {parent, children}),
- *     and holds until it is answered. Option 0 means the bridge created the
+ *     and holds until it is answered. A child's `after` names earlier
+ *     children by index: it waits until each is done (#142). Option 0 means the bridge created the
  *     children; the answer's decision lists their ids. The tool is neither
  *     registered nor pre-allowed without the role: bypassPermissions would
  *     run a registered one.
@@ -1116,10 +1117,18 @@ const splitOrderInput = {
         body: z.string().trim().min(1),
         division: z.string().trim().min(1).optional(),
         priority: z.enum(["routine", "yellow", "red"]).optional(),
+        after: z.array(z.number().int().min(0)).optional(),
       }),
     )
     .min(1)
-    .max(MAX_SPLIT_CHILDREN),
+    .max(MAX_SPLIT_CHILDREN)
+    .superRefine((children, ctx) =>
+      children.forEach((c, i) =>
+        c.after?.forEach((j) => {
+          if (j >= i) ctx.addIssue({ code: "custom", path: [i, "after"], message: `child ${i} may wait on earlier children only (index below ${i})` });
+        }),
+      ),
+    ),
 };
 
 /**
@@ -1133,10 +1142,12 @@ export function splitHail(order: Order, children: z.infer<z.ZodObject<typeof spl
     body: c.body,
     ...(c.division !== undefined && { division: c.division }),
     ...(c.priority !== undefined && { priority: PRIORITIES[c.priority] }),
+    ...(c.after !== undefined && c.after.length > 0 && { after: [...new Set(c.after)] }),
   }));
-  const lines = children.map(
-    (c, i) => `${i + 1}. ${c.title} (${c.division ?? "this order's division"}, ${c.priority ?? "this order's priority"})`,
-  );
+  const lines = children.map((c, i) => {
+    const after = c.after?.length ? `, after ${[...new Set(c.after)].map((j) => j + 1).join(" and ")}` : "";
+    return `${i + 1}. ${c.title} (${c.division ?? "this order's division"}, ${c.priority ?? "this order's priority"}${after})`;
+  });
   return {
     category: CATEGORY_ORDER_SPLIT,
     question: `Split ${order.id} into ${children.length} child order${children.length === 1 ? "" : "s"}? ${lines.join("; ")}`,
@@ -1230,6 +1241,7 @@ function combadgeServer(
           "split_order",
           `Ask the captain to split this order into child orders, each a new order of its own (at most ${MAX_SPLIT_CHILDREN}). ` +
             "Each child needs a one-line title and a body that says what to do; division and priority (routine, yellow, red) default to this order's. " +
+            "A child's after lists earlier children, by 0-based index, that must be done before anyone starts it; children without one may run at once, side by side. " +
             "This waits for the captain. When it is approved, the bridge has created the children and the result lists their ids: " +
             "they run on their own, so finish your own part of this order and call report.",
           splitOrderInput,
@@ -1489,7 +1501,7 @@ function instructions(order: Order, checkout: RepoCheckout, role?: Role): string
   ];
   if (role === "command") {
     lines.push(
-      `You are Command. When this order is too big for one crew member, split it with mcp__${MCP_SERVER}__split_order: each child becomes an order of its own, for whoever its division sends. The captain approves every split.`,
+      `You are Command. When this order is too big for one crew member, split it with mcp__${MCP_SERVER}__split_order: each child becomes an order of its own, for whoever its division sends. Children run side by side unless a child's after names earlier children it must wait for. The captain approves every split.`,
     );
   }
   if (order.body.dossier) lines.push("", "Your dossier (conventions learned on earlier orders):", order.body.dossier);
