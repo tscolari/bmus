@@ -1036,6 +1036,77 @@ func TestConsoleSnapshotCountermandable(t *testing.T) {
 	require.Nil(t, views[open].CountermandUntil)
 }
 
+// A bridge-raised hail (#151), with no order or crew member, reads through
+// every list path beside a beam's hail: hails.list, the console's snapshot
+// and its feed, the status count and hails.metrics. Its order and crew
+// are empty.
+func TestBridgeHailReaders(t *testing.T) {
+	t.Parallel()
+	home := privateHome(t)
+	r := startDaemon(t, home)
+	defer r.stop(t)
+	d := r.d
+	ctx := t.Context()
+	require.NoError(t, d.store.InsertCrew(ctx, store.Crew{ID: "kirk", Name: "Kirk"}, testEntry))
+	orderID, err := d.store.InsertOrder(ctx, store.Order{Title: "a", Assignee: "kirk"}, testEntry)
+	require.NoError(t, err)
+	bridgeHail, err := d.store.InsertBridgeHail(ctx, store.Hail{DeliverTo: "findings/" + orderID, Category: "tracker_review",
+		Question: "review?"}, store.LogEntry{Kind: "hail", OrderID: orderID, Text: "review raised"})
+	require.NoError(t, err)
+	beamHail, err := d.store.InsertHail(ctx, store.Hail{OrderID: orderID, CrewID: "kirk", Question: "?"}, testEntry)
+	require.NoError(t, err)
+
+	raw, err := json.Marshal(HailsListArgs{Status: store.HailOpen})
+	require.NoError(t, err)
+	res, err := rpcHailsList(ctx, d, raw)
+	require.NoError(t, err)
+	views := res.(HailsListResult).Hails
+	require.Len(t, views, 2)
+	require.Equal(t, bridgeHail, views[0].ID)
+	require.Empty(t, views[0].OrderID)
+	require.Empty(t, views[0].CrewID)
+	require.Equal(t, beamHail, views[1].ID)
+	require.Equal(t, orderID, views[1].OrderID)
+
+	snap, err := consoleSource{d: d}.Snapshot(ctx)
+	require.NoError(t, err)
+	var ids []string
+	for _, h := range snap.Hails.([]HailView) {
+		ids = append(ids, h.ID)
+	}
+	require.Equal(t, []string{bridgeHail, beamHail}, ids)
+	st, err := d.Status(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 2, st.HailsOpen)
+
+	entries, err := d.store.ListLog(ctx, 0)
+	require.NoError(t, err)
+	var raised store.LogEntry
+	for _, e := range entries {
+		if e.Text == "review raised" {
+			raised = e
+		}
+	}
+	events, err := consoleSource{d: d}.Views(ctx, raised)
+	require.NoError(t, err)
+	var hailEvents []string
+	for _, ev := range events {
+		if ev.Type == "hail" {
+			hailEvents = append(hailEvents, ev.Data.(HailView).ID)
+		}
+	}
+	require.Equal(t, []string{bridgeHail}, hailEvents)
+
+	require.NoError(t, d.store.DecideOpenHail(ctx, bridgeHail, store.DeciderCaptain, "keep", "", testEntry, nil))
+	raw, err = json.Marshal(HailsMetricsArgs{})
+	require.NoError(t, err)
+	mres, err := rpcHailsMetrics(ctx, d, raw)
+	require.NoError(t, err)
+	m := mres.(HailsMetricsResult)
+	require.Equal(t, 2, m.Total)
+	require.Equal(t, 1, m.Decided)
+}
+
 // The console's belay and recall on running missions (#78): each is
 // order.belay or order.recall, returning the order's view as the request
 // is queued, and the mission carries it out. A belayed order in its hail

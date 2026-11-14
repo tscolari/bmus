@@ -97,10 +97,14 @@ CREATE TABLE IF NOT EXISTS order_usage (
     PRIMARY KEY (order_id, beam)
 );
 
+-- A hail from a beam has an order and a crew member and no deliver_to. A
+-- hail a bridge workflow raises (#151) has neither: deliver_to is that
+-- workflow's id. Older databases are refused (requiredColumns).
 CREATE TABLE IF NOT EXISTS hails (
     id                TEXT PRIMARY KEY,
-    order_id          TEXT NOT NULL REFERENCES orders(id),
-    crew_id           TEXT NOT NULL REFERENCES crew(id),
+    order_id          TEXT REFERENCES orders(id),
+    crew_id           TEXT REFERENCES crew(id),
+    deliver_to        TEXT,
     category          TEXT NOT NULL DEFAULT '',
     question          TEXT NOT NULL,
     options           TEXT NOT NULL DEFAULT '[]',
@@ -211,6 +215,25 @@ CREATE TABLE IF NOT EXISTS backups (
     error       TEXT NOT NULL DEFAULT ''
 );
 
+-- Findings a crew member records while it works on an order (#151). The
+-- bridge files them as tracker issues once the order's mission ends.
+CREATE TABLE IF NOT EXISTS findings (
+    order_id     TEXT NOT NULL REFERENCES orders(id),
+    key          TEXT NOT NULL,
+    crew_id      TEXT NOT NULL,          -- who filed it
+    title        TEXT NOT NULL,
+    body         TEXT NOT NULL DEFAULT '',
+    labels       TEXT NOT NULL DEFAULT '[]',
+    severity     TEXT NOT NULL DEFAULT '',
+    blocked_by   TEXT NOT NULL DEFAULT '[]',
+    received_at  TIMESTAMP NOT NULL,
+    state        TEXT NOT NULL DEFAULT 'new', -- new, dropped, filed, failed, kept, discarded, restored
+    why          TEXT NOT NULL DEFAULT '',    -- Command's reason for dropping it, or the filing error
+    duplicate_of TEXT NOT NULL DEFAULT '',
+    ref          TEXT NOT NULL DEFAULT '',    -- its issue, once created
+    PRIMARY KEY (order_id, key)
+);
+
 CREATE INDEX IF NOT EXISTS orders_assignee_state ON orders (assignee, state);
 -- An order's recent log lines, for Command's consults (#150).
 CREATE INDEX IF NOT EXISTS log_order ON log (order_id, id);
@@ -222,3 +245,6 @@ CREATE INDEX IF NOT EXISTS orders_parent ON orders (parent_id, state);
 -- An order's dependents (#142): the cascade when it ends failed, belayed
 -- or withdrawn.
 CREATE INDEX IF NOT EXISTS order_after_after ON order_after (after_id);
+-- One hail per bridge raiser and category (#151): a re-run of the raising
+-- step finds the first.
+CREATE UNIQUE INDEX IF NOT EXISTS hails_deliver_to ON hails (deliver_to, category) WHERE deliver_to IS NOT NULL;

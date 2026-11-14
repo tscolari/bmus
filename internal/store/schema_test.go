@@ -33,7 +33,9 @@ func tableColumns(t *testing.T, db *sql.DB, table string) map[string]string {
 // rows, and gains the beams and orders columns and the order_usage,
 // order_egress, backups and budget_extensions (#119) tables, the same as
 // a new database has them.
-// Opening it again changes nothing.
+// Opening it again changes nothing. Open refuses a database from before
+// #151 (TestOpenRejectsHailsWithoutDeliverTo), so the test adds
+// hails.deliver_to first and checks the rest of the upgrade.
 func TestOpenAddsPhase4Schema(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
@@ -42,7 +44,7 @@ func TestOpenAddsPhase4Schema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), DBFile)
 	db, err := sql.Open("sqlite", path)
 	require.NoError(t, err)
-	_, err = db.Exec(string(old))
+	_, err = db.Exec(string(old) + `ALTER TABLE hails ADD COLUMN deliver_to TEXT;`)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO crew (id, name) VALUES ('sorell', 'Sorell');
 		INSERT INTO beams (uuid, alias, crew_id, tour_no, created_at, expires_at)
