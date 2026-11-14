@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -139,6 +140,9 @@ type (
 		// Source is where the order comes from, free-form. "tracker:<ref>"
 		// puts the tracker item's text in the body (#54).
 		Source string `json:"source,omitempty"`
+		// After are the orders this one waits on (#142): no crew member
+		// claims it until each has ended done.
+		After []string `json:"after,omitempty"`
 	}
 	// OrderRepo is a repo of an order: a name from the bridge's registry
 	// and the git ref the work starts from. Phase 1 orders name exactly
@@ -166,10 +170,24 @@ type (
 	// sent a belay of their own. Belayed is true when the call belayed
 	// the order itself (a split order, which has no mission), false when
 	// it queued the belay for the order's mission.
+	//
+	// Waiting are the orders waiting on it (#142), down the chain, that
+	// the belay withdraws: as the request read them for a belay queued
+	// for its mission, or those its cascade withdrew for a split order.
+	// Always present.
 	OrderBelayResult struct {
 		OrderView
-		Children int  `json:"children"`
-		Belayed  bool `json:"belayed"`
+		Children int      `json:"children"`
+		Belayed  bool     `json:"belayed"`
+		Waiting  []string `json:"waiting"`
+	}
+	// OrderWithdrawResult is order.withdraw's result: the order as an
+	// OrderView and Waiting, the orders waiting on it, down the chain,
+	// that its withdraw withdrew in the same transaction (#142). Always
+	// present.
+	OrderWithdrawResult struct {
+		OrderView
+		Waiting []string `json:"waiting"`
 	}
 	// OrderRouteArgs are order.route's args. An absent assignee or
 	// division keeps the order's, and an empty one clears it; at least one
@@ -178,6 +196,23 @@ type (
 		ID       string  `json:"id"`
 		Assignee *string `json:"assignee,omitempty"`
 		Division *string `json:"division,omitempty"`
+	}
+	// OrderRebaseArgs are order.rebase's args (#148): an order no crew
+	// member has started and the new base_ref of its repo Repo, which may
+	// be empty for an order with one repo. Onto is order:<id> or a plain
+	// ref. It returns the rebased OrderView.
+	OrderRebaseArgs struct {
+		ID   string `json:"id"`
+		Onto string `json:"onto"`
+		Repo string `json:"repo,omitempty"`
+	}
+	// OrderAfterArgs are order.after's args (#148): an order no crew
+	// member has started, and the orders to add to and remove from its
+	// after; at least one must be given. It returns the OrderView.
+	OrderAfterArgs struct {
+		ID     string   `json:"id"`
+		Add    []string `json:"add,omitempty"`
+		Remove []string `json:"remove,omitempty"`
 	}
 	// OrderBudgetArgs are order.budget's args (#120): an open order's id
 	// and its own budget's new tokens and turns. An absent field keeps the
@@ -366,6 +401,8 @@ var rpcHandlers = map[string]rpcHandler{
 	"order.withdraw":    rpcOrderWithdraw,
 	"order.route":       rpcOrderRoute,
 	"order.budget":      rpcOrderBudget,
+	"order.rebase":      rpcOrderRebase,
+	"order.after":       rpcOrderAfter,
 	"order.push":        rpcOrderPush,
 	"hails.list":        rpcHailsList,
 	"hails.answer":      rpcHailsAnswer,
@@ -527,7 +564,7 @@ func (d *Daemon) createOrder(ctx context.Context, a OrderCreateArgs) (string, er
 	}
 	return d.CreateOrder(ctx, store.Order{Title: a.Title, Body: a.Body, Division: a.Division,
 		Assignee: a.Assignee, Priority: a.Priority, Repos: repos, BudgetTokens: a.BudgetTokens, BudgetTurns: a.BudgetTurns, CreatedBy: "captain", Model: a.Model,
-		Source: a.Source})
+		Source: a.Source, After: a.After})
 }
 
 func rpcOrderList(ctx context.Context, d *Daemon, raw json.RawMessage) (any, error) {
@@ -561,18 +598,30 @@ func rpcOrderBelay(ctx context.Context, d *Daemon, raw json.RawMessage) (any, er
 // POST /api/orders/{id}/belay. It adds the open child orders the belay
 // reaches (#146).
 func (d *Daemon) belayAction(ctx context.Context, a OrderActionArgs) (OrderBelayResult, error) {
-	var (
-		n       int
-		belayed bool
-	)
+	var r belayReach
 	v, err := d.orderAction(ctx, a, func(ctx context.Context, id, reason string) (err error) {
-		n, belayed, err = d.belayOrder(ctx, id, reason)
+		r, err = d.belayOrder(ctx, id, reason)
 		return err
 	})
 	if err != nil {
 		return OrderBelayResult{}, err
 	}
-	return OrderBelayResult{OrderView: v, Children: n, Belayed: belayed}, nil
+	return OrderBelayResult{OrderView: v, Children: r.Children, Belayed: r.Settled, Waiting: orEmpty(r.Waiting)}, nil
+}
+
+// withdrawAction is orderAction for a withdraw: order.withdraw and the
+// console's POST /api/orders/{id}/withdraw. It adds the orders waiting on
+// it that the withdraw withdrew (#142).
+func (d *Daemon) withdrawAction(ctx context.Context, a OrderActionArgs) (OrderWithdrawResult, error) {
+	var waiting []string
+	v, err := d.orderAction(ctx, a, func(ctx context.Context, id, reason string) (err error) {
+		waiting, err = d.withdrawOrder(ctx, id, reason)
+		return err
+	})
+	if err != nil {
+		return OrderWithdrawResult{}, err
+	}
+	return OrderWithdrawResult{OrderView: v, Waiting: orEmpty(waiting)}, nil
 }
 
 func rpcOrderRecall(ctx context.Context, d *Daemon, raw json.RawMessage) (any, error) {
@@ -580,7 +629,15 @@ func rpcOrderRecall(ctx context.Context, d *Daemon, raw json.RawMessage) (any, e
 }
 
 func rpcOrderWithdraw(ctx context.Context, d *Daemon, raw json.RawMessage) (any, error) {
-	return rpcOrderAction(ctx, d, raw, d.WithdrawOrder)
+	var a OrderActionArgs
+	if err := decodeArgs(raw, &a); err != nil {
+		return nil, err
+	}
+	v, err := d.withdrawAction(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
 func rpcOrderAction(ctx context.Context, d *Daemon, raw json.RawMessage, act func(ctx context.Context, id, reason string) error) (any, error) {
@@ -638,6 +695,73 @@ func (d *Daemon) routeOrder(ctx context.Context, a OrderRouteArgs) (OrderView, e
 		return OrderView{}, err
 	}
 	return d.orderView(o), nil
+}
+
+func rpcOrderRebase(ctx context.Context, d *Daemon, raw json.RawMessage) (any, error) {
+	var a OrderRebaseArgs
+	if err := decodeArgs(raw, &a); err != nil {
+		return nil, err
+	}
+	v, err := d.rebaseOrder(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// rebaseOrder sets the base of the order a names (reorderOrder) and
+// returns its OrderView: order.rebase.
+func (d *Daemon) rebaseOrder(ctx context.Context, a OrderRebaseArgs) (OrderView, error) {
+	if a.ID == "" {
+		return OrderView{}, badRequest("order id is required")
+	}
+	if a.Onto == "" {
+		return OrderView{}, badRequest("onto is required: order:<id> or a ref")
+	}
+	o, err := d.reorderOrder(ctx, a.ID, store.OrderChange{Repo: a.Repo, Base: &a.Onto}, reorderSource{})
+	if err != nil {
+		return OrderView{}, err
+	}
+	return d.orderView(o), nil
+}
+
+func rpcOrderAfter(ctx context.Context, d *Daemon, raw json.RawMessage) (any, error) {
+	var a OrderAfterArgs
+	if err := decodeArgs(raw, &a); err != nil {
+		return nil, err
+	}
+	v, err := d.orderAfter(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// orderAfter changes the after of the order a names (reorderOrder) and
+// returns its OrderView: order.after.
+func (d *Daemon) orderAfter(ctx context.Context, a OrderAfterArgs) (OrderView, error) {
+	if a.ID == "" {
+		return OrderView{}, badRequest("order id is required")
+	}
+	if len(a.Add) == 0 && len(a.Remove) == 0 {
+		return OrderView{}, badRequest("nothing to change: give orders to add or remove")
+	}
+	o, err := d.reorderOrder(ctx, a.ID, store.OrderChange{AfterAdd: uniq(a.Add), AfterRemove: uniq(a.Remove)}, reorderSource{})
+	if err != nil {
+		return OrderView{}, err
+	}
+	return d.orderView(o), nil
+}
+
+// uniq is ids with repeats dropped, in first-seen order.
+func uniq(ids []string) []string {
+	var out []string
+	for _, id := range ids {
+		if !slices.Contains(out, id) {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func rpcOrderBudget(ctx context.Context, d *Daemon, raw json.RawMessage) (any, error) {

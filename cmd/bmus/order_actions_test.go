@@ -178,4 +178,119 @@ func TestBelayLine(t *testing.T) {
 	require.Equal(t, "order ORD-0001 belay requested, and its 2 open child orders", line(2))
 	split := bridge.OrderBelayResult{OrderView: bridge.OrderView{ID: "ORD-0001", State: store.OrderBelayed}, Children: 2, Belayed: true}
 	require.Equal(t, "order ORD-0001 belayed, and its 2 open child orders", belayLine(split))
+	// The orders waiting on it it withdraws (#142).
+	split.Waiting = []string{"ORD-0005"}
+	require.Equal(t, "order ORD-0001 belayed, and its 2 open child orders, and 1 order waiting on it (ORD-0005)", belayLine(split))
+	waiting := bridge.OrderBelayResult{OrderView: bridge.OrderView{ID: "ORD-0001"}, Waiting: []string{"ORD-0002", "ORD-0003"}}
+	require.Equal(t, "order ORD-0001 belay requested, and 2 orders waiting on it (ORD-0002, ORD-0003)", belayLine(waiting))
+}
+
+// #142's acceptance through the CLI: an order created with --after waits,
+// and `bmus order list` shows "waiting on ORD-0001" in its PROGRESS cell;
+// an after the bridge refuses fails the create. Withdrawing the first
+// withdraws the one waiting on it.
+func TestOrderAfter(t *testing.T) {
+	t.Parallel()
+	e := newE2E(t)
+	e.startBridge(t)
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.yaml")
+	require.NoError(t, os.WriteFile(first, []byte("title: first\ndivision: ops\nrepos:\n  - name: app\n    base_ref: main\n"), 0o600))
+	second := filepath.Join(dir, "second.yaml")
+	require.NoError(t, os.WriteFile(second, []byte("title: second\ndivision: ops\nrepos:\n  - name: app\n    base_ref: main\n"), 0o600))
+	require.Equal(t, "ORD-0001\n", e.run(t, "order", "create", first))
+	require.Contains(t, e.fail(t, "order", "create", second, "--after", "ORD-0404"), "after ORD-0404: no such order")
+	require.Equal(t, "ORD-0002\n", e.run(t, "order", "create", second, "--after", "ORD-0001"))
+	require.Regexp(t, `(?m)^ORD-0001\s+pool\s+-\s+-\s+-\s+ops\s+first\nORD-0002\s+pool\s+waiting on ORD-0001\s+-\s+-\s+ops\s+second\n`,
+		e.run(t, "order", "list"))
+	var orders bridge.OrderListResult
+	e.runJSON(t, &orders, "order", "list")
+	require.Equal(t, []string{"ORD-0001"}, orders.Orders[1].After)
+	require.Equal(t, []string{"ORD-0001"}, orders.Orders[1].WaitingOn)
+	require.Empty(t, orders.Orders[0].After)
+
+	require.Equal(t, "order ORD-0001 withdrawn, and 1 order waiting on it (ORD-0002)\n", e.run(t, "order", "withdraw", "ORD-0001"))
+	e.runJSON(t, &orders, "order", "list")
+	require.Equal(t, store.OrderWithdrawn, orders.Orders[1].State, "withdrawn with the order it waits on")
+	require.Contains(t, e.fail(t, "order", "create", second, "--after", "ORD-0001"),
+		"after ORD-0001: it ended withdrawn and will never be done")
+}
+
+// An order based on order:<id> (#143) waits on that order; an unknown
+// order, a malformed id and a repo the order doesn't work on are refused.
+func TestOrderBaseCLI(t *testing.T) {
+	t.Parallel()
+	e := newE2E(t)
+	e.startBridge(t)
+	dir := t.TempDir()
+	file := func(name, base string) string {
+		p := filepath.Join(dir, name+".yaml")
+		require.NoError(t, os.WriteFile(p, []byte("title: "+name+"\ndivision: ops\nrepos:\n  - name: app\n    base_ref: "+base+"\n"), 0o600))
+		return p
+	}
+	require.Equal(t, "ORD-0001\n", e.run(t, "order", "create", file("first", "main")))
+	require.Contains(t, e.fail(t, "order", "create", file("unknown", "order:ORD-0009")), "repo app: base_ref order:ORD-0009: no such order")
+	require.Contains(t, e.fail(t, "order", "create", file("malformed", "order:first")),
+		`repo app: base_ref "order:first": order: takes an order's id, such as order:ORD-0001`)
+	require.Equal(t, "ORD-0002\n", e.run(t, "order", "create", file("second", "order:ORD-0001")))
+	require.Regexp(t, `(?m)^ORD-0002\s+pool\s+waiting on ORD-0001\s`, e.run(t, "order", "list"))
+	var orders bridge.OrderListResult
+	e.runJSON(t, &orders, "order", "list")
+	require.Equal(t, []string{"ORD-0001"}, orders.Orders[1].After)
+	require.Equal(t, []bridge.OrderRepo{{Name: "app", BaseRef: "order:ORD-0001"}}, orders.Orders[1].Repos)
+}
+
+// order list's PROGRESS cell: "waiting on" an unclaimed order's afters not
+// yet done (#142), else its progress.
+func TestProgressCellWaiting(t *testing.T) {
+	t.Parallel()
+	pct := 40.0
+	for _, tc := range []struct {
+		o    bridge.OrderView
+		want string
+	}{
+		{bridge.OrderView{State: store.OrderPool, WaitingOn: []string{"ORD-0001"}}, "waiting on ORD-0001"},
+		{bridge.OrderView{State: store.OrderDirected, WaitingOn: []string{"ORD-0001", "ORD-0003"}}, "waiting on ORD-0001, ORD-0003"},
+		{bridge.OrderView{State: store.OrderPool, After: []string{"ORD-0001"}, WaitingOn: []string{}}, "-"},
+		{bridge.OrderView{State: store.OrderAway, WaitingOn: []string{"ORD-0001"}, ProgressPct: &pct}, "40%"},
+		{bridge.OrderView{State: store.OrderWithdrawn, WaitingOn: []string{"ORD-0001"}}, "-"},
+	} {
+		require.Equal(t, tc.want, progressCell(tc.o), "%+v", tc.o)
+	}
+}
+
+// `order rebase` and `order after` (#148) on an order nobody has claimed:
+// the base replaces the order: entry in after, after entries are added and
+// removed, and a cycle and the after a base implies are refused.
+func TestOrderRebaseCLI(t *testing.T) {
+	t.Parallel()
+	e := newE2E(t)
+	e.startBridge(t)
+	dir := t.TempDir()
+	file := func(name, base string) string {
+		p := filepath.Join(dir, name+".yaml")
+		require.NoError(t, os.WriteFile(p, []byte("title: "+name+"\ndivision: ops\nrepos:\n  - name: app\n    base_ref: "+base+"\n"), 0o600))
+		return p
+	}
+	require.Equal(t, "ORD-0001\n", e.run(t, "order", "create", file("first", "main")))
+	require.Equal(t, "ORD-0002\n", e.run(t, "order", "create", file("second", "order:ORD-0001")))
+	require.Equal(t, "ORD-0003\n", e.run(t, "order", "create", file("third", "main")))
+
+	require.Equal(t, "order ORD-0002 rebased onto order:ORD-0003, waiting on ORD-0003\n",
+		e.run(t, "order", "rebase", "ORD-0002", "--onto", "order:ORD-0003"))
+	var orders bridge.OrderListResult
+	e.runJSON(t, &orders, "order", "list")
+	require.Equal(t, []string{"ORD-0003"}, orders.Orders[1].After)
+	require.Equal(t, []bridge.OrderRepo{{Name: "app", BaseRef: "order:ORD-0003"}}, orders.Orders[1].Repos)
+
+	require.Equal(t, "order ORD-0002 after ORD-0001, ORD-0003, none done yet\n",
+		e.run(t, "order", "after", "ORD-0002", "--add", "ORD-0001"))
+	require.Contains(t, e.fail(t, "order", "after", "ORD-0002", "--remove", "ORD-0003"),
+		"after ORD-0003: order ORD-0002 is based on order:ORD-0003, so it waits on it; rebase ORD-0002 to drop the wait")
+	require.Contains(t, e.fail(t, "order", "after", "ORD-0001", "--add", "ORD-0002"),
+		"after ORD-0002: ORD-0002 waits on ORD-0001, directly or down its chain, so the wait would be a cycle")
+	require.Contains(t, e.fail(t, "order", "rebase", "ORD-0002"), "--onto is required")
+	require.Equal(t, "order ORD-0002 rebased onto main, waiting on ORD-0001\n", e.run(t, "order", "rebase", "ORD-0002", "--onto", "main"))
+	require.Equal(t, "order ORD-0002 waits on no order\n", e.run(t, "order", "after", "ORD-0002", "--remove", "ORD-0001"))
+	require.Regexp(t, `(?m)^ORD-0002\s+pool\s+-\s`, e.run(t, "order", "list"))
 }

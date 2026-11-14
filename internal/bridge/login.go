@@ -115,7 +115,7 @@ func (d *Daemon) checkLogin(ctx context.Context) {
 		d.logger.Warn("tsh login expired: beam work waits until you run tsh login", "valid_until", until)
 	case was && !is:
 		d.logger.Info("tsh login valid again: beam work resumes", "valid_until", until)
-		d.wakeOnDeck(ctx)
+		d.wakeOnDeck(ctx, "after the tsh login")
 	}
 }
 
@@ -185,11 +185,12 @@ func (d *Daemon) beamLoginWaiting() map[string]bool {
 }
 
 // wakeOnDeck signals the tour of every crew member on deck to claim, best
-// effort, as wakeDivision does for one division.
-func (d *Daemon) wakeOnDeck(ctx context.Context) {
+// effort, as wakeDivision does for one division. why ends its warnings:
+// "after the tsh login".
+func (d *Daemon) wakeOnDeck(ctx context.Context, why string) {
 	crew, err := d.store.ListCrew(ctx)
 	if err != nil {
-		d.logger.Warn("crew not woken after the tsh login: list crew", "err", err)
+		d.logger.Warn("crew not woken "+why+": list crew", "err", err)
 		return
 	}
 	for _, c := range crew {
@@ -198,7 +199,7 @@ func (d *Daemon) wakeOnDeck(ctx context.Context) {
 		}
 		tour := tourWorkflowID(c.ID, c.TourNo)
 		if err := d.wakeSend(tour, CrewSignal{Kind: SignalOrderAssigned}); err != nil {
-			d.logger.Warn("crew tour not woken after the tsh login", "tour", tour, "err", err)
+			d.logger.Warn("crew tour not woken "+why, "tour", tour, "err", err)
 		}
 	}
 }

@@ -108,7 +108,14 @@ func (d *Daemon) AddCrew(ctx context.Context, c store.Crew) error {
 // store.PriorityRoutine, PriorityYellow or PriorityRed, is a bad request.
 //
 // o.Repos must name exactly one repo of the registry (Config.Repos), with
-// a base_ref (checkOrderRepos); anything else is a bad request.
+// a base_ref (checkOrderRepos); anything else is a bad request. A
+// base_ref of order:<id> (#143) must name an order that can still bring
+// back work on that repo (checkOrderBases), and adds <id> to o.After when
+// it isn't there.
+//
+// o.After are the orders it waits on (#142): no claim takes it until each
+// has ended done. An after naming no order, the order itself, or one that
+// ended failed, belayed or withdrawn is a bad request.
 //
 // o.Source is free-form. One naming a tracker item ("tracker:<ref>", #54)
 // is read from the tracker into the order's title and body once every
@@ -145,6 +152,15 @@ func (d *Daemon) CreateOrder(ctx context.Context, o store.Order) (string, error)
 	if err := d.checkOrderRepos(o.Repos); err != nil {
 		return "", err
 	}
+	bases, err := d.checkOrderBases(ctx, o.Repos)
+	if err != nil {
+		return "", err
+	}
+	for _, id := range bases {
+		if !slices.Contains(o.After, id) {
+			o.After = append(o.After, id)
+		}
+	}
 	if err := d.resolveSource(ctx, &o); err != nil {
 		return "", err
 	}
@@ -159,6 +175,9 @@ func (d *Daemon) CreateOrder(ctx context.Context, o store.Order) (string, error)
 		}
 	}
 	id, err := d.store.InsertOrder(ctx, o, entry)
+	if errors.Is(err, store.ErrAfter) {
+		return "", badRequest("%s", strings.TrimSuffix(err.Error(), ": "+store.ErrAfter.Error()))
+	}
 	if err != nil {
 		return "", fmt.Errorf("create order: %w", err)
 	}
@@ -357,7 +376,7 @@ func correctionDroppedEntry(crewID, orderID, hailID, why string) (store.LogEntry
 // and a missing order ErrNotFound. It returns once the belay is queued
 // for the mission, or done.
 func (d *Daemon) BelayOrder(ctx context.Context, id, reason string) error {
-	_, _, err := d.belayOrder(ctx, id, reason)
+	_, err := d.belayOrder(ctx, id, reason)
 	return err
 }
 
@@ -365,25 +384,43 @@ func (d *Daemon) BelayOrder(ctx context.Context, id, reason string) error {
 // belaySplit takes instead.
 var errBelaySplit = errors.New("split order")
 
-// belayOrder is BelayOrder. It also returns how many open child orders
-// the belay reaches (#146): the order's open children as its request read
-// them, or for a split order those its cascade withdrew, belayed or sent
-// a belay; and whether it belayed the order itself (a split order) rather
-// than queueing the belay for its mission.
-func (d *Daemon) belayOrder(ctx context.Context, id, reason string) (children int, settled bool, err error) {
-	err = d.requestOrder(ctx, id, comms.TypeBelay, comms.BelayBody{Reason: reason}, "belay requested", reason,
-		func(o store.Order, _ string) error {
-			if err := belayCheck(o); err != nil {
-				return err
-			}
-			children = o.OpenChildren
-			return nil
-		})
-	if errors.Is(err, errBelaySplit) {
-		children, err = d.belaySplit(ctx, id, reason)
-		return children, err == nil, err
+// belayReach is what a belay reaches besides the order: Children, how
+// many open child orders (#146), and Waiting, the orders waiting on it
+// that it withdraws (#142). Settled is true when the call belayed the
+// order itself (a split order) rather than queueing the belay for its
+// mission.
+type belayReach struct {
+	Children int
+	Waiting  []string
+	Settled  bool
+}
+
+// belayOrder is BelayOrder, returning what the belay reaches. For a belay
+// queued for a mission, those are the order's open children and the
+// orders waiting on it, down the chain (store.WaitingChain), as the
+// request read them; for a split order, what its cascades did.
+func (d *Daemon) belayOrder(ctx context.Context, id, reason string) (belayReach, error) {
+	var r belayReach
+	err := d.store.RequestOrder(ctx, id, func(tx *sql.Tx, o store.Order, _ string) (store.LogEntry, error) {
+		if err := belayCheck(o); err != nil {
+			return store.LogEntry{}, err
+		}
+		waiting, err := store.WaitingChain(ctx, tx, id)
+		if err != nil {
+			return store.LogEntry{}, err
+		}
+		r = belayReach{Children: o.OpenChildren, Waiting: waiting}
+		return d.orderRequest(tx, o, comms.TypeBelay, comms.BelayBody{Reason: reason}, "belay requested", reason)
+	})
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return belayReach{}, fmt.Errorf("order %s: %w", id, ErrNotFound)
+	case errors.Is(err, errBelaySplit):
+		return d.belaySplit(ctx, id, reason)
+	case err != nil:
+		return belayReach{}, err
 	}
-	return children, false, err
+	return r, nil
 }
 
 // belayCheck is BelayOrder's check on order o: nil for an order whose
@@ -407,29 +444,31 @@ func belayCheck(o store.Order) error {
 // belaySplit belays split order id (#146): its mission has ended, so
 // belaySplitOrder settles it belayed and cascades. An order its last child
 // settled meanwhile is a bad request ("too late to belay"). It returns the
-// children the cascade reached: those it did not find already ended.
-func (d *Daemon) belaySplit(ctx context.Context, id, reason string) (int, error) {
+// children the cascade reached, those it did not find already ended, and
+// the orders waiting on any order it ended that it withdrew (#142).
+func (d *Daemon) belaySplit(ctx context.Context, id, reason string) (belayReach, error) {
 	o, err := d.store.GetOrder(ctx, id)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("order %s: %w", id, ErrNotFound)
+		return belayReach{}, fmt.Errorf("order %s: %w", id, ErrNotFound)
 	}
 	if err != nil {
-		return 0, err
+		return belayReach{}, err
 	}
-	current, cascade, belayed, err := d.belaySplitOrder(ctx, id, o.Assignee, reason)
+	cctx, col := store.WithAfterCascade(ctx)
+	current, cascade, belayed, err := d.belaySplitOrder(cctx, id, o.Assignee, reason)
 	if err != nil {
-		return 0, err
+		return belayReach{}, err
 	}
 	if !belayed {
-		return 0, badRequest("order %s is %s, too late to belay", id, current)
+		return belayReach{}, badRequest("order %s is %s, too late to belay", id, current)
 	}
-	n := 0
+	r := belayReach{Waiting: col.IDs(), Settled: true}
 	for _, c := range cascade {
 		if c.Action != store.CascadeAlready {
-			n++
+			r.Children++
 		}
 	}
-	return n, nil
+	return r, nil
 }
 
 // belaySplitOrder settles split order id belayed, logged "order
@@ -563,25 +602,37 @@ func (d *Daemon) orderRequest(tx *sql.Tx, o store.Order, typ string, body any, w
 // has its parked mission: "parked; use belay". Any other state is a bad
 // request naming it, and a missing order ErrNotFound.
 func (d *Daemon) WithdrawOrder(ctx context.Context, id, reason string) error {
+	_, err := d.withdrawOrder(ctx, id, reason)
+	return err
+}
+
+// withdrawOrder is WithdrawOrder. It also returns the orders waiting on
+// it, down the chain, that the withdraw withdrew in its transaction
+// (#142).
+func (d *Daemon) withdrawOrder(ctx context.Context, id, reason string) ([]string, error) {
 	text := "order withdrawn"
 	if reason != "" {
 		text += ": " + reason
 	}
 	entry, err := logEntry(logOrder, "", id, text, map[string]string{"reason": reason})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	o, withdrawn, err := d.store.WithdrawOrder(ctx, id, entry)
+	cctx, col := store.WithAfterCascade(ctx)
+	o, withdrawn, err := d.store.WithdrawOrder(cctx, id, entry)
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("order %s: %w", id, ErrNotFound)
+		return nil, fmt.Errorf("order %s: %w", id, ErrNotFound)
 	}
-	if err != nil || withdrawn {
-		return err
+	if err != nil {
+		return nil, err
+	}
+	if withdrawn {
+		return col.IDs(), nil
 	}
 	if (o.State == store.OrderPool || o.State == store.OrderDirected) && o.ParkedAt != nil {
-		return badRequest("order %s is parked; use belay (`bmus order belay`)", id)
+		return nil, badRequest("order %s is parked; use belay (`bmus order belay`)", id)
 	}
-	return badRequest("order %s is %s, too late to withdraw", id, o.State)
+	return nil, badRequest("order %s is %s, too late to withdraw", id, o.State)
 }
 
 // RouteOrder changes the assignee or division of order id before any crew
@@ -778,6 +829,33 @@ func (d *Daemon) wakeDivision(ctx context.Context, division string) {
 		if err := d.wakeSend(tour, CrewSignal{Kind: SignalOrderAssigned}); err != nil {
 			d.logger.Warn("crew tour not woken for its division's pool", "division", c.Division, "tour", tour, "err", err)
 		}
+	}
+}
+
+// settleReport is the order-done step's settle (store.SettleOrder) of
+// order id as state, done or split, then wakeReady for it.
+func (d *Daemon) settleReport(ctx context.Context, id, state string, entry, late store.LogEntry) (string, error) {
+	current, _, err := d.store.SettleOrder(ctx, id, state, entry, &late)
+	if err != nil {
+		return "", err
+	}
+	d.wakeReady(ctx, id)
+	return current, nil
+}
+
+// wakeReady wakes every crew member on deck (wakeOnDeck) when an
+// unclaimed order waiting on order id, or on a split parent id's settle
+// made done, now has each order in its after done (#142,
+// store.HasReadyDependents). Its own crew member, still away, claims
+// after its mission. Best effort, as wakeDivision.
+func (d *Daemon) wakeReady(ctx context.Context, id string) {
+	ready, err := d.store.HasReadyDependents(ctx, id)
+	if err != nil {
+		d.logger.Warn("waiting orders not woken", "err", err)
+		return
+	}
+	if ready {
+		d.wakeOnDeck(ctx, "for an order whose after is done")
 	}
 }
 

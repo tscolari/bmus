@@ -105,7 +105,8 @@ type openHail struct {
 	Ref string // combadge's ref, echoed in the answer
 	// Category is the hail's: an order_split answered with option 0
 	// runs create-children (#155), a tracker request tracker-request
-	// (#54), a budget hail budget-extend (#119).
+	// (#54), a budget hail budget-extend (#119), an order_reorder
+	// apply-reorder (#148).
 	Category string
 }
 
@@ -276,7 +277,11 @@ func syntheticMessage(typ string, body any, crewID, orderID string) (comms.Messa
 //     decided_by. An order_split hail answered with option 0 runs
 //     create-children in between (createChildren, #155), whose result
 //     becomes the answer's decision: the children's ids, or why none were
-//     created (option deny). A tracker request answered with option 0
+//     created (option deny). An order_reorder hail answered with option
+//     0 runs reorder-window, then apply-reorder there (applyReorder,
+//     #148): the decision says
+//     what applied and what was skipped (option deny when nothing
+//     applied). A tracker request answered with option 0
 //     runs tracker-window, tracker-request and tracker-record there
 //     instead (runTrackerRequest, #54): the answer's decision says what
 //     the bridge did, or why it didn't (option deny). A budget hail
@@ -729,6 +734,27 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 					body.Option = &deny
 				}
 			}
+			// An allowed reorder applies its changes before the answer goes
+			// out, so the answer can say what applied and what was
+			// skipped (#148). Once per hail, as create-children.
+			if hail.Category == comms.CategoryOrderReorder && body.Option != nil && *body.Option == 0 {
+				// A decision the captain may still countermand (a captain
+				// timeout's default_option) waits out its window first.
+				if err := awaitCountermandWindow(ctx, body.HailID, "reorder-window"); err != nil {
+					return MissionResult{}, cur.CrewID, err
+				}
+				out, err := dbos.RunAsStep(ctx, func(c context.Context) (reorderOutcome, error) {
+					return applyReorder(c, daemonFrom(c), cur, body.HailID)
+				}, append([]dbos.StepOption{dbos.WithStepName("apply-reorder")}, storeRetries...)...)
+				if err != nil {
+					return MissionResult{}, cur.CrewID, err
+				}
+				body.Decision = out.Decision
+				if out.Refused {
+					deny := 1
+					body.Option = &deny
+				}
+			}
 			// An extension raises the order's limit before the answer goes
 			// out, so the answer can carry it (#119). Keyed by the hail: a
 			// re-run extends nothing more.
@@ -1128,7 +1154,7 @@ func completeMission(ctx dbos.Context, in MissionInput, beam string, hail *openH
 		if err != nil {
 			return doneOutcome{}, err
 		}
-		current, _, err := d.store.SettleOrder(c, in.OrderID, state, entry, &late)
+		current, err := d.settleReport(c, in.OrderID, state, entry, late)
 		return doneOutcome{Split: state == store.OrderSplit && current == store.OrderSplit}, err
 	}, append([]dbos.StepOption{dbos.WithStepName("order-done")}, storeRetries...)...)
 	if err != nil {
@@ -1706,8 +1732,9 @@ func sendOrder(ctx context.Context, d *Daemon, in MissionInput, ship shipped) (u
 // writes nothing. A mission that outlives its tour's settle wait leaves the
 // tour's sickbay or dismissed alone (#43), and the next tour's status on
 // another order too (#48). An order_split hail is stored with the bridge's
-// question (splitQuestion), not the agent's (#155), and so is a tracker
-// request (trackerQuestion, #54). A budget hail is stored with the
+// question (splitQuestion), not the agent's (#155), and so are an
+// order_reorder hail (reorderQuestion, #148) and a tracker request
+// (trackerQuestion, #54). A budget hail is stored with the
 // bridge's question (budgetQuestion), its context's four counts and the
 // options extend and stop (#119).
 func recordHail(ctx context.Context, d *Daemon, in MissionInput, body comms.HailBody) (string, error) {
@@ -1717,6 +1744,9 @@ func recordHail(ctx context.Context, d *Daemon, in MissionInput, body comms.Hail
 			return "", fmt.Errorf("order %s: %w", in.OrderID, err)
 		}
 		body.Question = splitQuestion(o, body.Context)
+	}
+	if body.Category == comms.CategoryOrderReorder {
+		body.Question = d.reorderQuestion(ctx, body.Context)
 	}
 	if isTrackerRequest(body.Category) {
 		body.Context = d.canonTrackerContext(body.Category, body.Context)

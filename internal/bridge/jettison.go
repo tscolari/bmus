@@ -108,7 +108,8 @@ type JettisonResult struct {
 // (store.LatestOrderLogTS): every move to an ended state logs one, so it
 // is never before the order ended. A branch an open order's base_ref
 // resolves to in the clone stays (protectedBranches): a re-run of that
-// order's ship-repos resolves it again.
+// order's ship-repos resolves it again. So does the branch of an order an
+// open order's base_ref names as order:<id> (#143).
 //
 // With yes, each repo's branches are deleted under its lock
 // (jettisonRepo). On an error the result holds the branches deleted
@@ -304,7 +305,61 @@ func (d *Daemon) jettisonRepo(ctx context.Context, repo string, batch []Jettison
 			return deleted, skipped, kept, d.logJettisoned(ctx, deleted, orders, err)
 		}
 	}
-	return deleted, skipped, kept, d.logJettisoned(ctx, deleted, orders, nil)
+	deleted, restored, err := d.restoreBases(ctx, repo, dir, deleted, orders)
+	kept += restored
+	return deleted, skipped, kept, d.logJettisoned(ctx, deleted, orders, err)
+}
+
+// restoreBases reads the open orders' order:<id> bases again after
+// jettisonRepo's delete (#143). An order created between the lock's
+// re-read and the delete may name a branch just deleted: each such branch
+// is created again at its old commit, whose objects are still in the
+// clone, and logged on its order as "branch bmus/<id> restored in repo
+// <name>: an open order names it as its base". It returns the branches
+// still deleted and how many were restored. A restore that fails leaves
+// its branch deleted. A logging error is returned with the result.
+func (d *Daemon) restoreBases(ctx context.Context, repo, dir string, deleted []JettisonBranch, orders map[string]store.Order) ([]JettisonBranch, int, error) {
+	if len(deleted) == 0 {
+		return deleted, 0, nil
+	}
+	all, err := d.store.ListOrders(ctx)
+	if err != nil {
+		return deleted, 0, err
+	}
+	named := map[string]bool{}
+	for _, o := range all {
+		if store.OrderEnded(o.State) {
+			continue
+		}
+		for _, r := range o.Repos {
+			if id, ok := orderBase(r.BaseRef); ok && r.Name == repo {
+				named[id] = true
+			}
+		}
+	}
+	var (
+		gone     []JettisonBranch
+		restored int
+		logErr   error
+	)
+	for _, b := range deleted {
+		if !named[b.Order] {
+			gone = append(gone, b)
+			continue
+		}
+		ref := "refs/heads/" + b.Branch
+		if _, err := runGitStdin(ctx, dir, strings.NewReader("create "+ref+" "+b.Commit+"\n"), "update-ref", "--stdin"); err != nil {
+			gone = append(gone, b)
+			continue
+		}
+		restored++
+		if err := d.appendLog(ctx, logOrder, orders[b.Order].Assignee, b.Order,
+			fmt.Sprintf("branch %s restored in repo %s: an open order names it as its base", b.Branch, repo),
+			map[string]string{"repo": repo, "branch": b.Branch, "commit": b.Commit}); err != nil && logErr == nil {
+			logErr = err
+		}
+	}
+	return gone, restored, logErr
 }
 
 // movedSkip is the skip of b, which moved from its listed commit.
@@ -342,7 +397,7 @@ func refMissing(err error) bool {
 // repo that an open order's base_ref names. A base_ref is resolved as git
 // would in the clone, after its ~, ^ and @{...} suffixes are stripped,
 // with `git rev-parse --symbolic-full-name`; one that resolves to nothing
-// protects nothing.
+// protects nothing. A base_ref of order:<id> (#143) protects bmus/<id>.
 func protectedBranches(ctx context.Context, dir, repo string, orders []store.Order) (map[string]bool, error) {
 	out := map[string]bool{}
 	seen := map[string]bool{}
@@ -352,6 +407,10 @@ func protectedBranches(ctx context.Context, dir, repo string, orders []store.Ord
 		}
 		for _, r := range o.Repos {
 			if r.Name != repo {
+				continue
+			}
+			if id, ok := orderBase(r.BaseRef); ok {
+				out["refs/heads/"+orderBranch(id)] = true
 				continue
 			}
 			ref := r.BaseRef

@@ -44,6 +44,8 @@ export function order(id: string, over: Partial<OrderView> = {}): OrderView {
     created_by: "captain",
     model: "",
     open_children: 0,
+    after: [],
+    waiting_on: [],
     ...over,
   };
 }
