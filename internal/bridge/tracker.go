@@ -372,24 +372,8 @@ type trackerCall struct {
 // Only a store error in tracker-window or tracker-record fails the
 // mission.
 func runTrackerRequest(ctx dbos.Context, in MissionInput, hailID string) (trackerOutcome, error) {
-	wait, err := dbos.RunAsStep(ctx, func(c context.Context) (time.Duration, error) {
-		h, err := daemonFrom(c).store.GetHail(c, hailID)
-		if err != nil || h.CountermandUntil == nil {
-			return 0, err
-		}
-		// Capped so the mission settles within its tour's settle wait;
-		// tracker-request refuses a window still open after it.
-		return min(max(time.Until(*h.CountermandUntil), 0), daemonFrom(c).settleTimeout), nil
-	}, append([]dbos.StepOption{dbos.WithStepName("tracker-window")}, storeRetries...)...)
-	if err != nil {
+	if err := awaitCountermandWindow(ctx, hailID, "tracker-window"); err != nil {
 		return trackerOutcome{}, err
-	}
-	if wait > 0 {
-		// A countermand lands exactly at countermand_until at the latest:
-		// a moment past it, the hail's row is final.
-		if _, err := dbos.Sleep(ctx, wait+10*time.Millisecond); err != nil {
-			return trackerOutcome{}, err
-		}
 	}
 	call, err := dbos.RunAsStep(ctx, func(c context.Context) (trackerCall, error) {
 		return daemonFrom(c).trackerRequestCall(c, in, hailID), nil
@@ -406,6 +390,29 @@ func runTrackerRequest(ctx dbos.Context, in MissionInput, hailID string) (tracke
 		return trackerOutcome{Decision: trackerRefusedMark + call.Why, Refused: true}, nil
 	}
 	return trackerOutcome{Decision: call.Text}, nil
+}
+
+// awaitCountermandWindow waits out hail hailID's countermand window, if
+// it has one, before the mission carries out what the hail allowed: step
+// step reads the hail's countermand_until, then a durable sleep waits
+// until a moment past it, at most the tour's settle wait. The step that
+// follows must refuse a window still open after that (a longer one).
+func awaitCountermandWindow(ctx dbos.Context, hailID, step string) error {
+	wait, err := dbos.RunAsStep(ctx, func(c context.Context) (time.Duration, error) {
+		h, err := daemonFrom(c).store.GetHail(c, hailID)
+		if err != nil || h.CountermandUntil == nil {
+			return 0, err
+		}
+		// Capped so the mission settles within its tour's settle wait.
+		return min(max(time.Until(*h.CountermandUntil), 0), daemonFrom(c).settleTimeout), nil
+	}, append([]dbos.StepOption{dbos.WithStepName(step)}, storeRetries...)...)
+	if err != nil || wait <= 0 {
+		return err
+	}
+	// A countermand lands exactly at countermand_until at the latest: a
+	// moment past it, the hail's row is final.
+	_, err = dbos.Sleep(ctx, wait+10*time.Millisecond)
+	return err
 }
 
 // trackerRequestCall is the tracker-request step: it reads hail hailID

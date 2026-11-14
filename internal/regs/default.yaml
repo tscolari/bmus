@@ -247,6 +247,10 @@ captain_only:
   # the bridge then waits out the countermand window before posting one.
   # The bridge refuses both when it has no tracker.
   - category: tracker_comment
+  # Command asking to change the base or after of orders nobody has started
+  # (#148). Hails from Command reach the captain whatever this file says;
+  # removing this rule only lets on_timeout default_option decide one.
+  - category: order_reorder
   # A budget hail (a crew member over its order's budget asking to extend
   # it or stop) is always the captain's, whatever this file says, and
   # on_timeout default_option never decides one.

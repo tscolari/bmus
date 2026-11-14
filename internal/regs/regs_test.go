@@ -74,7 +74,7 @@ func neverAutoAnswered() []tableCase {
 	command := func(name string, h Hail, r Reply) { cases = append(cases, tableCase{name, h, r, RouteCommand, nil}) }
 
 	// Every captain_only category, offering an option Command could pick.
-	for _, cat := range []string{"order_split", "tracker_create", "tracker_close", "tracker_comment"} {
+	for _, cat := range []string{"order_split", "tracker_create", "tracker_close", "tracker_comment", "order_reorder"} {
 		captain(cat, Hail{Category: cat, Question: "Go ahead?", Options: []string{"approve", "reject"}})
 	}
 	// Fixed to the captain whatever regs.yaml says (#119): no config lists it.
@@ -731,6 +731,7 @@ func TestDefaultCaptainOnly(t *testing.T) {
 		`category "tracker_create"`,
 		`category "tracker_close"`,
 		`category "tracker_comment"`,
+		`category "order_reorder"`,
 		`option "(?i)delete|destroy|force"`,
 	})
 
