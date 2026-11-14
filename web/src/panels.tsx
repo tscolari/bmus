@@ -1134,6 +1134,7 @@ export function RecordPanel(props: { state: State; csrf: string }) {
       <div class="record">
         {rows.map((r) => {
           const o = props.state.order.get(r.orderId);
+          const pushed = canPush(o) ? pushedTo(props.state, o.id) : undefined;
           return (
             <div class="record-row" key={r.orderId}>
               <div class="record-main">
@@ -1147,6 +1148,7 @@ export function RecordPanel(props: { state: State; csrf: string }) {
                 <div class="record-who">
                   {r.crewId && <span class="record-crew">{shortName(r.crewId)}</span>}
                   <span class={`chip bg-${r.tone} on-${r.tone}`}>{r.result}</span>
+                  {pushed && <span class="mono pushed-to">pushed to {pushed}</span>}
                 </div>
                 {(canPush(o) || r.splitChildren !== undefined) && (
                   <div class="record-acts">
@@ -1174,22 +1176,19 @@ export function RecordPanel(props: { state: State; csrf: string }) {
 }
 
 /**
- * A done order's controls (#4): the pushed marker, Push and "Mission
- * report", which opens its report in a new tab (#104).
+ * A done order's controls (#4): Push and "Mission report", which opens its
+ * report in a new tab (#104). The pushed marker sits by the status chip
+ * (#139).
  */
 function DoneOrderActions(props: { state: State; order: OrderView; csrf: string }) {
   const o = props.order;
-  const pushed = pushedTo(props.state, o.id);
   return (
-    <>
-      {pushed && <span class="mono pushed-to">pushed to {pushed}</span>}
-      <div class="record-btns">
-        <PushAction orderId={o.id} remotes={pushRemotes(props.state, o)} run={(args) => pushOrder(props.csrf, o.id, args)} />
-        <a class="btn ghost small" href={reportPath(o.id)} target="_blank" rel="noopener noreferrer" aria-label={`Open the mission report of ${o.id}`}>
-          Mission report
-        </a>
-      </div>
-    </>
+    <div class="record-btns">
+      <PushAction orderId={o.id} remotes={pushRemotes(props.state, o)} run={(args) => pushOrder(props.csrf, o.id, args)} />
+      <a class="btn ghost small" href={reportPath(o.id)} target="_blank" rel="noopener noreferrer" aria-label={`Open the mission report of ${o.id}`}>
+        Mission report
+      </a>
+    </div>
   );
 }
 
@@ -1216,6 +1215,20 @@ export function pushFailed(err: unknown): { phase: PushPhase; error: string } {
   return { phase: { kind: "idle" }, error: errorText(err) };
 }
 
+/** How long a push's "Pushed." result shows before it clears itself (#139). */
+export const PUSH_RESULT_MS = 15_000;
+
+/**
+ * Starts the timer that clears a push's result: for a done phase, clear
+ * runs after ms; any other phase, a rejection or an error included, has
+ * none. Returns the timer's cleanup, for an effect.
+ */
+export function clearPushResult(phase: PushPhase, clear: () => void, ms = PUSH_RESULT_MS): () => void {
+  if (phase.kind !== "done") return () => {};
+  const t = setTimeout(clear, ms);
+  return () => clearTimeout(t);
+}
+
 /**
  * Push for a done order (#4), after ConfirmAction's pattern: Push asks,
  * naming the remotes and the target branch, which a field may change
@@ -1225,6 +1238,8 @@ export function pushFailed(err: unknown): { phase: PushPhase; error: string } {
  * request link for a github.com remote. A 409 shows the rejection and a
  * separate "Force push" button behind its own confirm, which says the
  * remote's commits are overwritten. No force control shows before that.
+ * The result clears itself after PUSH_RESULT_MS, and Push takes the focus
+ * if the result had it (#139); the pushed marker by the status chip stays.
  */
 export function PushAction(props: {
   orderId: string;
@@ -1254,6 +1269,14 @@ export function PushAction(props: {
       askRef.current?.focus();
     }
   }, [phase]);
+  useEffect(
+    () =>
+      clearPushResult(phase, () => {
+        if (resultRef.current?.contains(document.activeElement)) refocus.current = true;
+        setPhase({ kind: "idle" });
+      }),
+    [phase],
+  );
   const back = () => {
     refocus.current = true;
     setPhase(phase.kind === "force" ? { kind: "rejected", message: phase.message } : { kind: "idle" });
@@ -1328,7 +1351,7 @@ export function PushAction(props: {
         </p>
       )}
       {phase.kind === "rejected" && (
-        <button ref={forceAskRef} type="button" class="btn ghost" aria-label={`Force push ${id} to ${branch}`} onClick={() => setPhase({ kind: "force", message: phase.message })}>
+        <button ref={forceAskRef} type="button" class="btn ghost small" aria-label={`Force push ${id} to ${branch}`} onClick={() => setPhase({ kind: "force", message: phase.message })}>
           Force push
         </button>
       )}
@@ -1356,7 +1379,7 @@ export function PushAction(props: {
                   <span class="mono">
                     {r.name}: {r.branch} at {r.commit.slice(0, 12)}
                   </span>
-                  {r.url && <span class="mono muted-id"> {r.url}</span>}
+                  {r.url && <span class="mono muted-id push-remote">{r.url}</span>}
                   {pr && (
                     <>
                       {" "}

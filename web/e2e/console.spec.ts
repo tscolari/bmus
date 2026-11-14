@@ -13,7 +13,7 @@
 // target forced past a second confirm. The mission report (#104): a done
 // order, its crew, beam, report and diff in a new tab, the diff copied to
 // the clipboard.
-import { expect, test, type Page, type TestInfo } from "@playwright/test";
+import { expect, test, type Locator, type Page, type TestInfo } from "@playwright/test";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -474,6 +474,30 @@ function pageErrors(page: Page): string[] {
   return errors;
 }
 
+/**
+ * Checks a done order's record row keeps Push and Mission report on its
+ * status chip's line, right of it, and its push result has no list
+ * marker (#139).
+ */
+async function expectPushedRowLayout(row: Locator) {
+  const chip = await row.locator(".record-who .chip").boundingBox();
+  expect(chip).not.toBeNull();
+  for (const btn of [row.getByRole("button", { name: /^Push \S+'s work to its remote$/ }), row.getByRole("link", { name: /^Open the mission report of / })]) {
+    const box = await btn.boundingBox();
+    expect(box).not.toBeNull();
+    if (!chip || !box) return;
+    expect(box.x).toBeGreaterThan(chip.x + chip.width);
+    expect(box.y).toBeLessThan(chip.y + chip.height);
+    expect(box.y + box.height).toBeGreaterThan(chip.y);
+  }
+  const list = row.locator(".push-result ul");
+  await expect(list).toHaveCSS("list-style-type", "none");
+  const [listBox, rowBox] = [await list.boundingBox(), await row.boundingBox()];
+  if (!listBox || !rowBox) throw new Error("no push result list");
+  expect(listBox.x).toBeLessThan(rowBox.x + 2);
+  expect(await list.evaluate((e) => e.scrollWidth <= e.clientWidth)).toBe(true);
+}
+
 test("Phase 2 controls: standing orders, withdraw, route, belay and recall", async ({ page }) => {
   const errors = pageErrors(page);
   bridge = new Bridge();
@@ -726,6 +750,7 @@ test("a done order's work is pushed from its record row, forced past a diverged 
   bridge = new Bridge();
   const url = await bridge.start({ script: workScript });
   const bare = path.join(bridge.dir, "app.git");
+  await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto(url);
   await bridge.bmus("crew", "add", "sorell", "--name", "Lt. Sorell", "--division", "science");
   await expect(page.getByRole("article", { name: "Lt. Sorell" })).toContainText("On deck", { timeout: missionTimeout });
@@ -748,8 +773,9 @@ test("a done order's work is pushed from its record row, forced past a diverged 
   await expect(pushed).toContainText(`app: ${branch} at ${commit.slice(0, 12)}`, { timeout: missionTimeout });
   await expect(pushed.getByRole("link")).toHaveCount(0); // not a github.com remote
   expect(await gitOut(bridge.dir, "ls-remote", bare, branch)).toBe(`${commit}\trefs/heads/${branch}`);
-  await expect(row).toContainText(`pushed to ${branch}`);
+  await expect(row.locator(".record-who")).toContainText(`pushed to ${branch}`);
   await expect(row.getByRole("button", { name: "Force push" })).toHaveCount(0);
+  await expectPushedRowLayout(row);
 
   // A diverged target: the rejection, then a separate force confirm.
   const main = await gitOut(bridge.dir, "--git-dir", bare, "rev-parse", "main");
@@ -769,7 +795,8 @@ test("a done order's work is pushed from its record row, forced past a diverged 
   await force.getByRole("button", { name: "Force push" }).click();
   await expect(row.getByRole("status").filter({ hasText: "Pushed." })).toContainText(`app: feature at ${commit.slice(0, 12)}`, { timeout: missionTimeout });
   expect(await gitOut(bridge.dir, "ls-remote", bare, "feature")).toBe(`${commit}\trefs/heads/feature`);
-  await expect(row).toContainText("pushed to feature");
+  await expect(row.locator(".record-who")).toContainText("pushed to feature");
+  await expectPushedRowLayout(row);
 
   // Mission report opens the order's report in a new tab: the crew
   // member, the beam, the summary, the changed file and its added line;
