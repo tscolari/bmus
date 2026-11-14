@@ -65,7 +65,7 @@ A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026
 
 ### Campaigns
 
-- [ ] Stage 1: chain orders, so one waits for another and starts from its work
+- [ ] Stage 1: chain orders, so one waits for another and starts from its work ([#141](https://github.com/tscolari/bmus/issues/141))
 - [ ] Stage 2: crew file findings as issues, and you discard the ones you don't want
 - [ ] Stage 3: `bmus campaign run --issue <ref>` implements, reviews, fixes and lands one task
 - [ ] Stage 4: run a campaign over a backlog query with an in-flight limit, respecting blockers

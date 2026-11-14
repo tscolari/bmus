@@ -27,7 +27,8 @@ for whether a task is pickupable — don't add a parallel `status:ready`/`status
 label, it can drift out of sync with the real relation.
 
 Every issue carries:
-- One `phase:N` label (0-5, matching the spec's delivery phases).
+- One `phase:N` label: 0-5 for the spec's delivery phases, 6 and up for campaigns stages
+  (stage 1 is `phase:6`).
 - One or more `area:*` labels naming the component(s) touched: `area:bridge`,
   `area:combadge`, `area:transporter`, `area:comms`, `area:store`, `area:cli`,
   `area:protocol`, `area:holodeck`, `area:console`, `area:docs`.
