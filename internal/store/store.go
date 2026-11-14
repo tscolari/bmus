@@ -402,6 +402,14 @@ func HailRoute(ctx context.Context, tx *sql.Tx, id string) (string, error) {
 	return route, err
 }
 
+// HailDeliverTo reads hail id's deliver_to in tx: the bridge workflow that
+// raised it (InsertBridgeHail), "" for a hail from a beam (#152).
+func HailDeliverTo(ctx context.Context, tx *sql.Tx, id string) (string, error) {
+	var to string
+	err := tx.QueryRowContext(ctx, `SELECT COALESCE(deliver_to, '') FROM hails WHERE id = ?`, id).Scan(&to)
+	return to, err
+}
+
 // ListCrew returns every crew member ordered by id.
 func (s *Store) ListCrew(ctx context.Context) ([]Crew, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+crewCols+` FROM crew ORDER BY id`)
@@ -2922,8 +2930,20 @@ func (s *Store) TimeOutOpenHail(ctx context.Context, id string, entry LogEntry) 
 // fn runs holding the store's write slot: it must not call a Store write
 // method (it would wait forever).
 func (s *Store) TimeOutOpenHailThen(ctx context.Context, id string, entry LogEntry, fn func(tx *sql.Tx) error) (closed bool, err error) {
+	return s.TimeOutOpenHailWhy(ctx, id, "", entry, fn)
+}
+
+// TimeOutOpenHailWhy is TimeOutOpenHailThen that also writes why, if set,
+// as the hail's rationale: why it closed unanswered, for a raiser that
+// reads the row (#152).
+//
+// fn runs holding the store's write slot: it must not call a Store write
+// method (it would wait forever).
+func (s *Store) TimeOutOpenHailWhy(ctx context.Context, id, why string, entry LogEntry, fn func(tx *sql.Tx) error) (closed bool,
+	err error) {
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `UPDATE hails SET status = ? WHERE id = ? AND status = ?`, HailTimedOut, id, HailOpen)
+		res, err := tx.ExecContext(ctx, `UPDATE hails SET status = ?, rationale = CASE WHEN ? = '' THEN rationale ELSE ? END
+			WHERE id = ? AND status = ?`, HailTimedOut, why, why, id, HailOpen)
 		if err != nil {
 			return err
 		}

@@ -139,6 +139,10 @@ type Config struct {
 	// tunePump, if set, adjusts every pump's config before it starts. Tests
 	// use it to shorten timings.
 	tunePump func(*comms.PumpConfig)
+	// registerExtra, if set, registers more workflows before DBOS launches.
+	// Tests use it for a stand-in bridge workflow that raises hails
+	// (raiseBridgeHail, #152).
+	registerExtra func(dbos.Context)
 	// missionCheckEvery, if set, replaces defaultMissionCheckEvery.
 	missionCheckEvery time.Duration
 	// wakeSend, if set, replaces wakeDivision's send to a tour. Tests use
@@ -525,6 +529,9 @@ func Run(ctx context.Context, cfg Config) (err error) {
 
 	if err := d.register(); err != nil {
 		return err
+	}
+	if cfg.registerExtra != nil {
+		cfg.registerExtra(d.dbos)
 	}
 
 	// Launch resumes every PENDING workflow of this app and version; there is

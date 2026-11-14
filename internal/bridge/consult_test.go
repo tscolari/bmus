@@ -204,7 +204,7 @@ func TestHailCommandFallsBack(t *testing.T) {
 			"Regulations rejected Command's answer: confidence 0.5 is below 0.75 or out of range"},
 		{"captain-only option", forceHailStep(),
 			map[string]any{"decision": "answer", "option": 1, "confidence": 0.95},
-			`Regulations rejected Command's answer: captain-only "force push over it": captain_only[5]: option "(?i)delete|destroy|force"`},
+			`Regulations rejected Command's answer: captain-only "force push over it": captain_only[4]: option "(?i)delete|destroy|force"`},
 		{"silence", toolHail("make deploy"), "silence", "Command did not reply within 1s"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -583,7 +583,7 @@ func TestConsultBody(t *testing.T) {
 	require.True(t, strings.HasSuffix(body.RecentLog[consultRecentLog-1], "progress: line "+string(rune('a'+consultRecentLog+4))))
 	require.Equal(t, "No captain_only or auto_allow rule fits this hail: Command may answer it.\n"+
 		"min_confidence: 0.75 (a less confident answer goes to the captain)\n"+
-		`captain_only[5]: option "(?i)delete|destroy|force" (an answer this fits goes to the captain)`, body.Regulations)
+		`captain_only[4]: option "(?i)delete|destroy|force" (an answer this fits goes to the captain)`, body.Regulations)
 
 	_, err = d.store.TimeOutOpenHail(ctx, id, store.LogEntry{Kind: "test"})
 	require.NoError(t, err)

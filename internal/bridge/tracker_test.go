@@ -187,13 +187,13 @@ func TestTrackerRequests(t *testing.T) {
 	allow := 0
 
 	e := hd.waitLog(t, "hail H-0001 for the captain")
-	require.Equal(t, `hail H-0001 for the captain: captain_only[7]: category "tracker_comment"`, e.Text)
+	require.Equal(t, `hail H-0001 for the captain: captain_only[6]: category "tracker_comment"`, e.Text)
 	h := hd.hail(t, "H-0001")
 	require.Equal(t, "Comment on tracker item #1: Fixed on bmus/ORD-0001. Tests pass.", h.Question, "the bridge's question")
 	require.NoError(t, hd.d.AnswerHail(t.Context(), "H-0001", "", &allow))
 
 	e = hd.waitLog(t, "hail H-0002 for the captain")
-	require.Equal(t, `hail H-0002 for the captain: captain_only[4]: category "tracker_close"`, e.Text)
+	require.Equal(t, `hail H-0002 for the captain: captain_only[3]: category "tracker_close"`, e.Text)
 	require.Equal(t, "Close tracker item #1 as not planned", hd.hail(t, "H-0002").Question)
 	require.Len(t, fake.Comments(), 1, "the comment ran before the next hail")
 	require.NoError(t, hd.d.AnswerHail(t.Context(), "H-0002", "", &allow))

@@ -89,9 +89,12 @@ type (
 	// captain timeout's default_option), CountermandedAt once they last did
 	// (#153).
 	HailView struct {
-		ID        string          `json:"id"`
-		OrderID   string          `json:"order_id"`
-		CrewID    string          `json:"crew_id"`
+		ID      string `json:"id"`
+		OrderID string `json:"order_id"`
+		CrewID  string `json:"crew_id"`
+		// DeliverTo is the bridge workflow that raised the hail (#152),
+		// whose OrderID and CrewID are empty; absent for a hail from a beam.
+		DeliverTo string          `json:"deliver_to,omitempty"`
 		Category  string          `json:"category"`
 		Question  string          `json:"question"`
 		Options   []string        `json:"options"`
@@ -155,7 +158,7 @@ func hailView(h store.Hail) HailView {
 	if opts == nil {
 		opts = []string{}
 	}
-	return HailView{ID: h.ID, OrderID: h.OrderID, CrewID: h.CrewID, Category: h.Category, Question: h.Question,
+	return HailView{ID: h.ID, OrderID: h.OrderID, CrewID: h.CrewID, DeliverTo: h.DeliverTo, Category: h.Category, Question: h.Question,
 		Options: opts, Context: h.Context, Route: h.Route, Status: h.Status, DecidedBy: h.DecidedBy,
 		Decision: h.Decision, Rationale: h.Rationale, CreatedAt: utc(h.CreatedAt), DecidedAt: utc(h.DecidedAt),
 		OriginalDecidedBy: h.OriginalDecidedBy, Confidence: h.Confidence, CountermandUntil: utc(h.CountermandUntil),

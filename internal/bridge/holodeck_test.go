@@ -122,6 +122,8 @@ type holodeckBridge struct {
 	consultTimeout time.Duration
 	// pullWorkHook and sendOrderHook, if set, are the daemons' Config's.
 	pullWorkHook, sendOrderHook func(d *Daemon, orderID string)
+	// registerExtra, if set, is the daemons' Config.registerExtra.
+	registerExtra func(dbos.Context)
 	// tunePump, if set, adjusts the daemons' pump configs after the
 	// timings above (an attachGate's wrap, say). A daemon keeps the one
 	// set when it started.
@@ -230,6 +232,7 @@ func (b *holodeckBridge) start(t *testing.T) *hdaemon {
 		ConsultTimeout:    b.consultTimeout,
 		pullWorkHook:      b.pullWorkHook,
 		sendOrderHook:     b.sendOrderHook,
+		registerExtra:     b.registerExtra,
 		Tracker:           b.tracker,
 		loginCheckEvery:   b.loginCheckEvery,
 		loginWait:         b.loginWait,

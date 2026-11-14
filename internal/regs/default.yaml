@@ -237,7 +237,6 @@ captain_only:
   - tag: destructive
   - tag: external_effect
   - category: order_split
-  - category: tracker_create
   - category: tracker_close
   - option: '(?i)delete|destroy|force'
   - tag: opaque
@@ -254,6 +253,12 @@ captain_only:
   # A budget hail (a crew member over its order's budget asking to extend
   # it or stop) is always the captain's, whatever this file says, and
   # on_timeout default_option never decides one.
+  # So is a tracker_review hail, where the captain keeps or discards the
+  # issues the bridge filed from an order's findings.
+  # A findings_triage hail is the bridge asking Command to triage an
+  # order's findings before they are filed. Only Command answers it:
+  # wherever it would reach the captain the bridge skips triage and files
+  # every finding, so listing findings_triage here turns triage off.
 
 auto_allow:
   - tool: Bash

@@ -927,7 +927,7 @@ func hailsMetricsResult(since time.Time, m HailMetrics) HailsMetricsResult {
 // hailing, its mission has ended, or it is parked, when the correction
 // waits for the resume (#167). One parked on another crew member than the
 // hailer, or recalled (unclaimed, parked), is told only if the hailer
-// resumes it.
+// resumes it. A bridge-raised hail (#152) has no order and gets no note.
 func (d *Daemon) countermandHail(ctx context.Context, a HailsCountermandArgs) (HailsCountermandResult, error) {
 	if a.HailID == "" {
 		return HailsCountermandResult{}, badRequest("hail_id is required")
@@ -944,6 +944,10 @@ func (d *Daemon) countermandHail(ctx context.Context, a HailsCountermandArgs) (H
 		return HailsCountermandResult{}, err
 	}
 	res := HailsCountermandResult{HailView: hailView(h)}
+	if h.OrderID == "" {
+		// A bridge-raised hail (#152): no order, no agent to tell.
+		return res, nil
+	}
 	o, err := d.store.GetOrder(ctx, h.OrderID)
 	if err != nil {
 		return HailsCountermandResult{}, err

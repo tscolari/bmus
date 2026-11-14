@@ -454,9 +454,11 @@ type AnswerBody struct {
 // ConsultBody is a hail plus the context Command cannot see on its own
 // (spec D7). Command lane only; unused in Phase 1.
 type ConsultBody struct {
-	HailID      string          `json:"hail_id"`
-	Crew        string          `json:"crew"`  // who hailed
-	Order       string          `json:"order"` // the hailing crew's order
+	HailID string `json:"hail_id"`
+	// Crew and Order are who hailed and the order it hailed on, both
+	// absent for a hail a bridge workflow raised (#152).
+	Crew        string          `json:"crew,omitempty"`
+	Order       string          `json:"order,omitempty"`
 	Category    string          `json:"category"`
 	Question    string          `json:"question"`
 	Options     []string        `json:"options,omitempty"`

@@ -200,7 +200,6 @@ captain_only:
   - tag: destructive
   - tag: external_effect
   - category: order_split
-  - category: tracker_create
   - category: tracker_close
   - option: '(?i)delete|destroy|force'
   - tag: opaque
