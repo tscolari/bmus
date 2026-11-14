@@ -1134,6 +1134,7 @@ export function RecordPanel(props: { state: State; csrf: string }) {
       <div class="record">
         {rows.map((r) => {
           const o = props.state.order.get(r.orderId);
+          const pushed = canPush(o) ? pushedTo(props.state, o.id) : undefined;
           return (
             <div class="record-row" key={r.orderId}>
               <div class="record-main">
@@ -1147,6 +1148,7 @@ export function RecordPanel(props: { state: State; csrf: string }) {
                 <div class="record-who">
                   {r.crewId && <span class="record-crew">{shortName(r.crewId)}</span>}
                   <span class={`chip bg-${r.tone} on-${r.tone}`}>{r.result}</span>
+                  {pushed && <span class="mono pushed-to">pushed to {pushed}</span>}
                 </div>
                 {(canPush(o) || r.splitChildren !== undefined) && (
                   <div class="record-acts">
@@ -1174,22 +1176,19 @@ export function RecordPanel(props: { state: State; csrf: string }) {
 }
 
 /**
- * A done order's controls (#4): the pushed marker, Push and "Mission
- * report", which opens its report in a new tab (#104).
+ * A done order's controls (#4): Push and "Mission report", which opens its
+ * report in a new tab (#104). The pushed marker sits by the status chip
+ * (#139).
  */
 function DoneOrderActions(props: { state: State; order: OrderView; csrf: string }) {
   const o = props.order;
-  const pushed = pushedTo(props.state, o.id);
   return (
-    <>
-      {pushed && <span class="mono pushed-to">pushed to {pushed}</span>}
-      <div class="record-btns">
-        <PushAction orderId={o.id} remotes={pushRemotes(props.state, o)} run={(args) => pushOrder(props.csrf, o.id, args)} />
-        <a class="btn ghost small" href={reportPath(o.id)} target="_blank" rel="noopener noreferrer" aria-label={`Open the mission report of ${o.id}`}>
-          Mission report
-        </a>
-      </div>
-    </>
+    <div class="record-btns">
+      <PushAction orderId={o.id} remotes={pushRemotes(props.state, o)} run={(args) => pushOrder(props.csrf, o.id, args)} />
+      <a class="btn ghost small" href={reportPath(o.id)} target="_blank" rel="noopener noreferrer" aria-label={`Open the mission report of ${o.id}`}>
+        Mission report
+      </a>
+    </div>
   );
 }
 
@@ -1328,7 +1327,7 @@ export function PushAction(props: {
         </p>
       )}
       {phase.kind === "rejected" && (
-        <button ref={forceAskRef} type="button" class="btn ghost" aria-label={`Force push ${id} to ${branch}`} onClick={() => setPhase({ kind: "force", message: phase.message })}>
+        <button ref={forceAskRef} type="button" class="btn ghost small" aria-label={`Force push ${id} to ${branch}`} onClick={() => setPhase({ kind: "force", message: phase.message })}>
           Force push
         </button>
       )}
@@ -1356,7 +1355,7 @@ export function PushAction(props: {
                   <span class="mono">
                     {r.name}: {r.branch} at {r.commit.slice(0, 12)}
                   </span>
-                  {r.url && <span class="mono muted-id"> {r.url}</span>}
+                  {r.url && <span class="mono muted-id push-remote">{r.url}</span>}
                   {pr && (
                     <>
                       {" "}

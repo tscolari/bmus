@@ -325,10 +325,10 @@ describe("push (#4)", () => {
     }
   });
 
-  it("a row is the id and text on top, then a footer: crew and status on the left, the actions on the right", () => {
+  it("a row is the id and text on top, then a footer: crew, status and the pushed marker on the left, the actions on the right", () => {
     const html = renderToString(<RecordPanel state={record("done")} csrf="c" />);
     expect(html).toMatch(
-      /<div class="record-row"><div class="record-main"><span class="mono order-id">ORD-0007<\/span><span class="record-title">[^<]*<span class="record-sum">over<\/span><\/span><\/div><div class="record-foot"><div class="record-who"><span class="record-crew">VANCE<\/span><span class="chip bg-green on-green">Complete<\/span><\/div><div class="record-acts">/,
+      /<div class="record-row"><div class="record-main"><span class="mono order-id">ORD-0007<\/span><span class="record-title">[^<]*<span class="record-sum">over<\/span><\/span><\/div><div class="record-foot"><div class="record-who"><span class="record-crew">VANCE<\/span><span class="chip bg-green on-green">Complete<\/span><span class="mono pushed-to">pushed to bmus\/ORD-0007<\/span><\/div><div class="record-acts">/,
     );
     const acts = html.slice(html.indexOf('<div class="record-acts">'));
     expect(acts).toMatch(/<div class="record-btns"><button type="button" class="btn gold small"[^>]*>Push<\/button><a class="btn ghost small"/);
@@ -376,7 +376,7 @@ describe("push (#4)", () => {
     const rejected = renderToString(<PushAction orderId="ORD-0007" remotes={remotes} run={run} initial={{ kind: "rejected", message: "push order failed: conflict" }} />);
     expect(rejected).toContain('role="alert"');
     expect(rejected).toContain("The remote rejected the push: bmus/ORD-0007 has likely diverged");
-    expect(rejected).toContain('aria-label="Force push ORD-0007 to bmus/ORD-0007">Force push</button>');
+    expect(rejected).toContain('class="btn ghost small" aria-label="Force push ORD-0007 to bmus/ORD-0007">Force push</button>');
     expect(rejected).not.toContain("are overwritten");
   });
 
@@ -405,8 +405,8 @@ describe("push (#4)", () => {
       />,
     );
     expect(done).toContain('role="status"');
-    expect(done).toContain("app: bmus/ORD-0007 at 0123456789ab");
-    expect(done).toContain("lib: bmus/ORD-0007 at fedcba987654");
+    expect(done).toContain('<li><span class="mono">app: bmus/ORD-0007 at 0123456789ab</span><span class="mono muted-id push-remote">git@github.com:o/app.git</span>');
+    expect(done).toContain('<li><span class="mono">lib: bmus/ORD-0007 at fedcba987654</span><span class="mono muted-id push-remote">https://example.com/o/lib.git</span></li>');
     expect(done).toContain('<a href="https://github.com/o/app/compare/bmus/ORD-0007?expand=1" target="_blank" rel="noopener noreferrer">Open a pull request</a>');
     expect(done.split("Open a pull request").length - 1).toBe(1);
   });
