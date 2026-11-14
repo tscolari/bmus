@@ -1,7 +1,7 @@
 import { renderToString } from "preact-render-to-string";
 import { describe, expect, it } from "vitest";
 import type { OrderReport } from "../src/api.js";
-import { BudgetFacts, capLines, CopyButton, copyText, formatBytes, parseDiff, rawDiff, reportPageOrder, reportTime, ReportView } from "../src/report.js";
+import { baseText, BudgetFacts, capLines, CopyButton, copyText, formatBytes, parseDiff, rawDiff, reportPageOrder, reportTime, ReportView } from "../src/report.js";
 import { crew, order } from "./fixtures.js";
 
 const base = "0123456789abcdef0123456789abcdef01234567";
@@ -91,6 +91,13 @@ describe("ReportView", () => {
     expect(html).toContain("<dt>Created</dt><dd>2026-11-12 09:30 UTC</dd>");
     expect(html).toContain("<dt>Done</dt><dd>2026-11-12 10:05 UTC</dd>");
     expect(html).toContain(`<pre class="report-pre">Fix it.\n&lt;script>alert('body')&lt;/script></pre>`);
+  });
+
+  it("shows a base naming another order's work with the commit it started from (#143)", () => {
+    const based = renderToString(
+      <ReportView report={{ ...diff, order: { ...diff.order, repos: [{ name: "app", base_ref: "order:ORD-0001" }, { name: "lib", base_ref: "v1.2" }] } }} />,
+    );
+    expect(based).toContain('<li class="mono">app @ order:ORD-0001 (0123456789ab)</li><li class="mono">lib @ v1.2</li>');
   });
 
   it("shows the crew member, the beams, the report and the pushes", () => {
@@ -213,6 +220,18 @@ describe("copy", () => {
     const failed = renderToString(<ReportView report={diff} copy="failed" />);
     expect(failed).toContain('<span class="error copy-note" role="alert">The clipboard refused. Select the text to copy.</span>');
     expect(failed).toContain('<div class="dl dl-add">+&lt;script>alert(1)&lt;/script></div>');
+  });
+});
+
+describe("baseText", () => {
+  it("adds the commit to an order: base only, and only when the report has it", () => {
+    const diffs = diff.repos;
+    expect(baseText({ name: "app", base_ref: "main" }, diffs)).toBe("main");
+    expect(baseText({ name: "app", base_ref: "order:ORD-0001" }, diffs)).toBe("order:ORD-0001 (0123456789ab)");
+    expect(baseText({ name: "web", base_ref: "order:ORD-0001" }, diffs)).toBe("order:ORD-0001");
+    expect(baseText({ name: "app", base_ref: "order:ORD-0001" }, [{ name: "app", base: "", diff: "", truncated: false, jettisoned: true }])).toBe(
+      "order:ORD-0001",
+    );
   });
 });
 

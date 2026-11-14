@@ -108,7 +108,10 @@ func (d *Daemon) AddCrew(ctx context.Context, c store.Crew) error {
 // store.PriorityRoutine, PriorityYellow or PriorityRed, is a bad request.
 //
 // o.Repos must name exactly one repo of the registry (Config.Repos), with
-// a base_ref (checkOrderRepos); anything else is a bad request.
+// a base_ref (checkOrderRepos); anything else is a bad request. A
+// base_ref of order:<id> (#143) must name an order that can still bring
+// back work on that repo (checkOrderBases), and adds <id> to o.After when
+// it isn't there.
 //
 // o.After are the orders it waits on (#142): no claim takes it until each
 // has ended done. An after naming no order, the order itself, or one that
@@ -148,6 +151,15 @@ func (d *Daemon) CreateOrder(ctx context.Context, o store.Order) (string, error)
 	}
 	if err := d.checkOrderRepos(o.Repos); err != nil {
 		return "", err
+	}
+	bases, err := d.checkOrderBases(ctx, o.Repos)
+	if err != nil {
+		return "", err
+	}
+	for _, id := range bases {
+		if !slices.Contains(o.After, id) {
+			o.After = append(o.After, id)
+		}
 	}
 	if err := d.resolveSource(ctx, &o); err != nil {
 		return "", err

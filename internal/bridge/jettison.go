@@ -108,7 +108,8 @@ type JettisonResult struct {
 // (store.LatestOrderLogTS): every move to an ended state logs one, so it
 // is never before the order ended. A branch an open order's base_ref
 // resolves to in the clone stays (protectedBranches): a re-run of that
-// order's ship-repos resolves it again.
+// order's ship-repos resolves it again. So does the branch of an order an
+// open order's base_ref names as order:<id> (#143).
 //
 // With yes, each repo's branches are deleted under its lock
 // (jettisonRepo). On an error the result holds the branches deleted
@@ -342,7 +343,7 @@ func refMissing(err error) bool {
 // repo that an open order's base_ref names. A base_ref is resolved as git
 // would in the clone, after its ~, ^ and @{...} suffixes are stripped,
 // with `git rev-parse --symbolic-full-name`; one that resolves to nothing
-// protects nothing.
+// protects nothing. A base_ref of order:<id> (#143) protects bmus/<id>.
 func protectedBranches(ctx context.Context, dir, repo string, orders []store.Order) (map[string]bool, error) {
 	out := map[string]bool{}
 	seen := map[string]bool{}
@@ -352,6 +353,10 @@ func protectedBranches(ctx context.Context, dir, repo string, orders []store.Ord
 		}
 		for _, r := range o.Repos {
 			if r.Name != repo {
+				continue
+			}
+			if id, ok := orderBase(r.BaseRef); ok {
+				out["refs/heads/"+orderBranch(id)] = true
 				continue
 			}
 			ref := r.BaseRef
