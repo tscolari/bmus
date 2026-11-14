@@ -1,5 +1,5 @@
 import { renderToString } from "preact-render-to-string";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../src/api.js";
 import {
   AwayPanel,
@@ -11,8 +11,11 @@ import {
   HailCard,
   LogPanel,
   OpenOrdersPanel,
+  clearPushResult,
+  PUSH_RESULT_MS,
   PushAction,
   pushFailed,
+  type PushPhase,
   RecordPanel,
   StandingOrdersSwitch,
   Stats,
@@ -409,6 +412,53 @@ describe("push (#4)", () => {
     expect(done).toContain('<li><span class="mono">lib: bmus/ORD-0007 at fedcba987654</span><span class="mono muted-id push-remote">https://example.com/o/lib.git</span></li>');
     expect(done).toContain('<a href="https://github.com/o/app/compare/bmus/ORD-0007?expand=1" target="_blank" rel="noopener noreferrer">Open a pull request</a>');
     expect(done.split("Open a pull request").length - 1).toBe(1);
+  });
+
+  describe("the result clears itself after 15s (#139)", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+    const done: PushPhase = { kind: "done", repos: [{ name: "app", url: "", branch: "bmus/ORD-0007", commit: "0123456789abcdef" }] };
+
+    it("a push's result shows, is still there at 14.9s and gone at 15s", () => {
+      vi.useFakeTimers();
+      expect(PUSH_RESULT_MS).toBe(15_000);
+      expect(renderToString(<PushAction orderId="ORD-0007" remotes={remotes} run={run} initial={done} />)).toContain("Pushed.");
+      const clear = vi.fn();
+      clearPushResult(done, clear);
+      vi.advanceTimersByTime(14_900);
+      expect(clear).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(100);
+      expect(clear).toHaveBeenCalledTimes(1);
+    });
+
+    it("a new push restarts it, and the cleanup stops it", () => {
+      vi.useFakeTimers();
+      const clear = vi.fn();
+      const stop = clearPushResult(done, clear);
+      vi.advanceTimersByTime(10_000);
+      stop();
+      const stopAgain = clearPushResult({ ...done }, clear);
+      vi.advanceTimersByTime(14_900);
+      expect(clear).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(100);
+      expect(clear).toHaveBeenCalledTimes(1);
+      const stopped = vi.fn();
+      clearPushResult(done, stopped)();
+      stopAgain();
+      vi.advanceTimersByTime(60_000);
+      expect(stopped).not.toHaveBeenCalled();
+    });
+
+    it("a rejection or another phase doesn't clear itself", () => {
+      vi.useFakeTimers();
+      const clear = vi.fn();
+      for (const phase of [{ kind: "rejected", message: "conflict" }, { kind: "force", message: "conflict" }, { kind: "idle" }, { kind: "confirm" }] as PushPhase[]) {
+        clearPushResult(phase, clear);
+      }
+      vi.advanceTimersByTime(60_000);
+      expect(clear).not.toHaveBeenCalled();
+    });
   });
 });
 

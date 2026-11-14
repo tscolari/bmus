@@ -1215,6 +1215,20 @@ export function pushFailed(err: unknown): { phase: PushPhase; error: string } {
   return { phase: { kind: "idle" }, error: errorText(err) };
 }
 
+/** How long a push's "Pushed." result shows before it clears itself (#139). */
+export const PUSH_RESULT_MS = 15_000;
+
+/**
+ * Starts the timer that clears a push's result: for a done phase, clear
+ * runs after ms; any other phase, a rejection or an error included, has
+ * none. Returns the timer's cleanup, for an effect.
+ */
+export function clearPushResult(phase: PushPhase, clear: () => void, ms = PUSH_RESULT_MS): () => void {
+  if (phase.kind !== "done") return () => {};
+  const t = setTimeout(clear, ms);
+  return () => clearTimeout(t);
+}
+
 /**
  * Push for a done order (#4), after ConfirmAction's pattern: Push asks,
  * naming the remotes and the target branch, which a field may change
@@ -1224,6 +1238,8 @@ export function pushFailed(err: unknown): { phase: PushPhase; error: string } {
  * request link for a github.com remote. A 409 shows the rejection and a
  * separate "Force push" button behind its own confirm, which says the
  * remote's commits are overwritten. No force control shows before that.
+ * The result clears itself after PUSH_RESULT_MS, and Push takes the focus
+ * if the result had it (#139); the pushed marker by the status chip stays.
  */
 export function PushAction(props: {
   orderId: string;
@@ -1253,6 +1269,14 @@ export function PushAction(props: {
       askRef.current?.focus();
     }
   }, [phase]);
+  useEffect(
+    () =>
+      clearPushResult(phase, () => {
+        if (resultRef.current?.contains(document.activeElement)) refocus.current = true;
+        setPhase({ kind: "idle" });
+      }),
+    [phase],
+  );
   const back = () => {
     refocus.current = true;
     setPhase(phase.kind === "force" ? { kind: "rejected", message: phase.message } : { kind: "idle" });
