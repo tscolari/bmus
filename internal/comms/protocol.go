@@ -64,6 +64,13 @@ const (
 	// OrderSplitContext. An allowed split's answer has Option 0 and the
 	// created orders' ids, comma separated, as its Decision.
 	CategoryOrderSplit = "order_split"
+	// CategoryOrderReorder is Command's request to change the base and
+	// after of orders no crew member has started (#148): Options
+	// {OptionAllow, OptionDeny} and an OrderReorderContext. The bridge
+	// applies an allowed one, each change rechecked, and answers with
+	// Option 0 and what it applied and skipped as the Decision, or Option
+	// 1 when it applied nothing.
+	CategoryOrderReorder = "order_reorder"
 	// CategoryTrackerComment and CategoryTrackerClose are a crew member's
 	// requests to comment on or close a tracker item (#54): Options
 	// {OptionAllow, OptionDeny} and a TrackerCommentContext or
@@ -128,12 +135,32 @@ type OrderSplitContext struct {
 
 // OrderSplitChild is one child order of an order_split hail. An empty
 // Division and a nil Priority take the parent order's. Priority is 0
-// routine, 1 yellow or 2 red.
+// routine, 1 yellow or 2 red. After names earlier children of the same
+// split by their 0-based index: the child waits until each is done (#142).
 type OrderSplitChild struct {
 	Title    string `json:"title"`
 	Body     string `json:"body"`
 	Division string `json:"division,omitempty"`
 	Priority *int   `json:"priority,omitempty"`
+	After    []int  `json:"after,omitempty"`
+}
+
+// OrderReorderContext is an order_reorder hail's context (#148): the
+// changes Command asks for, at most 10, and why.
+type OrderReorderContext struct {
+	Changes []OrderReorderChange `json:"changes"`
+	Reason  string               `json:"reason"`
+}
+
+// OrderReorderChange is one change of an order_reorder hail: Onto, when
+// set, is the order's new base_ref (order:<id> or a plain ref), and
+// AfterAdd and AfterRemove are orders, by id, to add to or drop from its
+// after.
+type OrderReorderChange struct {
+	Order       string   `json:"order"`
+	Onto        string   `json:"onto,omitempty"`
+	AfterAdd    []string `json:"after_add,omitempty"`
+	AfterRemove []string `json:"after_remove,omitempty"`
 }
 
 // Options of a tool_approval hail, in this order. AnswerBody.Option 0

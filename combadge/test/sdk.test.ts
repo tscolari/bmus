@@ -442,7 +442,7 @@ describe("sdk harness", () => {
     const dir = tempDir();
     const children = [
       { title: "API half", body: "Build the API.", division: "ops", priority: "yellow" },
-      { title: "UI half", body: "Build the UI." },
+      { title: "UI half", body: "Build the UI.", after: [0, 0] },
     ];
     const run = start(async function* (agent) {
       yield init;
@@ -461,6 +461,10 @@ describe("sdk harness", () => {
         [{ title: "a\nb", body: "b" }],
         [{ title: "t", body: "" }],
         [{ title: "t", body: "b", priority: "urgent" }],
+        // after names earlier children only (#142).
+        [{ title: "t", body: "b", after: [0] }],
+        [{ title: "t", body: "b" }, { title: "u", body: "b", after: [2] }],
+        [{ title: "t", body: "b" }, { title: "u", body: "b", after: [-1] }],
       ]) {
         expect((await agent.callTool("split_order", { children: bad })).isError).toBe(true);
       }
@@ -472,13 +476,13 @@ describe("sdk harness", () => {
       body: {
         ref: `sdk-${ORDER}-1`,
         category: "order_split",
-        question: `Split ${ORDER} into 2 child orders? 1. API half (ops, yellow); 2. UI half (this order's division, this order's priority)`,
+        question: `Split ${ORDER} into 2 child orders? 1. API half (ops, yellow); 2. UI half (this order's division, this order's priority, after 1)`,
         options: ["allow", "deny"],
         context: {
           parent: ORDER,
           children: [
             { title: "API half", body: "Build the API.", division: "ops", priority: 1 },
-            { title: "UI half", body: "Build the UI." },
+            { title: "UI half", body: "Build the UI.", after: [0] },
           ],
         },
       },
@@ -489,8 +493,69 @@ describe("sdk harness", () => {
     await run.result;
     expect(run.emitted).toHaveLength(2);
     const o = run.options();
-    expect(o.allowedTools).toEqual(["mcp__combadge__progress", "mcp__combadge__report", "mcp__combadge__request_handover", "mcp__combadge__tracker_comment", "mcp__combadge__tracker_close", "mcp__combadge__split_order"]);
+    expect(o.allowedTools).toEqual(["mcp__combadge__progress", "mcp__combadge__report", "mcp__combadge__request_handover", "mcp__combadge__tracker_comment", "mcp__combadge__tracker_close", "mcp__combadge__split_order", "mcp__combadge__reorder_orders"]);
     expect(o.systemPrompt).toMatchObject({ append: expect.stringContaining("You are Command.") });
+  });
+
+  it("gives Command reorder_orders, an order_reorder hail: option 0 says what applied, anything else is an error (#148)", async () => {
+    const dir = tempDir();
+    const changes = [
+      { order: "ORD-0003", onto: "order:ORD-0005" },
+      { order: "ORD-0004", after_add: ["ORD-0003", "ORD-0003"], after_remove: ["ORD-0002"] },
+    ];
+    const run = start(async function* (agent) {
+      yield init;
+      expect(await agent.callTool("reorder_orders", { changes, reason: "the API moved" })).toEqual({
+        content: [{ type: "text", text: "Reorder approved; the bridge applied ORD-0003; skipped ORD-0004: order ORD-0004 is away: a crew member has started it on its current base." }],
+      });
+      expect(await agent.callTool("reorder_orders", { changes, reason: "again" })).toMatchObject({
+        isError: true,
+        content: [{ text: "Reorder not applied: denied by the captain" }],
+      });
+      // Checked before any hail.
+      for (const bad of [
+        { changes: [], reason: "r" },
+        { changes: Array.from({ length: 11 }, (_, i) => ({ order: `ORD-${String(i + 1).padStart(4, "0")}`, onto: "main" })), reason: "r" },
+        { changes: [{ order: "ORD-0003", onto: "main" }], reason: " " },
+        { changes: [{ order: "ORD-0003" }], reason: "r" },
+        { changes: [{ order: "ord-3", onto: "main" }], reason: "r" },
+        { changes: [{ order: "ORD-0003", onto: "-x" }], reason: "r" },
+        { changes: [{ order: "ORD-0003", onto: "order:first" }], reason: "r" },
+        { changes: [{ order: "ORD-0003", onto: "a\nb" }], reason: "r" },
+        // 100 three-byte characters: 300 bytes, over the bridge's 256.
+        { changes: [{ order: "ORD-0003", onto: "\u6f22".repeat(100) }], reason: "r" },
+        { changes: [{ order: "ORD-0003", after_add: ["main"] }], reason: "r" },
+        { changes: [{ order: "ORD-0003", after_add: ["ORD-0001"], after_remove: ["ORD-0001"] }], reason: "r" },
+        { changes: [{ order: "ORD-0003", onto: "main" }, { order: "ORD-0003", after_add: ["ORD-0001"] }], reason: "r" },
+      ]) {
+        expect((await agent.callTool("reorder_orders", bad)).isError).toBe(true);
+      }
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), role: "command" });
+
+    expect(await run.nth(0)).toEqual({
+      type: "hail",
+      body: {
+        ref: `sdk-${ORDER}-1`,
+        category: "order_reorder",
+        question: "Reorder 2 orders? ORD-0003 onto order:ORD-0005; ORD-0004 +ORD-0003 -ORD-0002 (the API moved)",
+        options: ["allow", "deny"],
+        context: {
+          changes: [
+            { order: "ORD-0003", onto: "order:ORD-0005" },
+            { order: "ORD-0004", after_add: ["ORD-0003"], after_remove: ["ORD-0002"] },
+          ],
+          reason: "the API moved",
+        },
+      },
+    });
+    run.answer(`sdk-${ORDER}-1`, "applied ORD-0003; skipped ORD-0004: order ORD-0004 is away: a crew member has started it on its current base", 0);
+    await run.nth(1);
+    run.answer(`sdk-${ORDER}-2`, "", 1);
+    await run.result;
+    expect(run.emitted).toHaveLength(2);
+    expect(run.options().allowedTools).toContain("mcp__combadge__reorder_orders");
+    expect(run.options().systemPrompt).toMatchObject({ append: expect.stringContaining("mcp__combadge__reorder_orders") });
   });
 
   it("gives every crew member tracker_comment and tracker_close, tracker hails the bridge runs (#54)", async () => {
@@ -545,18 +610,22 @@ describe("sdk harness", () => {
     expect(run.options().systemPrompt).toMatchObject({ append: expect.stringContaining("mcp__combadge__tracker_close") });
   });
 
-  it("gives no other crew member split_order", async () => {
+  it("gives no other crew member split_order or reorder_orders", async () => {
     const dir = tempDir();
     const run = start(async function* (agent) {
       yield init;
       const r = await agent.callTool("split_order", { children: [{ title: "t", body: "b" }] });
       expect(r.isError).toBe(true);
       expect(r.content[0]?.text).toMatch(/split_order/);
+      const re = await agent.callTool("reorder_orders", { changes: [{ order: "ORD-0003", onto: "main" }], reason: "r" });
+      expect(re.isError).toBe(true);
+      expect(re.content[0]?.text).toMatch(/reorder_orders/);
       yield success;
     }, { dir, repo: dir, claudePath: fakeClaude(dir) });
     await run.result;
     expect(run.emitted).toEqual([]);
     expect(run.options().allowedTools).not.toContain("mcp__combadge__split_order");
+    expect(run.options().allowedTools).not.toContain("mcp__combadge__reorder_orders");
     expect(run.options().systemPrompt).not.toMatchObject({ append: expect.stringContaining("You are Command.") });
   });
 

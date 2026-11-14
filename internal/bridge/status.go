@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/tscolari/bmus/internal/store"
 )
@@ -27,7 +28,9 @@ const infoRegsNotConfigured = "regs.yaml not configured"
 //     crew beaming in whose provisioning waits for a tsh login (#106) or a
 //     tsh login reason (#102), else green. Reasons name the crew members
 //     and orders that set it, in id order, crew members first ("sorell in
-//     sickbay", "ORD-0007 red alert", "sorell hailing"); a lower
+//     sickbay", "ORD-0007 red alert", "sorell hailing"; an unclaimed red
+//     order waiting on others, #142: "ORD-0007 red alert (waiting on
+//     ORD-0006)"); a lower
 //     condition's causes aren't listed, except Command's, the beam wait's
 //     and the login's, which always come last, in that order ("Command not
 //     on deck"; "2 crew waiting for a beam (tsh login)"; "tsh login
@@ -137,7 +140,11 @@ func statusOf(snap store.StatusSnapshot, login string, beamWaits map[string]bool
 	}
 	red := sick
 	for _, id := range snap.RedOrders {
-		red = append(red, id+" red alert")
+		reason := id + " red alert"
+		if w := snap.RedWaiting[id]; len(w) > 0 {
+			reason += " (waiting on " + strings.Join(w, ", ") + ")"
+		}
+		red = append(red, reason)
 	}
 	switch {
 	case len(red) > 0:

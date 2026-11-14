@@ -21,6 +21,13 @@ export const CATEGORY_TOOL_APPROVAL = "tool_approval";
  */
 export const CATEGORY_ORDER_SPLIT = "order_split";
 /**
+ * Command changing the base and after of orders nobody has started (#148):
+ * options allow/deny and an OrderReorderContext. The bridge applies an allowed
+ * one, each change rechecked, and answers with option 0 and what applied and
+ * what was skipped as the decision, or option 1 when nothing applied.
+ */
+export const CATEGORY_ORDER_REORDER = "order_reorder";
+/**
  * A crew member's requests to comment on or close a tracker item (#54):
  * options allow/deny and a TrackerCommentContext or TrackerCloseContext. The
  * bridge runs an allowed one with its own credentials, then answers with option
@@ -84,6 +91,8 @@ export interface OrderSplitChild {
   division?: string;
   /** 0 routine, 1 yellow, 2 red. */
   priority?: number;
+  /** Earlier children of the same split, by 0-based index, this one waits on until each is done (#142). */
+  after?: number[];
 }
 
 /** An order_split hail's context. */
@@ -91,6 +100,27 @@ export interface OrderSplitContext {
   /** The hailing order's id. */
   parent?: string;
   children: OrderSplitChild[];
+}
+
+/** The most changes one order_reorder hail may ask for, and the most ids in each after list of one. */
+export const MAX_REORDER_CHANGES = 10;
+export const MAX_REORDER_IDS = 10;
+/** The longest reason of an order_reorder hail, in characters, and the longest onto, in bytes. */
+export const MAX_REORDER_REASON = 1000;
+export const MAX_REORDER_ONTO = 256;
+
+/** One change of an order_reorder hail: a new base_ref (order:<id> or a ref), orders to add to and drop from its after. */
+export interface OrderReorderChange {
+  order: string;
+  onto?: string;
+  after_add?: string[];
+  after_remove?: string[];
+}
+
+/** An order_reorder hail's context. */
+export interface OrderReorderContext {
+  changes: OrderReorderChange[];
+  reason: string;
 }
 
 /** Options of a tool_approval hail, in this order. Answer option 0 allows the tool. */

@@ -146,6 +146,61 @@ func TestSplitOrder(t *testing.T) {
 	requireNoBackstop(t, hd.logEntries(t))
 }
 
+// #142's acceptance: a split whose second child has after [0] runs its
+// children in order. The second, red, would be claimed first; it waits in
+// the pool, "waiting on" the first, while two idle ops crew members stand
+// by, and is claimed only after the first is done.
+func TestSplitAfterRunsInOrder(t *testing.T) {
+	t.Parallel()
+	red := store.PriorityRed
+	kids := []comms.OrderSplitChild{
+		{Title: "child one", Body: "the first half", Division: "ops"},
+		{Title: "child two", Body: "the second half", Division: "ops", Priority: &red, After: []int{0}},
+	}
+	b := newHolodeckBridge(t, hailsScript(t, splitHail(kids...)))
+	b.regs = defaultRegs(t)
+	hd := b.start(t)
+	hd.addCommand(t)
+	hd.addCrewWith(t, store.Crew{ID: "sorell", Name: "Sorell", Division: "ops"})
+	hd.addCrewWith(t, store.Crew{ID: "chekov", Name: "Chekov", Division: "ops"})
+	require.NoError(t, hd.d.SetStandingOrders(t.Context(), true))
+	parent := hd.createCommandOrder(t)
+
+	q := "Split " + parent + " into 2 orders: 1) child one [ops, yellow]; 2) child two [ops, red, after 1]"
+	hd.waitLog(t, q)
+	allow := 0
+	require.NoError(t, hd.d.AnswerHail(t.Context(), "H-0001", "", &allow))
+	require.Equal(t, MissionDone, missionResult(t, hd.d, parent).Status)
+	first, second := "ORD-0002", "ORD-0003"
+	require.Equal(t, []string{first}, hd.order(t, second).After)
+
+	o := hd.waitOrderState(t, first, store.OrderAway)
+	require.Empty(t, o.After)
+	w := hd.order(t, second)
+	require.Equal(t, store.OrderPool, w.State, "the red child waits while an ops crew member is idle")
+	v := hd.d.orderView(w)
+	require.Equal(t, []string{first}, v.After)
+	require.Equal(t, []string{first}, v.WaitingOn)
+
+	missionDone(t, hd.d, first)
+	missionDone(t, hd.d, second)
+	hd.waitOrderState(t, parent, store.OrderDone)
+	entries := hd.logEntries(t)
+	done, claimed := -1, -1
+	for i, e := range entries {
+		if e.OrderID == first && e.Kind == logDone && done < 0 {
+			done = i
+		}
+		if e.OrderID == second && e.Text == "order away: mission started" && claimed < 0 {
+			claimed = i
+		}
+	}
+	require.Positive(t, done)
+	require.Greater(t, claimed, done, "the second child is claimed after the first is done")
+	require.Empty(t, hd.order(t, second).WaitingOn)
+	requireNoBackstop(t, entries)
+}
+
 // A malformed split is denied by policy before anyone sees it, with or
 // without regs.yaml, and Command's mission goes on to its report: done,
 // with no children.
@@ -250,11 +305,12 @@ func TestCheckSplit(t *testing.T) {
 			Options: []string{comms.OptionAllow, comms.OptionDeny}, Context: json.RawMessage(context)}
 	}
 
-	kids, why := d.checkSplit(hail(`{"parent":"ORD-0001","children":[{"title":" API ","body":"b","division":"ops","priority":2},{"title":"UI","body":"b"}]}`), parent, vance)
+	kids, why := d.checkSplit(hail(`{"parent":"ORD-0001","children":[{"title":" API ","body":"b","division":"ops","priority":2},`+
+		`{"title":"UI","body":"b","after":[0,0]}]}`), parent, vance)
 	require.Empty(t, why)
 	require.Equal(t, []store.Order{
 		{Title: "API", Body: "b", Division: "ops", Priority: store.PriorityRed, Repos: parent.Repos},
-		{Title: "UI", Body: "b", Division: DivisionCommand, Priority: store.PriorityYellow, Repos: parent.Repos},
+		{Title: "UI", Body: "b", Division: DivisionCommand, Priority: store.PriorityYellow, Repos: parent.Repos, AfterSiblings: []int{0}},
 	}, kids)
 
 	long := strings.Repeat("x", maxSplitTitle+1)
@@ -283,6 +339,12 @@ func TestCheckSplit(t *testing.T) {
 			"child 1 has no division, and order ORD-0001 has none"},
 		{"unknown division", hail(`{"children":[{"title":"t","body":"b","division":"x"}]}`), vance, parent, `child 1: unknown division "x"`},
 		{"priority", hail(`{"children":[{"title":"t","body":"b","priority":3}]}`), vance, parent, "child 1's priority 3 is out of range"},
+		{"after itself", hail(`{"children":[{"title":"t","body":"b","after":[0]}]}`), vance, parent,
+			"child 1's after names child 1: a child waits on earlier children only"},
+		{"after a later child", hail(`{"children":[{"title":"t","body":"b","after":[1]},{"title":"u","body":"b"}]}`), vance, parent,
+			"child 1's after names child 2"},
+		{"after negative", hail(`{"children":[{"title":"t","body":"b"},{"title":"u","body":"b","after":[-1]}]}`), vance, parent,
+			"child 2's after names child 0"},
 		{"repos gone", hail(`{"children":[{"title":"t","body":"b"}]}`), vance, store.Order{ID: "ORD-0001", Division: "ops",
 			Repos: []store.OrderRepo{{Name: "gone", BaseRef: "main"}}}, `order ORD-0001's repos: unknown repo "gone"`},
 	} {
@@ -467,6 +529,9 @@ func TestSplitQuestion(t *testing.T) {
 	require.Equal(t, "Split ORD-0001 into 2 orders: 1) API [science, red]; 2) UI and docs [ops, yellow]",
 		splitQuestion(o, raw(comms.OrderSplitChild{Title: " API ", Division: "science", Priority: &red},
 			comms.OrderSplitChild{Title: "UI\nand docs"})))
+	require.Equal(t, "Split ORD-0001 into 3 orders: 1) API [ops, yellow]; 2) UI [ops, yellow, after 1]; 3) docs [ops, yellow, after 1 and 2]",
+		splitQuestion(o, raw(comms.OrderSplitChild{Title: "API"}, comms.OrderSplitChild{Title: "UI", After: []int{0}},
+			comms.OrderSplitChild{Title: "docs", After: []int{0, 1, 0}})))
 	require.Contains(t, splitQuestion(o, raw(comms.OrderSplitChild{Title: strings.Repeat("é", maxSplitTitle)})),
 		strings.Repeat("é", maxSplitTitle)+" [", "a title checkSplit takes is shown whole")
 	long := strings.Repeat("x", maxSplitQuestionTitle+1)

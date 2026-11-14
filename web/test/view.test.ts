@@ -3,6 +3,7 @@ import type { OrderView } from "../src/api.js";
 import { emptyState, reduce, type State } from "../src/store.js";
 import {
   awayOrders,
+  openOrderState,
   belayPrompt,
   canCountermand,
   canPush,
@@ -494,5 +495,14 @@ describe("usage against budget (#120)", () => {
       tone: "red",
       text: "12 / 10 turns (over)",
     });
+  });
+});
+
+describe("order dependencies (#142)", () => {
+  it("reads the wait from waiting_on, and none when a view lacks it", () => {
+    expect(openOrderState(order("ORD-0002", { waiting_on: ["ORD-0001"] }))).toBe("In the pool, waiting on ORD-0001");
+    expect(openOrderState(order("ORD-0002", { state: "directed", assignee: "worf", waiting_on: [] }))).toBe("Queued for WORF");
+    const { waiting_on: _, ...older } = order("ORD-0002");
+    expect(openOrderState(older as OrderView)).toBe("In the pool");
   });
 });

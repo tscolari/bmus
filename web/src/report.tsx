@@ -9,7 +9,7 @@
 
 import { Fragment, type ComponentChildren } from "preact";
 import { useEffect, useState } from "preact/hooks";
-import { orderReport, type CrewView, type OrderReport, type OrderView, type RepoDiff } from "./api.js";
+import { orderReport, type CrewView, type OrderRepo, type OrderReport, type OrderView, type RepoDiff } from "./api.js";
 import { UsageMeter } from "./panels.js";
 import { budgetSourceText, divisionInfo, extensionsText, orderBranch, orderUsage, priorityInfo } from "./view.js";
 
@@ -229,6 +229,18 @@ function RepoSection(props: { repo: RepoDiff; branch: string; cap: number; maxLi
 /** What shows for a field the bridge has no record of. */
 export const unknown = "unknown";
 
+/**
+ * A repo's base as the report's order panel shows it: the base_ref, and
+ * for one naming another order's work (order:<id>, #143) the commit the
+ * work started from, "order:ORD-0001 (0123456789ab)", when the report has
+ * it.
+ */
+export function baseText(repo: OrderRepo, diffs: readonly RepoDiff[]): string {
+  if (!repo.base_ref.startsWith("order:")) return repo.base_ref;
+  const commit = diffs.find((d) => d.name === repo.name)?.base ?? "";
+  return commit === "" ? repo.base_ref : `${repo.base_ref} (${commit.slice(0, 12)})`;
+}
+
 /** A timestamp as "YYYY-MM-DD HH:MM UTC"; unknown when missing or unparsable. */
 export function reportTime(ts: string | null | undefined): string {
   if (!ts) return unknown;
@@ -344,7 +356,7 @@ export function ReportView(props: { report: OrderReport; copy?: CopyNote; maxLin
                 <ul class="report-list">
                   {o.repos.map((repo) => (
                     <li key={repo.name} class="mono">
-                      {repo.name} @ {repo.base_ref}
+                      {repo.name} @ {baseText(repo, r.repos)}
                     </li>
                   ))}
                 </ul>

@@ -22,13 +22,14 @@ repos:
 budget_tokens: 1000
 budget_turns: 40
 model: model-x
+after: [ORD-0001, ORD-0002]
 body: |
   look around
 `))
 	require.NoError(t, err)
 	require.Equal(t, bridge.OrderCreateArgs{Title: "survey", Division: "science", Assignee: "sorell",
 		Repos: []bridge.OrderRepo{{Name: "app", BaseRef: "main"}}, BudgetTokens: 1000, BudgetTurns: 40, Body: "look around\n",
-		Model: "model-x"}, args)
+		Model: "model-x", After: []string{"ORD-0001", "ORD-0002"}}, args)
 
 	// A tracker source stands in for the title (#54); any other doesn't.
 	args, err = parseOrder([]byte("source: tracker:#12\ndivision: science\n"))
@@ -143,9 +144,9 @@ func TestProgressCell(t *testing.T) {
 	t.Parallel()
 	pct := func(v float64) *float64 { return &v }
 	for in, want := range map[float64]string{0: "0%", 40: "40%", 99.6: "99%", 100: "100%", 140: "100%", -3: "0%"} {
-		require.Equal(t, want, progressCell(pct(in)), in)
+		require.Equal(t, want, pctCell(pct(in)), in)
 	}
-	require.Equal(t, "-", progressCell(nil))
+	require.Equal(t, "-", pctCell(nil))
 }
 
 // crew list's BEAM cell (#106): a crew member beaming in without a beam

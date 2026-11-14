@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -45,6 +46,8 @@ func splitCreatedBy(hailID string) string { return "hail:" + hailID }
 //     longer than maxSplitBody;
 //   - a child has no division, its own or o's, or one the roster doesn't
 //     list (checkDivision), or a priority out of range;
+//   - a child's after names itself or a later child (#142): a child waits
+//     on earlier children only, so the chain can't loop;
 //   - o's repos no longer pass checkOrderRepos.
 //
 // Every check is on the hail's stored context, the one the captain sees.
@@ -104,8 +107,17 @@ func (d *Daemon) checkSplit(h store.Hail, o store.Order, c store.Crew) (children
 		if priority < store.PriorityRoutine || priority > store.PriorityRed {
 			return nil, fmt.Sprintf("child %d's priority %d is out of range (0 routine, 1 yellow, 2 red)", n, priority)
 		}
+		var after []int
+		for _, j := range ch.After {
+			if j < 0 || j >= i {
+				return nil, fmt.Sprintf("child %d's after names child %d: a child waits on earlier children only", n, j+1)
+			}
+			if !slices.Contains(after, j) {
+				after = append(after, j)
+			}
+		}
 		children = append(children, store.Order{Title: title, Body: body, Division: division, Priority: priority,
-			Repos: o.Repos})
+			Repos: o.Repos, AfterSiblings: after})
 	}
 	return children, ""
 }
@@ -197,7 +209,7 @@ func createChildren(ctx context.Context, d *Daemon, in MissionInput, hailID stri
 				map[string]any{"hail_id": h.ID, "children": ids})
 		})
 		switch {
-		case errors.Is(err, store.ErrParentEnded):
+		case errors.Is(err, store.ErrParentEnded), errors.Is(err, store.ErrAfter):
 			why = err.Error()
 		case err != nil:
 			return splitOutcome{}, err
@@ -231,7 +243,9 @@ const (
 
 // splitQuestion is the question an order_split hail on order o is stored
 // with, built by the bridge from the hail's context (#155): "Split
-// ORD-0001 into 2 orders: 1) <title> [<division>, <priority>]; 2) ...",
+// ORD-0001 into 2 orders: 1) <title> [<division>, <priority>]; 2) <title>
+// [<division>, <priority>, after 1]; ...", a child's after (#142) naming
+// earlier children by the question's own numbering, each once,
 // each child's title cut to maxSplitQuestionTitle and its division to
 // maxSplitQuestionDivision, one line each, defaults resolved from o. What
 // the captain approves is what the bridge will create; the agent's own
@@ -253,8 +267,18 @@ func splitQuestion(o store.Order, context json.RawMessage) string {
 			priority = *ch.Priority
 		}
 		division := cmp.Or(strings.TrimSpace(ch.Division), o.Division, "no division")
-		parts = append(parts, fmt.Sprintf("%d) %s [%s, %s]", i+1, clip(oneLine(strings.TrimSpace(ch.Title)), maxSplitQuestionTitle),
-			clip(oneLine(division), maxSplitQuestionDivision), priorityName(priority)))
+		after := ""
+		var nums []string
+		for _, j := range ch.After {
+			if n := strconv.Itoa(j + 1); !slices.Contains(nums, n) {
+				nums = append(nums, n)
+			}
+		}
+		if len(nums) > 0 {
+			after = ", after " + strings.Join(nums, " and ")
+		}
+		parts = append(parts, fmt.Sprintf("%d) %s [%s, %s%s]", i+1, clip(oneLine(strings.TrimSpace(ch.Title)), maxSplitQuestionTitle),
+			clip(oneLine(division), maxSplitQuestionDivision), priorityName(priority), after))
 	}
 	return fmt.Sprintf("Split %s into %d orders: %s", o.ID, len(sc.Children), strings.Join(parts, "; "))
 }

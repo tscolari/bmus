@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -30,6 +31,7 @@ type orderFile struct {
 	Body         string          `yaml:"body"`
 	Model        string          `yaml:"model"`
 	Source       string          `yaml:"source"`
+	After        []string        `yaml:"after"`
 }
 
 // orderFileRepo is an entry of an order file's repos: a repo registered on
@@ -96,21 +98,24 @@ func parseOrder(data []byte) (bridge.OrderCreateArgs, error) {
 	}
 	return bridge.OrderCreateArgs{Title: o.Title, Body: o.Body, Division: o.Division, Assignee: o.Assignee,
 		Priority: priority, Repos: repos, BudgetTokens: o.BudgetTokens, BudgetTurns: o.BudgetTurns, Model: o.Model,
-		Source: o.Source}, nil
+		Source: o.Source, After: o.After}, nil
 }
 
 func newOrderCmd(a *app) *cobra.Command {
 	cmd := &cobra.Command{Use: "order", Short: "Manage orders"}
 
-	var createJSON bool
+	var (
+		createJSON bool
+		after      []string
+	)
 	create := &cobra.Command{
 		Use:   "create <order.yaml>",
 		Short: "Create an order from a YAML file and print its id",
 		Long: `Create an order from a YAML file and print its id.
 
 The file's fields: title (required), assignee (a crew id), division, repos
-(required), priority, budget_tokens, budget_turns, body, model and source.
-Unknown fields are an error. model is the model the order runs on,
+(required), priority, budget_tokens, budget_turns, body, model, source and
+after. Unknown fields are an error. model is the model the order runs on,
 overriding the assignee's (` + "`crew add --model`" + `); the harness checks it
 when the order starts. budget_tokens and budget_turns cap what the order
 may spend; 0 or missing takes its division's budget from the roster, and
@@ -136,7 +141,23 @@ orders take exactly one:
 
   repos:
     - name: app
-      base_ref: main`,
+      base_ref: main
+
+base_ref: order:ORD-0001 starts from another order's work: the commit
+ORD-0001 brought back on the same repo. It adds ORD-0001 to after, so the
+order waits until ORD-0001 is done. The bridge refuses an order it doesn't
+have, one that doesn't work on that repo or ended without work on it, one
+whose branch was jettisoned, a split order (base it on a child) and an id
+that isn't one. Splitting an order withdraws the unclaimed orders based
+on it. The bridge fails the mission with repo_failed if that commit isn't
+in its clone when the order starts.
+
+after lists orders this one waits on, by id: no crew member claims it until
+each has ended done. --after adds one (repeatable). The bridge refuses an
+after naming no order, or one that already ended failed, belayed or
+withdrawn. If one ends that way later, the bridge withdraws this order too,
+unless a crew member has claimed it. ` + "`bmus order list`" + ` shows a waiting order
+as "waiting on ORD-0001".`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, pos []string) error {
 			data, err := os.ReadFile(pos[0])
@@ -146,6 +167,11 @@ orders take exactly one:
 			args, err := parseOrder(data)
 			if err != nil {
 				return fmt.Errorf("%s: %w", pos[0], err)
+			}
+			for _, id := range after {
+				if !slices.Contains(args.After, id) {
+					args.After = append(args.After, id)
+				}
 			}
 			var res bridge.OrderCreateResult
 			if err := a.call(cmd.Context(), "order.create", args, &res); err != nil {
@@ -159,12 +185,16 @@ orders take exactly one:
 		},
 	}
 	create.Flags().BoolVar(&createJSON, "json", false, "print JSON")
+	create.Flags().StringArrayVar(&after, "after", nil, "an order this one waits on until it is done (repeatable)")
 
 	var listJSON bool
 	list := &cobra.Command{
 		Use:   "list",
 		Short: "List orders",
 		Long: `List orders.
+
+PROGRESS is the order's latest progress report, or "waiting on ORD-0001"
+for an unclaimed order whose after has orders not yet done.
 
 USAGE is what the order's beams spent against its current budget: tokens
 (input and output) and turns, "420k/1M 42/150t", each part shown only when
@@ -184,7 +214,7 @@ budget_tokens and budget_turns the order's own budget.`,
 			w := newTable(cmd.OutOrStdout())
 			fmt.Fprintln(w, "ID\tSTATE\tPROGRESS\tUSAGE\tASSIGNEE\tDIVISION\tTITLE")
 			for _, o := range res.Orders {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", o.ID, stateCell(o), progressCell(o.ProgressPct), usageCell(o),
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", o.ID, stateCell(o), progressCell(o), usageCell(o),
 					dash(o.Assignee), dash(o.Division), o.Title)
 			}
 			return w.Flush()
@@ -202,7 +232,10 @@ ended, is belayed at once.
 
 The belay cascades to the order's child orders: those not claimed yet are
 withdrawn, those in flight are belayed, and those already ended are left
-alone. The output says how many open child orders it reaches.`,
+alone. The output says how many open child orders it reaches.
+
+Orders waiting on it (their after, down the chain) that no crew member has
+claimed are withdrawn when the belay settles it; the output names them.`,
 		belayLine)
 	recall := orderActionCmd(a, "recall", "order.recall",
 		"Return an order to its division's pool from its last checkpoint",
@@ -215,8 +248,12 @@ change or beam loss can be recalled only while its crew member is in sickbay.`,
 	withdraw := orderActionCmd(a, "withdraw", "order.withdraw",
 		"Take back an order no crew member has claimed yet",
 		`Take back an order no crew member has claimed yet (pool or directed). A
-recalled order still has its parked mission: belay it instead.`,
-		func(v bridge.OrderView) string { return "order " + v.ID + " withdrawn" })
+recalled order still has its parked mission: belay it instead. Orders waiting
+on it (their after, down the chain) that no crew member has claimed are
+withdrawn with it; the output names them.`,
+		func(res bridge.OrderWithdrawResult) string {
+			return "order " + res.ID + " withdrawn" + waitingPart(res.Waiting)
+		})
 
 	var (
 		budgetJSON                bool
@@ -315,6 +352,85 @@ assignee or a division.`,
 	route.Flags().BoolVar(&routeJSON, "json", false, "print the order as JSON")
 
 	var (
+		rebaseJSON             bool
+		rebaseOnto, rebaseRepo string
+	)
+	rebase := &cobra.Command{
+		Use:   "rebase <id> --onto <base>",
+		Short: "Change the base of an order nobody has started",
+		Long: `Set the base_ref of an order no crew member has started: in the pool or
+directed, never claimed, with no parked mission and no checkpoint. --onto is
+order:ORD-0005, to start from that order's work once it is done, or a ref of
+the repo (a branch, a tag or a commit id). --repo names the repo of an order
+with more than one.
+
+An order:<id> base is checked as at create, and replaces the order: entry the
+old base put in the order's after; a plain ref drops it. Its other after
+entries stay. The bridge refuses an order a crew member has started, an order
+that ended or was split, and a base that would make the order wait on itself
+or on one of its own dependents. A started order's work is built on its old
+base. To start one over from a new base, belay it and create a new one.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, pos []string) error {
+			if rebaseOnto == "" {
+				return errors.New("--onto is required")
+			}
+			var res bridge.OrderView
+			if err := a.call(cmd.Context(), "order.rebase", bridge.OrderRebaseArgs{ID: pos[0], Onto: rebaseOnto, Repo: rebaseRepo}, &res); err != nil {
+				return err
+			}
+			if rebaseJSON {
+				return printJSON(cmd.OutOrStdout(), res)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "order %s rebased onto %s%s\n", res.ID, rebaseOnto, waitText(res))
+			return nil
+		},
+	}
+	rebase.Flags().StringVar(&rebaseOnto, "onto", "", "the new base: order:<id> or a ref")
+	rebase.Flags().StringVar(&rebaseRepo, "repo", "", "the repo to rebase, for an order with more than one")
+	rebase.Flags().BoolVar(&rebaseJSON, "json", false, "print the order as JSON")
+
+	var (
+		afterJSON             bool
+		afterAdd, afterRemove []string
+	)
+	afterCmd := &cobra.Command{
+		Use:   "after <id>",
+		Short: "Change which orders an order nobody has started waits on",
+		Long: `Change the after of an order no crew member has started, as rebase requires:
+--add adds an order it waits on, --remove drops one (both repeatable). The
+bridge refuses an order that doesn't exist or already ended failed, belayed or
+withdrawn, a wait that would be a cycle, and removing the order an order:<id>
+base waits on: rebase the order to drop that one.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, pos []string) error {
+			if len(afterAdd) == 0 && len(afterRemove) == 0 {
+				return errors.New("--add or --remove is required")
+			}
+			var res bridge.OrderView
+			if err := a.call(cmd.Context(), "order.after", bridge.OrderAfterArgs{ID: pos[0], Add: afterAdd, Remove: afterRemove}, &res); err != nil {
+				return err
+			}
+			if afterJSON {
+				return printJSON(cmd.OutOrStdout(), res)
+			}
+			if len(res.After) == 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "order %s waits on no order\n", res.ID)
+				return nil
+			}
+			wait := waitText(res)
+			if slices.Equal(res.WaitingOn, res.After) {
+				wait = ", none done yet"
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "order %s after %s%s\n", res.ID, strings.Join(res.After, ", "), wait)
+			return nil
+		},
+	}
+	afterCmd.Flags().StringArrayVar(&afterAdd, "add", nil, "an order to wait on (repeatable)")
+	afterCmd.Flags().StringArrayVar(&afterRemove, "remove", nil, "an order to stop waiting on (repeatable)")
+	afterCmd.Flags().BoolVar(&afterJSON, "json", false, "print the order as JSON")
+
+	var (
 		pushJSON, pushForce bool
 		pushTarget          string
 	)
@@ -352,7 +468,7 @@ the push. Each push is logged.`,
 	push.Flags().BoolVar(&pushForce, "force", false, "overwrite the target branch even if it has diverged")
 	push.Flags().BoolVar(&pushJSON, "json", false, "print JSON")
 
-	cmd.AddCommand(create, list, belay, recall, withdraw, route, budget, push)
+	cmd.AddCommand(create, list, belay, recall, withdraw, route, budget, rebase, afterCmd, push)
 	return cmd
 }
 
@@ -390,7 +506,7 @@ func orderActionCmd[T any](a *app, use, rpc, short, long string, say func(T) str
 // requested", or "order ORD-0001 belayed" for a split order the call
 // belayed itself (res.Belayed, not the state: a mission may settle its
 // order before the reply reads it), with ", and its 2 open child orders"
-// when the belay reaches any (#146). The CLI has no confirm prompt: the
+// when the belay reaches any (#146), then waitingPart (#142). The CLI has no confirm prompt: the
 // count is in the output.
 func belayLine(res bridge.OrderBelayResult) string {
 	line := "order " + res.ID + " belay requested"
@@ -403,13 +519,45 @@ func belayLine(res bridge.OrderBelayResult) string {
 	case res.Children > 1:
 		line += fmt.Sprintf(", and its %d open child orders", res.Children)
 	}
-	return line
+	return line + waitingPart(res.Waiting)
 }
 
-// progressCell shows an order's progress as a table cell: "40%", or "-"
+// waitingPart ends a withdraw's or a belay's line with the orders waiting
+// on it that it withdraws (#142): ", and 2 orders waiting on it (ORD-0002,
+// ORD-0003)", or nothing for none.
+func waitingPart(ids []string) string {
+	switch len(ids) {
+	case 0:
+		return ""
+	case 1:
+		return ", and 1 order waiting on it (" + ids[0] + ")"
+	}
+	return fmt.Sprintf(", and %d orders waiting on it (%s)", len(ids), strings.Join(ids, ", "))
+}
+
+// waitText ends `order rebase` and `order after`'s line with the orders
+// the order still waits on: ", waiting on ORD-0005", or nothing.
+func waitText(o bridge.OrderView) string {
+	if len(o.WaitingOn) == 0 {
+		return ""
+	}
+	return ", waiting on " + strings.Join(o.WaitingOn, ", ")
+}
+
+// progressCell is an order's PROGRESS cell: "waiting on ORD-0001" for an
+// unclaimed order whose after has orders not done yet (#142), else its
+// progress, pctCell.
+func progressCell(o bridge.OrderView) string {
+	if (o.State == store.OrderPool || o.State == store.OrderDirected) && len(o.WaitingOn) > 0 {
+		return "waiting on " + strings.Join(o.WaitingOn, ", ")
+	}
+	return pctCell(o.ProgressPct)
+}
+
+// pctCell shows an order's progress as a table cell: "40%", or "-"
 // without a report (#141). The pct is clamped to 0-100, as the console
 // does, and floored: 99.6 isn't done.
-func progressCell(pct *float64) string {
+func pctCell(pct *float64) string {
 	if pct == nil {
 		return "-"
 	}

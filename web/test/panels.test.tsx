@@ -541,3 +541,37 @@ describe("usage against budget on the away-missions card (#120)", () => {
     expect(over).toContain('class="mono usage-text tone-grey">3 turns');
   });
 });
+
+describe("order dependencies on the open-orders card (#142)", () => {
+  it("shows a waiting order as waiting on its after, next to a normal one", () => {
+    const s = reduce(emptyState, {
+      type: "snapshot",
+      snapshot: snapshot({
+        crew: [crew("worf")],
+        orders: [
+          order("ORD-0001", { division: "ops" }),
+          order("ORD-0002", { division: "ops", after: ["ORD-0001"], waiting_on: ["ORD-0001"] }),
+          order("ORD-0003", { state: "directed", assignee: "worf", after: ["ORD-0001", "ORD-0002"], waiting_on: ["ORD-0001", "ORD-0002"] }),
+        ],
+      }),
+    });
+    const html = renderToString(<OpenOrdersPanel state={s} csrf="c" />);
+    const rows = html.split('<div class="row"').slice(1);
+    expect(rows).toHaveLength(3);
+    expect(rows[0]).toContain('<span class="row-state">In the pool</span>');
+    expect(rows[1]).toContain('<span class="row-state">In the pool, waiting on ORD-0001</span>');
+    expect(rows[2]).toContain('<span class="row-state">Queued for WORF, waiting on ORD-0001, ORD-0002</span>');
+  });
+
+  it("drops the wait once the feed says its after is done", () => {
+    let s = reduce(emptyState, {
+      type: "snapshot",
+      snapshot: snapshot({ orders: [order("ORD-0002", { division: "ops", after: ["ORD-0001"], waiting_on: ["ORD-0001"] })] }),
+    });
+    expect(renderToString(<OpenOrdersPanel state={s} csrf="c" />)).toContain("waiting on ORD-0001");
+    s = reduce(s, { type: "order", view: order("ORD-0002", { division: "ops", after: ["ORD-0001"], waiting_on: [] }) });
+    const html = renderToString(<OpenOrdersPanel state={s} csrf="c" />);
+    expect(html).not.toContain("waiting on");
+    expect(html).toContain('<span class="row-state">In the pool</span>');
+  });
+});

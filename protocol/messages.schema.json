@@ -148,15 +148,19 @@
       "required": ["ref", "category", "question"],
       "properties": {
         "ref": {"description": "Combadge-local hail id, echoed back in the answer.", "type": "string", "minLength": 1},
-        "category": {"description": "Hail category: clarifying_question, tool_approval, order_split (Command splitting its order into child orders, #155), tracker_comment or tracker_close (a request to comment on or close a tracker item, #54), budget (the harness is over its order's budget, #119); open so later categories (scope_change, destructive, egress, ...) fit.", "type": "string", "minLength": 1},
+        "category": {"description": "Hail category: clarifying_question, tool_approval, order_split (Command splitting its order into child orders, #155), order_reorder (Command changing the base and after of orders nobody has started, #148), tracker_comment or tracker_close (a request to comment on or close a tracker item, #54), budget (the harness is over its order's budget, #119); open so later categories (scope_change, destructive, egress, ...) fit.", "type": "string", "minLength": 1},
         "question": {"type": "string", "minLength": 1},
         "options": {"description": "Choices offered to the decider; absent or empty means free-text answer.", "type": "array", "items": {"type": "string"}},
-        "context": {"description": "Free-form context (files, diff stat, tool input...). The only open object in the protocol, except for an order_split hail's (order_split_context), a tracker request's (tracker_comment_context, tracker_close_context) and a budget hail's (budget_context).", "type": "object"}
+        "context": {"description": "Free-form context (files, diff stat, tool input...). The only open object in the protocol, except for an order_split hail's (order_split_context), an order_reorder hail's (order_reorder_context), a tracker request's (tracker_comment_context, tracker_close_context) and a budget hail's (budget_context).", "type": "object"}
       },
       "allOf": [
         {
           "if": {"required": ["category"], "properties": {"category": {"const": "order_split"}}},
           "then": {"required": ["options", "context"], "properties": {"options": {"const": ["allow", "deny"]}, "context": {"$ref": "#/$defs/order_split_context"}}}
+        },
+        {
+          "if": {"required": ["category"], "properties": {"category": {"const": "order_reorder"}}},
+          "then": {"required": ["options", "context"], "properties": {"options": {"const": ["allow", "deny"]}, "context": {"$ref": "#/$defs/order_reorder_context"}}}
         },
         {
           "if": {"required": ["category"], "properties": {"category": {"const": "tracker_comment"}}},
@@ -223,12 +227,41 @@
               "title": {"type": "string", "minLength": 1, "maxLength": 200},
               "body": {"type": "string", "minLength": 1},
               "division": {"description": "Absent: the parent order's.", "type": "string", "minLength": 1},
-              "priority": {"description": "0 routine, 1 yellow, 2 red. Absent: the parent order's.", "type": "integer", "minimum": 0, "maximum": 2}
+              "priority": {"description": "0 routine, 1 yellow, 2 red. Absent: the parent order's.", "type": "integer", "minimum": 0, "maximum": 2},
+              "after": {"description": "Earlier children of the same split, by 0-based index, this child waits on until each is done (#142). The bridge refuses its own or a later index.", "type": "array", "uniqueItems": true, "maxItems": 9, "items": {"type": "integer", "minimum": 0, "maximum": 8}}
             }
           }
         }
       }
     },
+    "order_reorder_context": {
+      "description": "An order_reorder hail's context (#148): the changes Command asks for to the base and after of orders nobody has started, and why. The bridge checks it again (bridge.checkReorder) and writes the question from the orders' current and proposed bases and afters. An allowed one is applied change by change, each rechecked; the answer has option 0 and what applied and what was skipped as the decision, or option 1 when nothing applied.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["changes", "reason"],
+      "properties": {
+        "changes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["order"],
+            "minProperties": 2,
+            "$comment": "minProperties: order and at least one of onto, after_add and after_remove.",
+            "properties": {
+              "order": {"$ref": "#/$defs/order_id"},
+              "onto": {"description": "The order's new base_ref: order:<id> or a ref. At most 256 bytes of UTF-8: the bridge and combadge count bytes, and maxLength, which counts characters, is only the schema's looser bound.", "type": "string", "minLength": 1, "maxLength": 256},
+              "after_add": {"description": "Orders to add to its after.", "type": "array", "minItems": 1, "maxItems": 10, "uniqueItems": true, "items": {"$ref": "#/$defs/order_id"}},
+              "after_remove": {"description": "Orders to drop from its after; not one its base implies.", "type": "array", "minItems": 1, "maxItems": 10, "uniqueItems": true, "items": {"$ref": "#/$defs/order_id"}}
+            }
+          }
+        },
+        "reason": {"type": "string", "minLength": 1, "maxLength": 1000}
+      }
+    },
+    "order_id": {"description": "An order id as the bridge makes them.", "type": "string", "pattern": "^ORD-[0-9]{4,}$"},
     "checkpoint_ready": {
       "description": "beam->bridge. A checkpoint is on the beam's disk for the bridge to scp into the cargo bay. Paths are absolute on the beam.",
       "type": "object",

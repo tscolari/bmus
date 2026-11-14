@@ -511,6 +511,16 @@ type Order struct {
 	// OpenChildren counts the order's child orders (parent_id) not yet
 	// ended (endedStates), read with the order.
 	OpenChildren int
+	// After are the orders this order waits on (the order_after table,
+	// #142), in their creation order: it is claimed only once each has
+	// ended done. InsertOrder takes them; WaitingOn, read with the order,
+	// are those not done yet.
+	After     []string
+	WaitingOn []string
+	// AfterSiblings are, for InsertChildOrders only, the earlier children
+	// of the same batch this child waits on, by index; the store adds
+	// their ids to After.
+	AfterSiblings []int
 	// Used is the order's usage (order_usage), summed over its beams,
 	// and AssigneeDivision its assignee's division, "" without one; both
 	// read with the order (#120).
@@ -534,6 +544,10 @@ type OrderRepo struct {
 
 const orderCols = `id, title, body, division, priority, state, assignee, parent_id, branch, budget_tokens, budget_turns, budget_extended, created_by, model, source, parked_at, progress_pct, progress_note,
 	(SELECT COUNT(*) FROM orders c WHERE c.parent_id = orders.id AND c.state NOT IN ` + endedSQL + `),
+	(SELECT COALESCE(group_concat(a.after_id, ' ' ORDER BY p.rowid), '') FROM order_after a JOIN orders p ON p.id = a.after_id
+		WHERE a.order_id = orders.id),
+	(SELECT COALESCE(group_concat(a.after_id, ' ' ORDER BY p.rowid), '') FROM order_after a JOIN orders p ON p.id = a.after_id
+		WHERE a.order_id = orders.id AND p.state <> 'done'),
 	(SELECT COALESCE(SUM(u.input_tokens), 0) FROM order_usage u WHERE u.order_id = orders.id),
 	(SELECT COALESCE(SUM(u.output_tokens), 0) FROM order_usage u WHERE u.order_id = orders.id),
 	(SELECT COALESCE(SUM(u.turns), 0) FROM order_usage u WHERE u.order_id = orders.id),
@@ -541,13 +555,15 @@ const orderCols = `id, title, body, division, priority, state, assignee, parent_
 
 func scanOrder(row interface{ Scan(...any) error }) (Order, error) {
 	var (
-		o      Order
-		parked sql.NullTime
-		pct    sql.NullFloat64
+		o              Order
+		parked         sql.NullTime
+		pct            sql.NullFloat64
+		after, waiting string
 	)
 	err := row.Scan(&o.ID, &o.Title, &o.Body, &o.Division, &o.Priority, &o.State, &o.Assignee, &o.ParentID, &o.Branch,
 		&o.BudgetTokens, &o.BudgetTurns, &o.BudgetExtended, &o.CreatedBy, &o.Model, &o.Source, &parked, &pct, &o.ProgressNote, &o.OpenChildren,
-		&o.Used.InputTokens, &o.Used.OutputTokens, &o.Used.Turns, &o.AssigneeDivision)
+		&after, &waiting, &o.Used.InputTokens, &o.Used.OutputTokens, &o.Used.Turns, &o.AssigneeDivision)
+	o.After, o.WaitingOn = strings.Fields(after), strings.Fields(waiting)
 	if parked.Valid {
 		o.ParkedAt = &parked.Time
 	}
@@ -593,7 +609,10 @@ func (s *Store) orderRepos(ctx context.Context, ids []string) (map[string][]Orde
 // InsertOrder creates an order and returns its generated id (ORD-0001, ...),
 // and appends entry, with its OrderID set to that id, to the captain's log,
 // in one transaction. o.ID and o.ParkedAt are ignored. An empty State
-// defaults to directed when Assignee is set, pool otherwise.
+// defaults to directed when Assignee is set, pool otherwise. o.After are
+// the orders it waits on (order_after, #142): an unknown order, the order
+// itself, or one that ended failed, belayed or withdrawn is refused
+// (ErrAfter, wrapped), and nothing is written.
 func (s *Store) InsertOrder(ctx context.Context, o Order, entry LogEntry) (string, error) {
 	var id string
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
@@ -632,9 +651,44 @@ func (s *Store) insertOrder(ctx context.Context, tx *sql.Tx, o Order, entry LogE
 			return "", fmt.Errorf("repo %s: %w", r.Name, err)
 		}
 	}
+	if err := insertAfter(ctx, tx, id, o.After); err != nil {
+		return "", err
+	}
 	entry.OrderID = id
 	_, err = s.appendLog(ctx, tx, entry)
 	return id, err
+}
+
+// ErrAfter is returned, wrapped, by InsertOrder and InsertChildOrders for
+// an after they refuse (#142): an order that doesn't exist, the order
+// itself, or one that ended failed, belayed or withdrawn and so never
+// will be done.
+var ErrAfter = errors.New("bad after")
+
+// insertAfter records, in tx, that order id waits on each of after
+// (order_after), refusing any ErrAfter names. A repeated id counts once.
+// An order already done is accepted: it is satisfied at once.
+func insertAfter(ctx context.Context, tx *sql.Tx, id string, after []string) error {
+	for _, a := range after {
+		if a == id {
+			return fmt.Errorf("after %s: an order can't wait on itself: %w", a, ErrAfter)
+		}
+		var state string
+		err := tx.QueryRowContext(ctx, `SELECT state FROM orders WHERE id = ?`, a).Scan(&state)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("after %s: no such order: %w", a, ErrAfter)
+		}
+		if err != nil {
+			return err
+		}
+		if state == OrderFailed || state == OrderBelayed || state == OrderWithdrawn {
+			return fmt.Errorf("after %s: it ended %s and will never be done: %w", a, state, ErrAfter)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO order_after (order_id, after_id) VALUES (?, ?)`, id, a); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ErrParentEnded is returned by InsertChildOrders when the parent order is
@@ -646,12 +700,17 @@ var ErrParentEnded = errors.New("parent order no longer away")
 // parent and its CreatedBy to createdBy, each logged "order created:
 // <title>" (kind order), then entry(ids), the split's own entry, appended
 // for the parent. It returns the children's ids, in children's order.
+// A child's AfterSiblings, indexes of earlier children, join its After as
+// those children's ids (#142); a later or its own index is ErrAfter.
 //
 // createdBy marks the batch: when the parent already has children created
 // by it, their ids are returned and nothing is written, so a re-run of the
 // step that made them makes no more. The parent must be away or hailing
 // (ErrParentEnded, wrapped, otherwise); a missing parent returns
 // sql.ErrNoRows.
+//
+// The same transaction withdraws the unclaimed orders based on the
+// parent's work, order:<parent> (cascadeBase, #143).
 func (s *Store) InsertChildOrders(ctx context.Context, parent, createdBy string, children []Order,
 	entry func(ids []string) (LogEntry, error)) (ids []string, err error) {
 	if createdBy == "" {
@@ -669,8 +728,15 @@ func (s *Store) InsertChildOrders(ctx context.Context, parent, createdBy string,
 		if state != OrderAway && state != OrderHailing {
 			return fmt.Errorf("order %s is %s: %w", parent, state, ErrParentEnded)
 		}
-		for _, c := range children {
+		for i, c := range children {
 			c.ParentID, c.CreatedBy = parent, createdBy
+			c.After = slices.Clone(c.After)
+			for _, j := range c.AfterSiblings {
+				if j < 0 || j >= i {
+					return fmt.Errorf("child %d: after %d: a child waits on earlier children only: %w", i, j, ErrAfter)
+				}
+				c.After = append(c.After, ids[j])
+			}
 			payload, err := withField(nil, "parent_id", parent)
 			if err != nil {
 				return err
@@ -686,13 +752,96 @@ func (s *Store) InsertChildOrders(ctx context.Context, parent, createdBy string,
 			return err
 		}
 		e.OrderID = parent
-		_, err = s.appendLog(ctx, tx, e)
-		return err
+		if _, err = s.appendLog(ctx, tx, e); err != nil {
+			return err
+		}
+		return s.cascadeBase(ctx, tx, parent, ids)
 	})
 	if err != nil {
 		return nil, err
 	}
 	return ids, nil
+}
+
+// OrderBasePrefix starts a repo's base_ref that names another order's
+// work (#143): order:<id>.
+const OrderBasePrefix = "order:"
+
+// cascadeBase withdraws, in tx, the unclaimed orders (pool or directed, no
+// parked mission) with a repo based on order:<parent>, which has just been
+// split into children (#143): a split order brings back no work of its
+// own. Each is logged "order withdrawn: ORD-0001 was split into ORD-0003,
+// ORD-0004: base it on one of them" (kind order, payload reason and base),
+// in rowid order, and its withdraw cascades to the orders waiting on it
+// (settleFamily). A claimed dependent is left alone; its ship-repos fails
+// with repo_failed. Each order withdrawn is added to ctx's AfterCascade,
+// if any.
+func (s *Store) cascadeBase(ctx context.Context, tx *sql.Tx, parent string, children []string) error {
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT o.id, o.assignee, o.rowid FROM order_repos r JOIN orders o ON o.id = r.order_id
+		WHERE r.base_ref = ? AND o.state IN (?, ?) AND o.parked_at IS NULL ORDER BY o.rowid`,
+		OrderBasePrefix+parent, OrderPool, OrderDirected)
+	if err != nil {
+		return err
+	}
+	type dep struct{ ID, Assignee string }
+	var deps []dep
+	for rows.Next() {
+		var d dep
+		var rowid int64
+		if err := rows.Scan(&d.ID, &d.Assignee, &rowid); err != nil {
+			rows.Close()
+			return err
+		}
+		deps = append(deps, d)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(deps) == 0 {
+		return err
+	}
+	reason := SplitBaseText(parent, children)
+	payload, err := json.Marshal(map[string]string{"reason": reason, "base": parent})
+	if err != nil {
+		return err
+	}
+	col, _ := ctx.Value(afterCascadeKey{}).(*AfterCascade)
+	for _, d := range deps {
+		at := col.add(d.ID)
+		withdrawn, err := s.withdraw(ctx, tx, d.ID, LogEntry{Kind: logKindOrder, CrewID: d.Assignee, OrderID: d.ID,
+			Text: "order withdrawn: " + reason, Payload: payload})
+		if err != nil {
+			return err
+		}
+		if !withdrawn {
+			col.dropAt(at) // an earlier dependent's chain withdrew it
+		}
+	}
+	return nil
+}
+
+// SplitBaseText says that order id, named as a base (#143), was split into
+// children: "ORD-0001 was split into ORD-0003, ORD-0004: base it on one of
+// them".
+func SplitBaseText(id string, children []string) string {
+	return id + " was split into " + strings.Join(children, ", ") + ": base it on one of them"
+}
+
+// ChildIDs returns the ids of order parent's child orders, in creation
+// order; none when it has none.
+func (s *Store) ChildIDs(ctx context.Context, parent string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM orders WHERE parent_id = ? ORDER BY rowid`, parent)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // ChildBatch returns the ids of order parent's children created by
@@ -915,7 +1064,9 @@ func (s *Store) ListOrders(ctx context.Context) ([]Order, error) {
 // ClaimOldestDirectedOrder returns the order crewID should be working on. A
 // crew member runs one mission at a time, so if it already has an away order
 // that order is returned unchanged; otherwise the highest-priority directed
-// order assigned to it, the oldest of those, is moved to away and returned. This makes a re-run of the
+// order assigned to it, the oldest of those, is moved to away and returned;
+// one waiting on an order in its after not yet done is skipped (#142).
+// This makes a re-run of the
 // claim (e.g. a replayed DBOS step) return the same order. found is false when
 // there is nothing to work on, or the crew member is dismissed or beaming
 // in (#106).
@@ -959,7 +1110,7 @@ func (s *Store) ClaimOldestDirectedOrder(ctx context.Context, crewID string, ent
 		}
 		err = tx.QueryRowContext(ctx, `
 			UPDATE orders SET state = ?
-			WHERE rowid = (SELECT rowid FROM orders WHERE assignee = ? AND state = ? `+claimOrderBy+` LIMIT 1)
+			WHERE rowid = (SELECT o.rowid FROM orders o WHERE o.assignee = ? AND o.state = ? AND NOT `+waitingSQL+` `+claimOrderBy+` LIMIT 1)
 			RETURNING id`, OrderAway, crewID, OrderDirected).Scan(&id)
 		if err != nil {
 			return err
@@ -984,9 +1135,16 @@ func (s *Store) ClaimOldestDirectedOrder(ctx context.Context, crewID string, ent
 // first, then the oldest.
 const claimOrderBy = `ORDER BY priority DESC, rowid ASC`
 
+// waitingSQL is true for order o, unclaimed, while it waits on an order in
+// its after not yet done (#142): a split order counts as not done until
+// it settles done. Both claims skip it.
+const waitingSQL = `EXISTS (SELECT 1 FROM order_after a JOIN orders p ON p.id = a.after_id
+	WHERE a.order_id = o.id AND p.state <> 'done')`
+
 // ClaimOldestPoolOrder claims the highest-priority pool order of division,
 // the oldest of those, for crewID (the standing-orders dispatcher, spec
-// phase-2-plan section 4): it sets the order's assignee to crewID and its
+// phase-2-plan section 4), skipping one waiting on an order in its after
+// not yet done (#142): it sets the order's assignee to crewID and its
 // state to away, sets the crew member away and appends entry, with its
 // OrderID set to the order's id, all in one transaction. A claimed pool
 // order is then indistinguishable from a claimed directed one, so the next
@@ -1012,7 +1170,7 @@ func (s *Store) ClaimOldestPoolOrder(ctx context.Context, crewID, division strin
 		}
 		err := tx.QueryRowContext(ctx, `
 			UPDATE orders SET state = ?, assignee = ?
-			WHERE rowid = (SELECT rowid FROM orders WHERE state = ? AND division = ? `+claimOrderBy+` LIMIT 1)
+			WHERE rowid = (SELECT o.rowid FROM orders o WHERE o.state = ? AND o.division = ? AND NOT `+waitingSQL+` `+claimOrderBy+` LIMIT 1)
 			RETURNING id`, OrderAway, crewID, OrderPool, division).Scan(&id)
 		if err != nil {
 			return err
@@ -1119,6 +1277,9 @@ const (
 // before its cascade touches any child (cascadeBelay): settleSplit,
 // which moves only a split order, leaves it alone.
 //
+// An order that ended failed, belayed or withdrawn withdraws the unclaimed
+// orders waiting on it (cascadeAfter, #142).
+//
 // A belayed order's children were cascaded to (cascadeBelay, #146). An
 // order that failed with child orders still open (its mission failed after
 // create-children) leaves them running: it logs "order ended with N open
@@ -1140,10 +1301,197 @@ func (s *Store) settleFamily(ctx context.Context, tx *sql.Tx, id string) error {
 			return err
 		}
 	}
+	if state != OrderDone {
+		if err := s.cascadeAfter(ctx, tx, id, state); err != nil {
+			return err
+		}
+	}
 	if parent != "" {
 		return s.settleSplit(ctx, tx, parent)
 	}
 	return nil
+}
+
+// cascadeAfter withdraws, in tx, the unclaimed orders (pool or directed,
+// no parked mission) waiting on order id, which has just ended state
+// (failed, belayed or withdrawn) and so will never be done (#142). Each
+// is logged "order withdrawn: it waits on ORD-0001, which failed" (or
+// "which was belayed", "which was withdrawn"; kind order, payload reason
+// and after), in rowid order, and its own withdraw cascades in turn
+// (settleFamily), down the chain. A dependent already claimed is left to
+// run, and nothing is logged for it. So is a child of a belayed parent:
+// that parent's cascadeBelay, under way in tx, withdraws it with its own
+// cause. Each order withdrawn is added to ctx's AfterCascade, if any.
+func (s *Store) cascadeAfter(ctx context.Context, tx *sql.Tx, id, state string) error {
+	rows, err := tx.QueryContext(ctx, `SELECT o.id, o.assignee FROM order_after a JOIN orders o ON o.id = a.order_id
+		WHERE a.after_id = ? AND o.state IN (?, ?) AND o.parked_at IS NULL
+		AND NOT EXISTS (SELECT 1 FROM orders p WHERE p.id = o.parent_id AND p.state = ?) ORDER BY o.rowid`,
+		id, OrderPool, OrderDirected, OrderBelayed)
+	if err != nil {
+		return err
+	}
+	type dep struct{ ID, Assignee string }
+	var deps []dep
+	for rows.Next() {
+		var d dep
+		if err := rows.Scan(&d.ID, &d.Assignee); err != nil {
+			rows.Close()
+			return err
+		}
+		deps = append(deps, d)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(deps) == 0 {
+		return err
+	}
+	how := "was " + state
+	if state == OrderFailed {
+		how = "failed"
+	}
+	reason := "it waits on " + id + ", which " + how
+	payload, err := json.Marshal(map[string]string{"reason": reason, "after": id})
+	if err != nil {
+		return err
+	}
+	col, _ := ctx.Value(afterCascadeKey{}).(*AfterCascade)
+	for _, d := range deps {
+		// Recorded before the withdraw, whose own cascade comes after
+		// it: the ids stay in chain order.
+		at := col.add(d.ID)
+		withdrawn, err := s.withdraw(ctx, tx, d.ID, LogEntry{Kind: logKindOrder, CrewID: d.Assignee, OrderID: d.ID,
+			Text: "order withdrawn: " + reason, Payload: payload})
+		if err != nil {
+			return err
+		}
+		if !withdrawn {
+			col.dropAt(at) // an earlier dependent's chain withdrew it
+		}
+	}
+	return nil
+}
+
+// AfterCascade collects the orders cascadeAfter withdraws in a write made
+// with the context WithAfterCascade returns (#142): a withdraw or a belay
+// reports them. A write runs fn once (inTx retries only its BEGIN), so
+// the ids are those its transaction withdrew.
+type AfterCascade struct {
+	mu  sync.Mutex
+	ids []string
+}
+
+type afterCascadeKey struct{}
+
+// WithAfterCascade returns ctx with a new AfterCascade, and that
+// collector.
+func WithAfterCascade(ctx context.Context) (context.Context, *AfterCascade) {
+	c := &AfterCascade{}
+	return context.WithValue(ctx, afterCascadeKey{}, c), c
+}
+
+// add records id and returns its index, for dropAt.
+func (c *AfterCascade) add(id string) int {
+	if c == nil {
+		return -1
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ids = append(c.ids, id)
+	return len(c.ids) - 1
+}
+
+// dropAt removes the id add recorded at i.
+func (c *AfterCascade) dropAt(i int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ids = slices.Delete(c.ids, i, i+1)
+}
+
+// IDs are the orders withdrawn, in the order the cascade reached them.
+func (c *AfterCascade) IDs() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.ids)
+}
+
+// WaitingChain returns, in tx, the orders a cascadeAfter from order id
+// would withdraw were id to end failed, belayed or withdrawn now (#142):
+// the unclaimed orders with no parked mission waiting on it, directly or
+// down the chain, in creation order. A belay request reports them.
+func WaitingChain(ctx context.Context, tx *sql.Tx, id string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `WITH RECURSIVE chain(id) AS (
+			SELECT ?
+			UNION
+			SELECT o.id FROM chain c JOIN order_after a ON a.after_id = c.id JOIN orders o ON o.id = a.order_id
+			WHERE o.state IN (?, ?) AND o.parked_at IS NULL)
+		SELECT o.id FROM chain c JOIN orders o ON o.id = c.id WHERE o.id <> ? ORDER BY o.rowid`,
+		id, OrderPool, OrderDirected, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		ids = append(ids, d)
+	}
+	return ids, rows.Err()
+}
+
+// OpenDependents returns the ids of the unclaimed orders (pool or
+// directed) waiting on order id (#142), in creation order: the console
+// refreshes them when id changes.
+func (s *Store) OpenDependents(ctx context.Context, id string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT o.id FROM order_after a JOIN orders o ON o.id = a.order_id
+		WHERE a.after_id = ? AND o.state IN (?, ?) ORDER BY o.rowid`, id, OrderPool, OrderDirected)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		ids = append(ids, d)
+	}
+	return ids, rows.Err()
+}
+
+// HasReadyDependents reports whether an unclaimed order waiting on order
+// id (#142), or on a split parent whose settle id's own settle made done
+// (up its parents, while each is done), now has every order in its after
+// done, so a claim would take it. An order id that isn't done has none.
+func (s *Store) HasReadyDependents(ctx context.Context, id string) (bool, error) {
+	for cur := id; cur != ""; {
+		var state, parent string
+		err := s.db.QueryRowContext(ctx, `SELECT state, parent_id FROM orders WHERE id = ?`, cur).Scan(&state, &parent)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if state != OrderDone {
+			return false, nil
+		}
+		var n int
+		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM order_after x JOIN orders o ON o.id = x.order_id
+			WHERE x.after_id = ? AND o.state IN (?, ?) AND NOT `+waitingSQL+`)`, cur, OrderPool, OrderDirected).Scan(&n); err != nil {
+			return false, err
+		}
+		if n == 1 {
+			return true, nil
+		}
+		cur = parent
+	}
+	return false, nil
 }
 
 // noteOrphans logs, in tx, the open child orders of order id, which has
@@ -2057,6 +2405,9 @@ type StatusSnapshot struct {
 	// RedOrders are the ids of open red orders (pool, directed, away or
 	// hailing with PriorityRed), in id order.
 	RedOrders []string
+	// RedWaiting are, by id, the orders in each unclaimed red order's
+	// after not done yet (#142); absent for one waiting on none.
+	RedWaiting map[string][]string
 	// CommandDown is whether Command's consults have nobody to go to:
 	// regs.yaml is configured, and the command division has crew members
 	// but none on deck. The bridge sets it from Crew (ReadStatus knows
@@ -2109,18 +2460,27 @@ func (s *Store) ReadStatus(ctx context.Context) (StatusSnapshot, error) {
 	if err := rows.Err(); err != nil {
 		return snap, err
 	}
-	rows, err = tx.QueryContext(ctx, `SELECT id FROM orders WHERE priority = ? AND state IN (?, ?, ?, ?) ORDER BY id`,
-		PriorityRed, OrderPool, OrderDirected, OrderAway, OrderHailing)
+	rows, err = tx.QueryContext(ctx, `SELECT o.id, CASE WHEN o.state IN (?, ?) THEN
+			(SELECT COALESCE(group_concat(a.after_id, ' ' ORDER BY p.rowid), '') FROM order_after a JOIN orders p ON p.id = a.after_id
+			WHERE a.order_id = o.id AND p.state <> 'done') ELSE '' END
+		FROM orders o WHERE o.priority = ? AND o.state IN (?, ?, ?, ?) ORDER BY o.id`,
+		OrderPool, OrderDirected, PriorityRed, OrderPool, OrderDirected, OrderAway, OrderHailing)
 	if err != nil {
 		return snap, err
 	}
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var id, waiting string
+		if err := rows.Scan(&id, &waiting); err != nil {
 			rows.Close()
 			return snap, err
 		}
 		snap.RedOrders = append(snap.RedOrders, id)
+		if w := strings.Fields(waiting); len(w) > 0 {
+			if snap.RedWaiting == nil {
+				snap.RedWaiting = map[string][]string{}
+			}
+			snap.RedWaiting[id] = w
+		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {

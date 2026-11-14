@@ -53,6 +53,7 @@ import {
   missionRecord,
   openHails,
   openOrders,
+  openOrderState,
   orderBranch,
   orderProgress,
   orderUsage,
@@ -920,7 +921,7 @@ export function OpenOrdersPanel(props: { state: State; csrf: string }) {
                 <span class="mono order-id">{o.id}</span>
                 <span class={`chip bg-${p.tone} on-${p.tone}`}>{p.label}</span>
                 {o.division && <span class={`chip-o tone-${d.tone}`}>{d.label}</span>}
-                <span class="row-state">{o.state === "pool" ? "In the pool" : `Queued for ${shortName(o.assignee)}`}</span>
+                <span class="row-state">{openOrderState(o)}</span>
               </div>
               <div class="order-title">{o.title}</div>
               <div class="row-actions">
