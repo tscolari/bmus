@@ -3,6 +3,7 @@ package trackertest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -19,7 +20,10 @@ type Comment struct {
 }
 
 // Fake is an in-memory tracker. Refs are "#<n>", numbered from 1 in
-// creation order. Items with Deps unset (nil) report no dependency data.
+// creation order. It keeps each item's labels as Create gave them, less
+// those Unlabel removed, and CloseReason reports how each closed item was
+// closed. NoDeps makes it report no dependency data. List takes items in
+// creation order and stops at a Query's Limit.
 // It honours a Mark's key (Since aside): a second Comment on a ref under
 // a key already recorded there posts nothing, and a second Create under
 // a key returns the item filed under it. Its zero value is ready to use;
@@ -107,8 +111,14 @@ func (f *Fake) List(_ context.Context, q tracker.Query) ([]tracker.Item, error) 
 	if f.Err != nil {
 		return nil, f.Err
 	}
+	if err := tracker.CheckLimit(q.Limit); err != nil {
+		return nil, err
+	}
 	var out []tracker.Item
 	for i := range f.items {
+		if q.Limit > 0 && len(out) == q.Limit {
+			break
+		}
 		it := f.view(i)
 		if (q.Parent == "" || it.Parent == q.Parent) && tracker.Fits(it, q) {
 			out = append(out, it)
@@ -191,6 +201,25 @@ func (f *Fake) Close(_ context.Context, ref, reason string) error {
 		f.reasons = map[string]string{}
 	}
 	f.reasons[ref] = reason
+	return nil
+}
+
+// Unlabel removes label from ref, matched case-insensitively. A label
+// ref lacks is no error.
+func (f *Fake) Unlabel(_ context.Context, ref, label string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Err != nil {
+		return f.Err
+	}
+	if strings.TrimSpace(label) == "" {
+		return errors.New("unlabel: no label")
+	}
+	i, err := f.index(ref)
+	if err != nil {
+		return err
+	}
+	f.items[i].Labels = slices.DeleteFunc(f.items[i].Labels, func(l string) bool { return strings.EqualFold(l, label) })
 	return nil
 }
 

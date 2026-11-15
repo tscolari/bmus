@@ -189,3 +189,53 @@ func TestFakeMark(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, items, 3)
 }
+
+// The fake keeps a created item's labels, removes one with Unlabel in any
+// case (an absent one is no error), reports each closed item's reason,
+// and stops List at a Query's Limit.
+func TestFakeLabelsCloseAndLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := &trackertest.Fake{}
+	a := f.Add(tracker.Item{Title: "a", Labels: []string{"bmus:unreviewed", "area:store"}})
+	b := f.Add(tracker.Item{Title: "b", Labels: []string{"bmus:unreviewed"}})
+	c := f.Add(tracker.Item{Title: "c", Labels: []string{"bmus:unreviewed"}})
+	f.Add(tracker.Item{Title: "d"})
+
+	it, err := f.Get(ctx, a)
+	require.NoError(t, err)
+	require.Equal(t, []string{"bmus:unreviewed", "area:store"}, it.Labels)
+	require.NoError(t, f.Unlabel(ctx, a, "BMUS:Unreviewed"))
+	require.NoError(t, f.Unlabel(ctx, a, "bmus:unreviewed"), "absent")
+	it, err = f.Get(ctx, a)
+	require.NoError(t, err)
+	require.Equal(t, []string{"area:store"}, it.Labels)
+	require.ErrorIs(t, f.Unlabel(ctx, "#9", "x"), tracker.ErrNotFound)
+	require.ErrorIs(t, f.Unlabel(ctx, "9", "x"), tracker.ErrBadRef)
+	require.ErrorContains(t, f.Unlabel(ctx, a, ""), "no label")
+
+	require.NoError(t, f.Close(ctx, b, tracker.ReasonNotPlanned))
+	require.NoError(t, f.Close(ctx, c, ""))
+	require.Equal(t, tracker.ReasonNotPlanned, f.CloseReason(b))
+	require.Equal(t, tracker.ReasonCompleted, f.CloseReason(c))
+	require.Equal(t, "", f.CloseReason(a), "open")
+
+	items, err := f.List(ctx, tracker.Query{State: tracker.StateAll, Limit: 2})
+	require.NoError(t, err)
+	require.Equal(t, []string{a, b}, refs(items))
+	items, err = f.List(ctx, tracker.Query{Limit: 1, Labels: []string{"bmus:unreviewed"}, State: tracker.StateAll})
+	require.NoError(t, err)
+	require.Equal(t, []string{b}, refs(items), "the limit counts what fits")
+	items, err = f.List(ctx, tracker.Query{})
+	require.NoError(t, err)
+	require.Len(t, items, 2, "no limit")
+	_, err = f.List(ctx, tracker.Query{Limit: -1})
+	require.ErrorContains(t, err, "limit -1")
+}
+
+func TestMissingLabels(t *testing.T) {
+	t.Parallel()
+	require.Nil(t, tracker.MissingLabels(nil, []string{"a"}))
+	require.Nil(t, tracker.MissingLabels([]string{"Area:Store"}, []string{"area:store"}))
+	require.Equal(t, []string{"b", "c"}, tracker.MissingLabels([]string{"a", "b", "c"}, []string{"A"}))
+}

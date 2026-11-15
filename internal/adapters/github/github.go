@@ -20,7 +20,7 @@
 // API, listing open blockers only, and nil where the API isn't available.
 // A sub-issue or blocker in another repository keeps its own ref, and its
 // BlockedBy is nil. Pull requests are left out of List and refused by Get,
-// Comment and Close.
+// Comment, Close and Unlabel.
 //
 // Comment and Create take a tracker.Mark (#206). Its key goes at the end
 // of the body as a hidden line, "<!-- bmus <key> -->", which GitHub keeps
@@ -484,26 +484,41 @@ const maxPages = 100
 
 // getAll GETs every page of a list at path.
 func getAll[T any](ctx context.Context, g *GitHub, path string, query url.Values) ([]T, error) {
+	var all []T
+	err := eachPage(ctx, g, path, query, func(page []T) bool {
+		all = append(all, page...)
+		return false
+	})
+	if err != nil {
+		return nil, err
+	}
+	return all, nil
+}
+
+// eachPage GETs the pages of a list at path in order, handing each to
+// fn, until fn reports it has enough or there is no next page.
+func eachPage[T any](ctx context.Context, g *GitHub, path string, query url.Values, fn func([]T) (enough bool)) error {
 	if query == nil {
 		query = url.Values{}
 	}
 	query.Set("per_page", "100")
-	var all []T
 	for range maxPages {
 		var page []T
 		h, err := g.do(ctx, http.MethodGet, path, query, nil, &page)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		all = append(all, page...)
+		if fn(page) {
+			return nil
+		}
 		m := nextRe.FindStringSubmatch(h.Get("Link"))
 		// Only follow links under the API URL: the token goes with them.
 		if m == nil || !strings.HasPrefix(m[1], g.cfg.APIURL+"/") {
-			return all, nil
+			return nil
 		}
 		path, query = m[1], nil
 	}
-	return nil, fmt.Errorf("github: %s: more than %d pages", path, maxPages)
+	return fmt.Errorf("github: %s: more than %d pages", path, maxPages)
 }
 
 func (g *GitHub) repoPath() string { return "/repos/" + g.cfg.Repo }
@@ -584,16 +599,21 @@ func (g *GitHub) milestoneNumber(ctx context.Context, title string) (int, error)
 
 // List reads the issues q fits, each with its open blockers. A parent's
 // sub-issues come from the sub-issues API and are filtered here; other
-// queries filter on GitHub's side. Pull requests are left out.
+// queries filter on GitHub's side. Pull requests are left out. With a
+// Limit, paging stops once that many issues fit, and only those have
+// their blockers read.
 func (g *GitHub) List(ctx context.Context, q tracker.Query) ([]tracker.Item, error) {
 	switch q.State {
 	case "", tracker.StateOpen, tracker.StateClosed, tracker.StateAll:
 	default:
 		return nil, fmt.Errorf("unknown state %q (want open, closed or all)", q.State)
 	}
+	if err := tracker.CheckLimit(q.Limit); err != nil {
+		return nil, err
+	}
 	var (
-		issues []issue
-		err    error
+		path   string
+		query  url.Values
 		parent string
 	)
 	if q.Parent != "" {
@@ -602,11 +622,9 @@ func (g *GitHub) List(ctx context.Context, q tracker.Query) ([]tracker.Item, err
 			return nil, err
 		}
 		parent = g.ref(n)
-		if issues, err = getAll[issue](ctx, g, fmt.Sprintf("%s/issues/%d/sub_issues", g.repoPath(), n), nil); err != nil {
-			return nil, err
-		}
+		path = fmt.Sprintf("%s/issues/%d/sub_issues", g.repoPath(), n)
 	} else {
-		query := url.Values{"state": {cmp.Or(q.State, tracker.StateOpen)}}
+		query = url.Values{"state": {cmp.Or(q.State, tracker.StateOpen)}}
 		if len(q.Labels) > 0 {
 			query.Set("labels", strings.Join(q.Labels, ","))
 		}
@@ -620,20 +638,33 @@ func (g *GitHub) List(ctx context.Context, q tracker.Query) ([]tracker.Item, err
 			}
 			query.Set("milestone", strconv.Itoa(m))
 		}
-		if issues, err = getAll[issue](ctx, g, g.repoPath()+"/issues", query); err != nil {
-			return nil, err
+		path = g.repoPath() + "/issues"
+	}
+	var kept []issue
+	err := eachPage(ctx, g, path, query, func(page []issue) bool {
+		for _, i := range page {
+			if i.PullRequest != nil && string(i.PullRequest) != "null" {
+				continue
+			}
+			it := g.item(i)
+			it.Parent = parent
+			if !tracker.Fits(it, q) {
+				continue
+			}
+			kept = append(kept, i)
+			if len(kept) == q.Limit {
+				return true
+			}
 		}
+		return false
+	})
+	if err != nil {
+		return nil, err
 	}
 	out := []tracker.Item{}
-	for _, i := range issues {
-		if i.PullRequest != nil && string(i.PullRequest) != "null" {
-			continue
-		}
+	for _, i := range kept {
 		it := g.item(i)
 		it.Parent = parent
-		if !tracker.Fits(it, q) {
-			continue
-		}
 		if it.BlockedBy, err = g.blockedBy(ctx, i); err != nil {
 			return nil, err
 		}
@@ -649,9 +680,15 @@ func (g *GitHub) List(ctx context.Context, q tracker.Query) ([]tracker.Item, err
 // created. When a later call fails, the issue already exists: the item
 // comes back with its Ref and the error.
 //
+// Last, the issue must carry every label asked for: GitHub drops labels
+// silently for a token without push access. One that lacks any comes back
+// with its Ref and an error wrapping tracker.ErrLabels that names them,
+// after its links are added.
+//
 // With a key, the body ends with its marker. An issue already filed under
 // it (filed) is taken instead of a new one, and only its missing links
-// are added.
+// are added. Its labels are checked the same way, so a retry reports the
+// labels the first attempt lost.
 func (g *GitHub) Create(ctx context.Context, it tracker.Item, m tracker.Mark) (tracker.Item, error) {
 	if strings.TrimSpace(it.Title) == "" {
 		return tracker.Item{}, errors.New("an issue needs a title")
@@ -747,6 +784,10 @@ func (g *GitHub) Create(ctx context.Context, it tracker.Item, m tracker.Mark) (t
 		if b.State == tracker.StateOpen {
 			out.BlockedBy = append(out.BlockedBy, g.ref(b.Number))
 		}
+	}
+	if missing := tracker.MissingLabels(it.Labels, out.Labels); len(missing) > 0 {
+		return out, fmt.Errorf("%s created without the labels %s (GitHub drops labels for a token without push access): %w",
+			out.Ref, strings.Join(missing, ", "), tracker.ErrLabels)
 	}
 	return out, nil
 }
@@ -942,6 +983,24 @@ func (g *GitHub) Comment(ctx context.Context, ref, body string, m tracker.Mark) 
 		map[string]any{"body": withMarker(body, m.Key)}, nil)
 	if err != nil && m.Key != "" && mayHaveLanded(err) {
 		return g.recheck(ctx, err, "the comment may have been posted", func() (bool, error) { return g.commented(ctx, n, m) })
+	}
+	return err
+}
+
+// Unlabel removes label from issue ref. The issue is read first, so a pull
+// request or a missing issue is refused; a 404 from the DELETE after that
+// is GitHub saying the issue lacks the label, which is done.
+func (g *GitHub) Unlabel(ctx context.Context, ref, label string) error {
+	if strings.TrimSpace(label) == "" {
+		return errors.New("unlabel: no label")
+	}
+	n, err := g.target(ctx, ref)
+	if err != nil {
+		return err
+	}
+	_, err = g.do(ctx, http.MethodDelete, fmt.Sprintf("%s/issues/%d/labels/%s", g.repoPath(), n, url.PathEscape(label)), nil, nil, nil)
+	if errors.Is(err, tracker.ErrNotFound) {
+		return nil
 	}
 	return err
 }
