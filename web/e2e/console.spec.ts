@@ -280,13 +280,20 @@ interface FakeIssue {
   state: "open" | "closed";
   state_reason: string | null;
   labels: string[];
+  /** The ids of the issues that block it. */
+  blocked_by: number[];
 }
 
 /**
  * The GitHub REST endpoints the bridge's tracker adapter calls to file,
  * list, unlabel and close issues (internal/adapters/github), on loopback:
- * the adapter takes an http api_url only for a loopback host. Issues have
- * no blockers, and the token's account is the author of every issue.
+ * the adapter takes an http api_url only for a loopback host. Blockers go
+ * through the issue dependencies endpoints (POST and GET
+ * .../dependencies/blocked_by), and issue_dependencies_summary counts
+ * them. Any other path is a 404, which the adapter reads as "not found"
+ * (tracker.ErrNotFound): a call the fake lacks fails that way, quietly
+ * for a read of dependencies. Sub-issues and milestones are among them.
+ * The token's account is the author of every issue.
  */
 class FakeGitHub {
   static readonly tokenEnv = "BMUS_E2E_GITHUB_TOKEN";
@@ -312,7 +319,7 @@ class FakeGitHub {
   /** Files an issue as the adapter's Create would, and returns it. */
   add(title: string, labels: string[] = []): FakeIssue {
     const n = this.issues.length + 1;
-    const is: FakeIssue = { id: 1000 + n, number: n, title, body: "", state: "open", state_reason: null, labels };
+    const is: FakeIssue = { id: 1000 + n, number: n, title, body: "", state: "open", state_reason: null, labels, blocked_by: [] };
     this.issues.push(is);
     return is;
   }
@@ -325,7 +332,7 @@ class FakeGitHub {
     return {
       id: i.id, number: i.number, title: i.title, body: i.body, state: i.state, state_reason: i.state_reason,
       labels: i.labels.map((name) => ({ name })), repository_url: `${this.url}/repos/${this.repo}`,
-      user: { id: 1, login: "bmus-e2e" }, issue_dependencies_summary: { blocked_by: 0 },
+      user: { id: 1, login: "bmus-e2e" }, issue_dependencies_summary: { blocked_by: i.blocked_by.length },
     };
   }
 
@@ -341,7 +348,13 @@ class FakeGitHub {
       if (req.headers.authorization !== "Bearer e2e-token") return send(401, { message: "Bad credentials" });
       const u = new URL(req.url ?? "/", this.url);
       const base = `/repos/${this.repo}/issues`;
-      const body = (raw ? JSON.parse(raw) : {}) as { title?: string; body?: string; labels?: string[]; state?: "open" | "closed"; state_reason?: string };
+      type Body = { title?: string; body?: string; labels?: string[]; state?: "open" | "closed"; state_reason?: string; issue_id?: number };
+      let body: Body;
+      try {
+        body = (raw ? JSON.parse(raw) : {}) as Body;
+      } catch {
+        return send(400, { message: "Problems parsing JSON" });
+      }
       if (req.method === "GET" && u.pathname === "/user") return send(200, { id: 1, login: "bmus-e2e" });
       if (u.pathname === base && req.method === "GET") {
         const state = u.searchParams.get("state") ?? "open";
@@ -357,9 +370,16 @@ class FakeGitHub {
         is.body = body.body ?? "";
         return send(201, this.view(is));
       }
-      const m = new RegExp(`^${base}/(\\d+)(/labels/(.+))?$`).exec(u.pathname);
+      const m = new RegExp(`^${base}/(\\d+)(/labels/(.+)|/dependencies/blocked_by)?$`).exec(u.pathname);
       const is = m ? this.issue(Number(m[1])) : undefined;
       if (!m || !is) return notFound();
+      if (m[2] === "/dependencies/blocked_by") {
+        if (req.method === "GET") return send(200, this.issues.filter((b) => is.blocked_by.includes(b.id)).map((b) => this.view(b)));
+        const blocker = this.issues.find((b) => b.id === body.issue_id);
+        if (req.method !== "POST" || !blocker) return notFound();
+        if (!is.blocked_by.includes(blocker.id)) is.blocked_by.push(blocker.id);
+        return send(201, this.view(is));
+      }
       if (m[3] !== undefined && req.method === "DELETE") {
         const name = decodeURIComponent(m[3]);
         if (!is.labels.includes(name)) return notFound();
@@ -458,7 +478,7 @@ test("an order goes away, hails, is answered and comes back done", async ({ page
 
   // Answer it; it closes, the order is back away and the mission finishes.
   await hails.getByRole("button", { name: "allow", exact: true }).click();
-  await expect(hails).toBeHidden({ timeout: missionTimeout });
+  await lastHailAnswered(page, hails);
   await expect(row.locator(".row-state")).toHaveText("Away");
 
   const record = page.getByRole("region", { name: "Mission record" });
@@ -579,6 +599,19 @@ test.describe("with notifications granted", () => {
 });
 
 /** Collects the page's console errors, but a refused action's "Failed to load resource" (the test asks for those). */
+/**
+ * Waits for the last open hail's card, which held focus, to go: focus
+ * moves to the hails panel's heading, which says all hails are answered,
+ * and the panel goes once focus leaves it (#157).
+ */
+async function lastHailAnswered(page: Page, hails: Locator) {
+  await expect(hails.getByRole("heading", { name: "Hailing frequencies open" })).toBeFocused({ timeout: missionTimeout });
+  await expect(hails).toContainText("All hails answered.");
+  await expect(hails.locator(".row.hail")).toHaveCount(0);
+  await page.keyboard.press("Tab");
+  await expect(hails).toBeHidden();
+}
+
 function pageErrors(page: Page): string[] {
   const errors: string[] = [];
   page.on("console", (m) => {
@@ -678,7 +711,7 @@ test("Phase 2 controls: standing orders, withdraw, route, belay and recall", asy
   await expect(card).toBeVisible({ timeout: missionTimeout });
   await card.getByRole("button", { name: `Belay order ${belayed}` }).click();
   await card.getByRole("group", { name: `Belay ${belayed}? The order is abandoned.` }).getByRole("button", { name: "Belay" }).click();
-  await expect(hails).toBeHidden({ timeout: missionTimeout });
+  await lastHailAnswered(page, hails);
   await expect(recordRow(belayed)).toContainText("Belayed", { timeout: missionTimeout });
   await expect(sorell).toContainText("On deck", { timeout: missionTimeout });
 
@@ -796,7 +829,7 @@ test("Command's split, approved from the page, waits on its open children", asyn
     .toBeVisible({ timeout: missionTimeout });
   await expect(hails.getByText("the agent's own words")).toHaveCount(0);
   await hails.getByRole("button", { name: "allow", exact: true }).click();
-  await expect(hails).toBeHidden({ timeout: missionTimeout });
+  await lastHailAnswered(page, hails);
 
   // The children wait in the science pool, which nobody serves; the
   // parent's mission is over and it waits on them.
@@ -1001,7 +1034,10 @@ test("an order's findings, filed and triaged by Command, are reviewed from the p
     // The agent's title is text.
     await expect(card.getByText("<script>alert(1)</script> **Snapshot** writer leaks a handle", { exact: true })).toBeVisible();
     await expect(card.locator("script")).toHaveCount(0);
-    await expect(card).toContainText("Dropped: duplicate of acme/app#1; 3 is a typo in a comment; 2 repeats #1");
+    // Command's rationale once; each dropped row its own reason.
+    await expect(card.getByText("Command: 3 is a typo in a comment; 2 repeats #1", { exact: true })).toHaveCount(1);
+    await expect(card).toContainText("Dropped: duplicate of acme/app#1");
+    await expect(card).toContainText("Dropped by Command");
 
     // Discard all asks first; Cancel puts it back and sends nothing.
     await card.getByRole("button", { name: "Discard all 2 issues from" }).click();
@@ -1010,11 +1046,20 @@ test("an order's findings, filed and triaged by Command, are reviewed from the p
     await confirm.getByRole("button", { name: "Cancel" }).click();
     await expect(card.getByRole("button", { name: "Discard all 2 issues from" })).toBeFocused();
 
-    // Discard #3, restore c-typo.
+    // Every issue ticked: Apply asks first, as Discard all does.
+    const discard2 = card.getByRole("checkbox", { name: "Discard acme/app#2" });
     const discard3 = card.getByRole("checkbox", { name: "Discard acme/app#3" });
+    await discard2.check();
     await discard3.check();
+    await card.getByRole("button", { name: /^Apply/ }).click();
+    const applyAll = card.getByRole("group", { name: "Close all 2 issues as not planned?" });
+    await expect(applyAll.getByRole("button", { name: "Apply" })).toBeFocused();
+    await applyAll.getByRole("button", { name: "Cancel" }).click();
+    await discard2.uncheck();
+
+    // Discard #3, restore c-typo.
     await card.getByRole("checkbox", { name: "Restore c-typo" }).check();
-    await expect(card.getByText("Apply: Keeps 1, discards 1, restores 1")).toBeVisible();
+    await expect(card.getByText("Apply keeps 1, discards 1, restores 1")).toBeVisible();
 
     // A refusal from the bridge shows on the card, and the boxes stay.
     await page.route("**/api/hails/*/answer", (route) =>
@@ -1030,8 +1075,9 @@ test("an order's findings, filed and triaged by Command, are reviewed from the p
       if (r.method() === "POST" && r.url().endsWith("/answer")) sent = r.postData() ?? "";
     });
     await card.getByRole("button", { name: "Apply" }).click();
-    // The feed closes the hail, and its card goes.
-    await expect(card).toBeHidden({ timeout: missionTimeout });
+    // The feed closes the hail, and its card goes; focus moves to the
+    // panel's heading, the last hail answered.
+    await lastHailAnswered(page, hails);
     expect(JSON.parse(sent)).toEqual({ decision: "discard acme/app#3; restore c-typo" });
 
     const { hails: decided } = JSON.parse(await bridge.bmus("hails", "list", "--status", "decided", "--json")) as {

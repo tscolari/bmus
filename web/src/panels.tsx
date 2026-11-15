@@ -70,9 +70,13 @@ import {
   pushRejectedText,
   pushRemotes,
   queuedFor,
+  discardAllPrompt,
+  restoreKeys,
+  reviewAllDecision,
   reviewContext,
   reviewDecision,
   reviewSummary,
+  triageRationale,
   routeArgs,
   routeValue,
   shortName,
@@ -94,9 +98,9 @@ function errorText(err: unknown): string {
 }
 
 /** The sections' heading: a coloured tab and the title. */
-function Heading(props: { id: string; tone: Tone; blink?: boolean; children: ComponentChildren }) {
+function Heading(props: { id: string; tone: Tone; blink?: boolean; focusable?: boolean; onBlur?: () => void; children: ComponentChildren }) {
   return (
-    <h2 id={props.id} class="sect">
+    <h2 id={props.id} class="sect" {...(props.focusable && { tabIndex: -1, onBlur: props.onBlur })}>
       <span class={`tab bg-${props.tone}${props.blink ? " blink" : ""}`} aria-hidden="true" />
       {props.children}
     </h2>
@@ -137,8 +141,10 @@ export function ConfirmAction(props: {
   prompt: string;
   confirmLabel: string;
   run: () => Promise<unknown>;
-  /** Not askable yet (e.g. a field it needs is empty). */
+  /** Not askable yet (e.g. a field it needs is empty), or, in the confirm step, not confirmable now. */
   disabled?: boolean;
+  /** The first button's class; "btn ghost" by default. */
+  askClass?: string;
 }) {
   const [phase, setPhase] = useState<ConfirmPhase>("idle");
   const [error, setError] = useState("");
@@ -176,7 +182,7 @@ export function ConfirmAction(props: {
         <button
           ref={askRef}
           type="button"
-          class="btn ghost"
+          class={props.askClass ?? "btn ghost"}
           aria-label={props.ariaLabel}
           disabled={phase === "sent" || props.disabled === true}
           onClick={() => {
@@ -201,7 +207,7 @@ export function ConfirmAction(props: {
           <span id={promptId} class="confirm-q">
             {props.prompt}
           </span>
-          <button ref={confirmRef} type="button" class="btn red" disabled={phase === "pending"} onClick={() => void go()}>
+          <button ref={confirmRef} type="button" class="btn red" disabled={phase === "pending" || props.disabled === true} onClick={() => void go()}>
             {phase === "pending" ? "Sending" : props.confirmLabel}
           </button>
           <button type="button" class="btn ghost" disabled={phase === "pending"} onClick={back}>
@@ -648,15 +654,46 @@ export function focusComposer(doc: Document = document) {
 
 /* Hails ----------------------------------------------------------------- */
 
+/**
+ * The open hails. When the card that holds focus leaves (its hail was
+ * answered, here or elsewhere), focus moves to the card now in its place,
+ * else the one before it, else the panel's heading, which stays with "All
+ * hails answered." until focus leaves it: a keyboard user keeps their
+ * place in the panel.
+ */
 export function HailsPanel(props: { state: State; csrf: string }) {
   const hails = openHails(props.state);
-  if (hails.length === 0) return null;
+  const ids = hails.map((h) => h.id);
+  const focused = useRef("");
+  const [cleared, setCleared] = useState(false);
+  useEffect(() => {
+    const gone = focused.current;
+    if (gone === "" || ids.includes(gone)) return;
+    focused.current = "";
+    const active = document.activeElement;
+    if (active !== null && active !== document.body) return; // focus went elsewhere
+    const next = hails.find((h) => h.id > gone) ?? hails[hails.length - 1];
+    if (next) document.getElementById(hailCardId(next.id))?.focus();
+    else setCleared(true);
+  }, [ids.join(" ")]);
+  useEffect(() => {
+    if (cleared && ids.length > 0) setCleared(false);
+    else if (cleared) document.getElementById("hail-h")?.focus();
+  }, [cleared, ids.length]);
+  if (hails.length === 0 && !cleared) return null;
   return (
     <section class="panel hails area-hails" aria-labelledby="hail-h">
-      <Heading id="hail-h" tone="blue" blink>
+      <Heading id="hail-h" tone="blue" blink={hails.length > 0} focusable onBlur={() => setCleared(false)}>
         Hailing frequencies open
       </Heading>
-      <div class="stack">
+      {hails.length === 0 && <p class="notice">All hails answered.</p>}
+      <div
+        class="stack"
+        onFocusIn={(e) => {
+          const card = (e.target as HTMLElement).closest?.(".row.hail");
+          if (card?.id) focused.current = card.id.slice(hailCardId("").length);
+        }}
+      >
         {hails.map((h) => {
           switch (hailKind(h)) {
             case "review":
@@ -796,17 +833,23 @@ export function TriageCard(props: { hail: HailView }) {
   );
 }
 
-type ReviewSent = "" | "answer" | "discard-all";
+type ReviewSent = "" | "answer" | "confirmed";
 
 /**
  * The findings review (#156, #157): the issues filed from an order's
  * findings, each with a Discard box, and the findings triage dropped or
- * filing failed, each with a Restore box and its reason. Keep all is
- * option 0. Apply sends the answer the boxes make, in the bridge's normal
- * form (reviewDecision): nothing ticked keeps everything. Discard all is
- * option 1, behind a confirm. Titles, reasons and errors are the agent's
- * or Command's text, shown as text; a ref links to its issue only where
- * issueURL can tell the address.
+ * filing failed, each with a Restore box and its reason, numbered as
+ * `bmus hails review` numbers them. Command's rationale shows once, above
+ * the findings it dropped.
+ *
+ * Keep all keeps every issue and Discard all discards every one, behind a
+ * confirm; either also restores the findings ticked. Apply sends the
+ * answer the boxes make (reviewDecision): nothing ticked keeps everything,
+ * discards name their refs, and every issue ticked asks first as Discard
+ * all does. Without restores, Keep all and Discard all send option 0 and
+ * 1. One answer at a time: every control waits on a pending one. Titles,
+ * reasons and errors are the agent's or Command's text, shown as text; a
+ * ref links to its issue only where issueURL can tell the address.
  */
 export function ReviewCard(props: { hail: HailView; repoUrls: Readonly<Record<string, string>>; csrf: string }) {
   const { hail: h } = props;
@@ -834,6 +877,17 @@ export function ReviewCard(props: { hail: HailView; repoUrls: Readonly<Record<st
       setPending(false);
     }
   };
+  // A confirm's run: ConfirmAction shows its refusal and its "Sent" note.
+  const confirmed = async (args: { option?: number; decision?: string }) => {
+    setPending(true);
+    setError("");
+    try {
+      await answerHail(props.csrf, h.id, args);
+      setSent("confirmed");
+    } finally {
+      setPending(false);
+    }
+  };
   const toggle = (set: ReadonlySet<string>, put: (s: ReadonlySet<string>) => void, v: string, on: boolean) => {
     const next = new Set(set);
     if (on) next.add(v);
@@ -845,9 +899,14 @@ export function ReviewCard(props: { hail: HailView; repoUrls: Readonly<Record<st
   const cardId = hailCardId(h.id);
   const sumId = `${cardId}-sum`;
   const findings = [
-    ...rc.dropped.map((f) => ({ key: f.key, title: f.title, kind: "dropped" as const, why: f.why, dup: f.duplicate_of })),
-    ...rc.failed.map((f) => ({ key: f.key, title: f.title, kind: "failed" as const, why: f.error, dup: undefined })),
+    ...rc.dropped.map((f) => ({ key: f.key, title: f.title, kind: "dropped" as const, dup: f.duplicate_of, error: "" })),
+    ...rc.failed.map((f) => ({ key: f.key, title: f.title, kind: "failed" as const, dup: undefined, error: f.error })),
   ];
+  const rationale = triageRationale(rc);
+  const keys = restoreKeys(rc, restore);
+  const keepDecision = reviewAllDecision(rc, "keep", restore);
+  const discardDecision = reviewAllDecision(rc, "discard", restore);
+  const allTicked = rc.issues.length > 0 && rc.issues.every((i) => discard.has(i.ref));
   const ref = (r: string) => {
     const url = issueURL(r, props.repoUrls);
     return url ? (
@@ -874,6 +933,9 @@ export function ReviewCard(props: { hail: HailView; repoUrls: Readonly<Record<st
               const id = `${cardId}-d${i}`;
               return (
                 <li key={is.ref} class={`review-item discard${discard.has(is.ref) ? " ticked" : ""}`}>
+                  <span class="review-n mono" aria-hidden="true">
+                    {i + 1}
+                  </span>
                   <input
                     id={id}
                     type="checkbox"
@@ -898,11 +960,19 @@ export function ReviewCard(props: { hail: HailView; repoUrls: Readonly<Record<st
       {findings.length > 0 && (
         <fieldset class="review-set" disabled={busy}>
           <legend class="review-legend">Not filed: {findings.length}</legend>
+          {rationale.map((r, i) => (
+            <p key={i} class="mono review-rationale">
+              Command: {r}
+            </p>
+          ))}
           <ul class="review-list">
             {findings.map((f, i) => {
               const id = `${cardId}-r${i}`;
               return (
                 <li key={f.key} class={`review-item restore${restore.has(f.key) ? " ticked" : ""}`}>
+                  <span class="review-n mono" aria-hidden="true">
+                    {rc.issues.length + i + 1}
+                  </span>
                   <input
                     id={id}
                     type="checkbox"
@@ -919,14 +989,7 @@ export function ReviewCard(props: { hail: HailView; repoUrls: Readonly<Record<st
                     {f.title}
                   </span>
                   <span id={`${id}-w`} class={`review-why mono${f.kind === "failed" ? " failed" : ""}`}>
-                    {f.kind === "failed" ? "Failed: " : "Dropped: "}
-                    {f.dup !== undefined && (
-                      <>
-                        duplicate of {ref(f.dup)}
-                        {f.why ? "; " : ""}
-                      </>
-                    )}
-                    {f.why}
+                    {f.kind === "failed" ? `Failed: ${f.error}` : f.dup !== undefined ? <>Dropped: duplicate of {ref(f.dup)}</> : "Dropped by Command"}
                   </span>
                 </li>
               );
@@ -935,33 +998,50 @@ export function ReviewCard(props: { hail: HailView; repoUrls: Readonly<Record<st
         </fieldset>
       )}
       <p id={sumId} class="mono hail-ctx">
-        Apply: {reviewSummary(rc, discard, restore)}
+        {reviewSummary(rc, discard, restore)}
       </p>
       <div class="btns">
-        <button type="button" class="btn blue" disabled={busy} onClick={() => void answer({ option: 0 })}>
-          Keep all
-        </button>
         <button
           type="button"
-          class="btn blue-o"
+          class="btn blue"
           disabled={busy}
-          aria-describedby={sumId}
-          onClick={() => void answer({ decision: reviewDecision(rc, discard, restore) })}
+          aria-label={keys.length > 0 ? `Keep all and restore ${keys.join(", ")}` : undefined}
+          onClick={() => void answer(keepDecision ? { decision: keepDecision } : { option: 0 })}
         >
-          Apply
+          Keep all
         </button>
+        {allTicked ? (
+          <ConfirmAction
+            key="apply-all"
+            idBase={`${cardId}-apply`}
+            label="Apply"
+            ariaLabel={`Apply: ${reviewSummary(rc, discard, restore).replace(/^Apply /, "")}`}
+            askClass="btn blue-o"
+            prompt={discardAllPrompt(rc, restore)}
+            confirmLabel="Apply"
+            disabled={busy}
+            run={() => confirmed({ decision: reviewDecision(rc, discard, restore) })}
+          />
+        ) : (
+          <button
+            type="button"
+            class="btn blue-o"
+            disabled={busy}
+            aria-describedby={sumId}
+            onClick={() => void answer({ decision: reviewDecision(rc, discard, restore) })}
+          >
+            Apply
+          </button>
+        )}
         {rc.issues.length > 0 && (
           <ConfirmAction
             idBase={`${cardId}-all`}
             label="Discard all"
             ariaLabel={`Discard all ${issuesText(rc.issues.length)} from ${h.id}`}
-            prompt={`Close all ${issuesText(rc.issues.length)} as not planned?`}
+            prompt={discardAllPrompt(rc, restore)}
             confirmLabel="Discard all"
             disabled={busy}
-            run={async () => {
-              await answerHail(props.csrf, h.id, { option: 1 });
-              setSent("discard-all");
-            }}
+            run={() => confirmed(discardDecision ? { decision: discardDecision } : { option: 1 })}
           />
         )}
       </div>

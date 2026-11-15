@@ -4,7 +4,17 @@ import type { HailView, ReviewContext } from "../src/api.js";
 import { hailNotice, notifies } from "../src/notify.js";
 import { HailCard, HailsPanel, ReviewCard, TriageCard } from "../src/panels.js";
 import { emptyState, reduce } from "../src/store.js";
-import { bridgeHailOrder, hailKind, issueURL, reviewContext, reviewDecision, reviewSummary } from "../src/view.js";
+import {
+  bridgeHailOrder,
+  discardAllPrompt,
+  hailKind,
+  issueURL,
+  reviewAllDecision,
+  reviewContext,
+  reviewDecision,
+  reviewSummary,
+  triageRationale,
+} from "../src/view.js";
 import { crew, hail, order, snapshot } from "./fixtures.js";
 
 const hostile = `<script>alert(1)</script> **bold** [link](https://example.com) <img src=x onerror="alert(1)">`;
@@ -17,7 +27,7 @@ const context: ReviewContext = {
     { ref: "acme/app#4", key: "c", title: "Compactor holds the lock" },
   ],
   dropped: [
-    { key: "noise", title: "Typo in a comment", why: "noise, not worth an issue" },
+    { key: "noise", title: "Typo in a comment", why: hostile },
     { key: "dup", title: "TestSnapshot is flaky", why: hostile, duplicate_of: "acme/app#1" },
   ],
   failed: [{ key: "lost", title: "Lost finding", error: "github: POST /repos/acme/app/issues: 502 Bad Gateway" }],
@@ -58,11 +68,15 @@ describe("ReviewCard (#157)", () => {
     for (const [i, key] of ["noise", "dup", "lost"].entries()) {
       expect(html).toContain(`<label for="hail-H-0007-r${i}" class="review-verb">Restore<span class="sr-only"> ${key}</span></label>`);
     }
-    expect(html).toContain("Dropped: noise, not worth an issue");
+    expect(html).toContain(">Dropped by Command<");
     expect(html).toContain("Failed: github: POST /repos/acme/app/issues: 502 Bad Gateway");
     expect(html).toContain("Dropped: duplicate of ");
+    // Command's rationale, the same on both dropped rows, shows once.
+    expect(html.split("Command: ").length - 1).toBe(1);
+    // Rows are numbered on through the lists, as bmus hails review numbers them.
+    expect([...html.matchAll(/<span class="review-n mono" aria-hidden="true">(\d+)<\/span>/g)].map((m) => m[1])).toEqual(["1", "2", "3", "4", "5", "6"]);
     // Nothing ticked: Apply keeps everything.
-    expect(html).toContain("Apply: Keeps 3, discards 0, restores 0");
+    expect(html).toContain("Apply keeps 3, discards 0, restores 0");
   });
 
   it("offers Keep all and Apply, and Discard all only as a confirm's first step", () => {
@@ -90,7 +104,7 @@ describe("ReviewCard (#157)", () => {
     expect(html).not.toContain("<script");
     expect(html).not.toContain("<img");
     expect(html).toContain("&lt;script>alert(1)&lt;/script> **bold** [link](https://example.com) &lt;img src=x onerror=");
-    // Two places: the issue's title and the dropped finding's reason.
+    // Two places: the issue's title and Command's rationale.
     expect(html.split("&lt;script>").length - 1).toBe(2);
     expect(html).not.toContain('href="https://example.com"');
   });
@@ -110,21 +124,35 @@ describe("reviewDecision", () => {
 
   it("is keep with nothing ticked, never a bare discard", () => {
     expect(reviewDecision(rc, set(), set())).toBe("keep");
-    expect(reviewSummary(rc, set(), set())).toBe("Keeps 3, discards 0, restores 0");
+    expect(reviewSummary(rc, set(), set())).toBe("Apply keeps 3, discards 0, restores 0");
   });
 
   it("names the refs ticked in the context's order", () => {
     expect(reviewDecision(rc, set("acme/app#4", "acme/app#2"), set())).toBe("discard acme/app#2 acme/app#4");
   });
 
-  it("is the bare discard only when every issue is ticked", () => {
-    expect(reviewDecision(rc, set("acme/app#4", "acme/app#3", "acme/app#2"), set())).toBe("discard");
+  it("names every ref when every issue is ticked, so it can't reach an issue the card didn't show", () => {
+    expect(reviewDecision(rc, set("acme/app#4", "acme/app#3", "acme/app#2"), set())).toBe("discard acme/app#2 acme/app#3 acme/app#4");
   });
 
   it("adds the keys to restore in the context's order, dropped then failed, after keep or discard", () => {
     expect(reviewDecision(rc, set(), set("lost", "noise"))).toBe("keep; restore noise lost");
     expect(reviewDecision(rc, set("acme/app#3"), set("dup"))).toBe("discard acme/app#3; restore dup");
-    expect(reviewSummary(rc, set("acme/app#3"), set("dup"))).toBe("Keeps 2, discards 1, restores 1");
+    expect(reviewSummary(rc, set("acme/app#3"), set("dup"))).toBe("Apply keeps 2, discards 1, restores 1");
+  });
+
+  it("Keep all and Discard all carry the restores ticked, and are their option alone without any", () => {
+    expect(reviewAllDecision(rc, "keep", set())).toBeUndefined();
+    expect(reviewAllDecision(rc, "discard", set())).toBeUndefined();
+    expect(reviewAllDecision(rc, "keep", set("lost", "dup"))).toBe("keep; restore dup lost");
+    expect(reviewAllDecision(rc, "discard", set("noise"))).toBe("discard; restore noise");
+    expect(discardAllPrompt(rc, set())).toBe("Close all 3 issues as not planned?");
+    expect(discardAllPrompt(rc, set("lost", "noise"))).toBe("Close all 3 issues as not planned and restore noise, lost?");
+  });
+
+  it("shows Command's rationale once", () => {
+    expect(triageRationale(rc)).toEqual([hostile]);
+    expect(triageRationale({ ...rc, dropped: [{ key: "x", title: "", why: "" }] })).toEqual([]);
   });
 
   it("ignores values the review doesn't hold", () => {
@@ -154,6 +182,9 @@ describe("issueURL", () => {
     expect(issueURL("acme/app#12 x", urls)).toBeUndefined();
     expect(issueURL("acme/app#0", urls)).toBeUndefined();
     expect(issueURL("javascript:alert(1)//acme/app#1", urls)).toBeUndefined();
+    // A dot owner or name is no GitHub repo.
+    expect(issueURL("./app#1", { a: "git@github.com:./app.git" })).toBeUndefined();
+    expect(issueURL("acme/..#1", { a: "git@github.com:acme/...git" })).toBeUndefined();
   });
 });
 

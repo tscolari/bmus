@@ -572,7 +572,8 @@ function githubRepo(url: string): { owner: string; name: string } | undefined {
   if (parts.length !== 2) return undefined;
   const owner = parts[0] ?? "";
   const name = (parts[1] ?? "").replace(/\.git$/, "");
-  if (!githubName.test(owner) || !githubName.test(name) || name === "." || name === "..") return undefined;
+  const dots = (v: string) => v === "." || v === "..";
+  if (!githubName.test(owner) || !githubName.test(name) || dots(owner) || dots(name)) return undefined;
   return { owner, name };
 }
 
@@ -646,24 +647,49 @@ export function reviewContext(h: HailView): ReviewContext {
 
 /**
  * The review's answer for the boxes ticked, in the bridge's normal form
- * (#156): keep, discard (every issue), or discard <ref>... in the
- * context's order, then "; restore <key>..." in the context's order
- * (dropped, then failed). Nothing to discard is keep: a bare discard is
- * sent only when every issue is ticked, never for an empty selection.
+ * (#156) except for one thing: discards always name their refs, in the
+ * context's order, even when every issue is ticked, so an answer never
+ * reaches an issue the card didn't show. Then "; restore <key>..." in the
+ * context's order (dropped, then failed). Nothing to discard is keep, and
+ * restores alone are "keep; restore <key>...".
  */
 export function reviewDecision(rc: ReviewContext, discard: ReadonlySet<string>, restore: ReadonlySet<string>): string {
   const refs = rc.issues.map((i) => i.ref).filter((r) => discard.has(r));
-  const keys = [...rc.dropped, ...rc.failed].map((f) => f.key).filter((k) => restore.has(k));
-  let s = "keep";
-  if (refs.length > 0) s = refs.length === rc.issues.length ? "discard" : `discard ${refs.join(" ")}`;
-  return keys.length > 0 ? `${s}; restore ${keys.join(" ")}` : s;
+  return withRestores(rc, refs.length > 0 ? `discard ${refs.join(" ")}` : "keep", restore);
 }
 
-/** What Apply does with the boxes ticked: "Keeps 2, discards 1, restores 1". */
+/**
+ * Keep all's or Discard all's answer with the restores ticked:
+ * "keep; restore <key>..." or "discard; restore <key>...", or undefined
+ * with none, when the option alone says it (option 0 or 1).
+ */
+export function reviewAllDecision(rc: ReviewContext, verb: "keep" | "discard", restore: ReadonlySet<string>): string | undefined {
+  const s = withRestores(rc, verb, restore);
+  return s === verb ? undefined : s;
+}
+
+/** The keys ticked to restore, in the context's order: dropped, then failed. */
+export function restoreKeys(rc: ReviewContext, restore: ReadonlySet<string>): string[] {
+  return [...rc.dropped, ...rc.failed].map((f) => f.key).filter((k) => restore.has(k));
+}
+
+function withRestores(rc: ReviewContext, head: string, restore: ReadonlySet<string>): string {
+  const keys = restoreKeys(rc, restore);
+  return keys.length > 0 ? `${head}; restore ${keys.join(" ")}` : head;
+}
+
+/** What Apply does with the boxes ticked: "Apply keeps 2, discards 1, restores 1". */
 export function reviewSummary(rc: ReviewContext, discard: ReadonlySet<string>, restore: ReadonlySet<string>): string {
   const discards = rc.issues.filter((i) => discard.has(i.ref)).length;
-  const restores = [...rc.dropped, ...rc.failed].filter((f) => restore.has(f.key)).length;
-  return `Keeps ${rc.issues.length - discards}, discards ${discards}, restores ${restores}`;
+  return `Apply keeps ${rc.issues.length - discards}, discards ${discards}, restores ${restoreKeys(rc, restore).length}`;
+}
+
+/**
+ * Command's triage rationale for the dropped findings, each distinct text
+ * once: the bridge stores Command's one rationale on every row it drops.
+ */
+export function triageRationale(rc: ReviewContext): string[] {
+  return [...new Set(rc.dropped.map((f) => f.why).filter((w) => w !== ""))];
 }
 
 /** The plural of a count of issues: "1 issue", "3 issues". */
@@ -687,4 +713,10 @@ export function issueURL(ref: string, repoUrls: Readonly<Record<string, string>>
     return r !== undefined && r.owner.toLowerCase() === owner.toLowerCase() && r.name.toLowerCase() === name.toLowerCase();
   });
   return registered ? `https://github.com/${owner}/${name}/issues/${m[3]}` : undefined;
+}
+
+/** The confirm prompt for discarding every issue: "Close all 3 issues as not planned and restore c-typo?". */
+export function discardAllPrompt(rc: ReviewContext, restore: ReadonlySet<string>): string {
+  const keys = restoreKeys(rc, restore);
+  return `Close all ${issuesText(rc.issues.length)} as not planned${keys.length > 0 ? ` and restore ${keys.join(", ")}` : ""}?`;
 }
