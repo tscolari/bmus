@@ -3,6 +3,7 @@ package bridge
 import (
 	"bytes"
 	"cmp"
+	"database/sql"
 	"encoding/json"
 	"log/slog"
 	"maps"
@@ -418,4 +419,52 @@ func TestCountermandBridgeHail(t *testing.T) {
 	for _, e := range hd.logEntries(t) {
 		require.NotContains(t, e.Text, "correction", e.Text)
 	}
+}
+
+// Closing a bridge hail whose raiser has already completed succeeds and
+// sends it nothing: notifyRaiser skips a workflow that isn't live.
+func TestCloseBridgeHailRaiserDone(t *testing.T) {
+	t.Parallel()
+	b := newHolodeckBridge(t, hailsScript(t))
+	b.registerExtra = registerRaiser
+	hd := b.start(t)
+	ctx := t.Context()
+	const raiser = "raiser/done"
+	done, err := dbos.RunWorkflow(hd.d.dbos, recvClosed, "", dbos.WithWorkflowID(raiser))
+	require.NoError(t, err)
+	requirePending(t, hd.d, raiser)
+	require.NoError(t, dbos.Send(hd.d.dbos, raiser, "sentinel", hailClosedTopic))
+	got, err := done.GetResult(dbos.WithHandleTimeout(30 * time.Second))
+	require.NoError(t, err)
+	require.Equal(t, "sentinel", got)
+	require.Eventually(t, func() bool {
+		live, found, err := workflowLive(hd.d, raiser)
+		return err == nil && found && !live
+	}, 30*time.Second, 20*time.Millisecond)
+
+	db, err := sql.Open("sqlite", filepath.Join(b.home, store.DBFile))
+	require.NoError(t, err)
+	defer db.Close()
+	sent := func() int {
+		var n int
+		require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM notifications WHERE destination_uuid = ?`, raiser).Scan(&n))
+		return n
+	}
+	before := sent()
+
+	for _, category := range []string{regs.CategoryTrackerReview, "campaign_pick"} {
+		id, err := hd.d.store.InsertBridgeHail(ctx, store.Hail{DeliverTo: raiser, Category: category, Question: "?",
+			Options: []string{"a", "b"}}, store.LogEntry{Kind: logHail, Text: "raised"})
+		require.NoError(t, err)
+		if category == regs.CategoryTrackerReview {
+			zero := 0
+			require.NoError(t, hd.d.AnswerHail(ctx, id, "", &zero))
+		} else {
+			closed, err := hd.d.skipAdvisory(ctx, id, "Command not on deck")
+			require.NoError(t, err)
+			require.True(t, closed)
+		}
+	}
+
+	require.Equal(t, before, sent(), "nothing sent to the completed raiser")
 }

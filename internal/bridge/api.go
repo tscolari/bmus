@@ -289,8 +289,11 @@ func (d *Daemon) AnswerHail(ctx context.Context, hailID, decision string, option
 // ErrNotFound.
 //
 // A bridge-raised hail (#152) has no order or agent to correct: the row and
-// its log entry are written and nothing is sent. Its raiser sleeps past
-// countermand_until and re-reads the row.
+// its log entry are written and nothing is sent, the raiser included. A
+// raiser that acts on a countermandable decision must sleep past
+// countermand_until and re-read the row before acting
+// (spec/campaigns-stage-2-plan-2026-11-14.md section 2); awaitBridgeHail
+// returns at the first decision and does not wait out the window.
 func (d *Daemon) CountermandHail(ctx context.Context, hailID, decision string, option *int, reason string) (ended bool, err error) {
 	h, err := d.store.GetHail(ctx, hailID)
 	if errors.Is(err, sql.ErrNoRows) {

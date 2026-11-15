@@ -253,3 +253,44 @@ func TestBridgeHailBesideBeamHail(t *testing.T) {
 	require.Equal(t, 1, m.Countermanded)
 	require.Equal(t, 1, m.ByOriginalDecider[DeciderCommand])
 }
+
+// TimeOutOpenHailWhy (#152) writes a non-empty why as the hail's
+// rationale; "" leaves an existing rationale as it was.
+func TestTimeOutOpenHailWhy(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := openTest(t)
+	raise := func(category string) string {
+		id, err := s.InsertBridgeHail(ctx, Hail{DeliverTo: "findings/ORD-0001", Category: category, Question: "?"}, testEntry)
+		require.NoError(t, err)
+		return id
+	}
+
+	why := raise("findings_triage")
+	closed, err := s.TimeOutOpenHailWhy(ctx, why, "Command not on deck", testEntry, nil)
+	require.NoError(t, err)
+	require.True(t, closed)
+	h, err := s.GetHail(ctx, why)
+	require.NoError(t, err)
+	require.Equal(t, HailTimedOut, h.Status)
+	require.Equal(t, "Command not on deck", h.Rationale)
+
+	kept := raise("tracker_review")
+	_, err = s.db.ExecContext(ctx, `UPDATE hails SET rationale = ? WHERE id = ?`, "set earlier", kept)
+	require.NoError(t, err)
+	closed, err = s.TimeOutOpenHailWhy(ctx, kept, "", testEntry, nil)
+	require.NoError(t, err)
+	require.True(t, closed)
+	h, err = s.GetHail(ctx, kept)
+	require.NoError(t, err)
+	require.Equal(t, HailTimedOut, h.Status)
+	require.Equal(t, "set earlier", h.Rationale)
+
+	// A closed hail is left alone, its rationale too.
+	closed, err = s.TimeOutOpenHailWhy(ctx, why, "again", testEntry, nil)
+	require.NoError(t, err)
+	require.False(t, closed)
+	h, err = s.GetHail(ctx, why)
+	require.NoError(t, err)
+	require.Equal(t, "Command not on deck", h.Rationale)
+}

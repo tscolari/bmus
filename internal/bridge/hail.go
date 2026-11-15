@@ -1018,7 +1018,9 @@ func (d *Daemon) notifyRaiser(tx *sql.Tx, id string) error {
 // a raise-hail step records it with deliver_to the workflow's id
 // (store.InsertBridgeHail, entry its log entry), then it starts hail/<id>
 // as a child it never awaits, as the mission does. A replay, or a re-run
-// of the step, raises nothing new: one hail per raiser and category.
+// of the step, raises nothing new: one hail per raiser and category. A
+// second raise of the same category returns the first hail's id, which
+// may already be closed; starting its workflow again starts nothing.
 func raiseBridgeHail(ctx dbos.Context, h store.Hail, entry store.LogEntry) (string, error) {
 	wf, err := dbos.GetWorkflowID(ctx)
 	if err != nil {
@@ -1041,7 +1043,11 @@ func raiseBridgeHail(ctx dbos.Context, h store.Hail, entry store.LogEntry) (stri
 // (raiseBridgeHail), for the hail to close, and returns its row as the
 // check-raised-hail step read it. It wakes on hailClosedTopic
 // (notifyRaiser) and at least every hailRecheckEvery, and reads the row on
-// every wake.
+// every wake. A buffered hail-closed message may belong to an earlier hail
+// the same raiser raised and saw closed (skip-advisory can close one before
+// the raiser's first check, leaving its message unread), so the loop goes
+// by the row alone. Callers must not take a message as proof of which hail
+// closed.
 func awaitBridgeHail(ctx dbos.Context, id string) (store.Hail, error) {
 	for {
 		h, err := dbos.RunAsStep(ctx, func(c context.Context) (store.Hail, error) {
