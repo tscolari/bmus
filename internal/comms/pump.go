@@ -180,6 +180,9 @@ const (
 	// finished (ErrGone). The
 	// payload holds the message (or the raw line) for the operator.
 	UndeliverableLogKind = "undeliverable"
+	// FindingLogKind is for a finding the pump kept on its order (#153);
+	// store.RecordFinding writes the entry.
+	FindingLogKind = store.FindingLogKind
 )
 
 // Pump is one crew member's comms pump. Start it with StartPump and end it
@@ -774,6 +777,8 @@ func (p *Pump) dispatch(ctx context.Context, tx store.InboxTx, msg Message) erro
 			return nil
 		}
 		return p.cfg.Sink.UsageRecorded(ctx, tx, msg.Order)
+	case TypeFinding:
+		return p.recordFinding(tx, msg)
 	case TypeHail, TypeCheckpointReady, TypeReport:
 		if msg.Order == "" {
 			p.log.Error("comms: dropping order message without an order", "type", msg.Type, "seq", msg.Seq)
@@ -802,6 +807,35 @@ func (p *Pump) dispatch(ctx context.Context, tx store.InboxTx, msg Message) erro
 		p.log.Warn("comms: skipping message of unknown type", "type", msg.Type, "seq", msg.Seq)
 		return nil
 	}
+}
+
+// recordFinding keeps a finding on its order, straight to the store in the
+// inbox transaction like usage (#153); the store logs it there. One the store
+// won't keep (an ended order or another crew member's, a key past the
+// order's cap, a key the findings workflow already took up), one without
+// an order and one with a bad body are dropped with a warning, like a bad
+// progress body.
+func (p *Pump) recordFinding(tx store.InboxTx, msg Message) error {
+	var b FindingBody
+	if err := json.Unmarshal(msg.Body, &b); err != nil {
+		p.log.Warn("comms: dropping finding with a bad body", "seq", msg.Seq, "order", msg.Order, "err", err)
+		return nil
+	}
+	if err := b.Check(); err != nil {
+		p.log.Warn("comms: dropping finding with a bad body", "seq", msg.Seq, "order", msg.Order, "err", err)
+		return nil
+	}
+	if msg.Order == "" {
+		p.log.Warn("comms: dropping finding without an order", "seq", msg.Seq, "key", b.Key)
+		return nil
+	}
+	err := tx.RecordFinding(msg.Order, store.Finding{Key: b.Key, Title: b.Title, Body: b.Body,
+		Labels: b.Labels, Severity: b.Severity, BlockedBy: b.BlockedBy}, msg.TS)
+	if errors.Is(err, store.ErrFindingDropped) {
+		p.log.Warn("comms: dropping finding", "seq", msg.Seq, "order", msg.Order, "key", b.Key, "err", err)
+		return nil
+	}
+	return err
 }
 
 // toInt64 is n as a store count, capped at math.MaxInt64.

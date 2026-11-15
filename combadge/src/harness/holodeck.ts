@@ -14,6 +14,10 @@
  *       Emits usage with those counts (#117), which stand for the order's
  *       cumulative usage on this beam. Each count is a non-negative integer.
  *       Unlike the sdk harness, nothing checks they never decrease.
+ *   {"at_pct": 35, "finding": {"key": "...", "title": "...", "body": "...", ...}}
+ *       Emits a finding with that body as given (#153): only its being an
+ *       object is checked, so a script can send what the bridge must drop.
+ *       No answer comes back, and the walk goes on.
  *   {"at_pct": 40, "hail": {"category": "...", "question": "...", "options": [...], "context": {...}}}
  *       Emits a hail with ref `holodeck-<order>-<index>` (options/context
  *       optional) and waits for the answer echoing that ref. The answer's
@@ -114,7 +118,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { AnswerBody, ConsultReplyBody, HailBody, ReportBody, UsageBody } from "../protocol.js";
+import type { AnswerBody, ConsultReplyBody, FindingBody, HailBody, ReportBody, UsageBody } from "../protocol.js";
 import { git } from "../repos.js";
 import { abortable, Budget, BudgetExceeded, orderDir, Stopped, writePlaceholderCheckpoint } from "./common.js";
 import type { Harness, HarnessOptions, HarnessReport, Inbound, Order } from "./types.js";
@@ -126,6 +130,7 @@ type UsageSpec = UsageBody;
 export type Step = { at_pct: number } & (
   | { progress: string }
   | { usage: UsageSpec }
+  | { finding: FindingBody }
   | { hail: HailSpec }
   | { commit: string }
   | { request_handover: string }
@@ -145,7 +150,7 @@ type Delivered<T> = { body: T; delivery: number };
 
 export type ConsultSpec = (Omit<ConsultReplyBody, "hail_id" | "rationale"> & { rationale?: string }) | "silence";
 
-const ACTIONS = ["progress", "usage", "hail", "commit", "request_handover", "sleep_ms", "report", "crash"] as const;
+const ACTIONS = ["progress", "usage", "finding", "hail", "commit", "request_handover", "sleep_ms", "report", "crash"] as const;
 type Action = (typeof ACTIONS)[number];
 const TERMINAL = new Set<Action>(["report", "crash"]);
 /** Longest Node timer; anything above it fires after 1ms. */
@@ -272,6 +277,9 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
             const { input_tokens, output_tokens, turns } = step.usage;
             own = { input_tokens, output_tokens, turns };
             emit({ type: "usage", body: { input_tokens, output_tokens, turns } });
+            log();
+          } else if ("finding" in step) {
+            emit({ type: "finding", body: step.finding });
             log();
           } else if ("hail" in step) {
             const ref = `holodeck-${order.id}-${index}`;
@@ -429,6 +437,9 @@ export function validateScript(raw: unknown): Step[] {
         }
         break;
       }
+      case "finding":
+        if (!isObject(v)) fail("finding must be an object");
+        break;
       case "hail": {
         if (!isObject(v)) fail("hail must be an object");
         const h = v as Record<string, unknown>;

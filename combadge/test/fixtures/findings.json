@@ -1,0 +1,7 @@
+[
+  { "at_pct": 10, "progress": "surveying the codebase" },
+  { "at_pct": 20, "finding": { "key": "flaky-test", "title": "TestSnapshot is flaky", "body": "Fails one run in ten on a loaded machine." } },
+  { "at_pct": 40, "finding": { "key": "snapshot-leak", "title": "Snapshot writer leaks a file handle on error", "body": "Short writes return without closing the temp file.", "labels": ["bug", "raft"], "severity": "medium", "blocked_by": ["flaky-test", "#12"] } },
+  { "at_pct": 60, "finding": { "key": "flaky-test", "title": "TestSnapshot races the compactor", "body": "The flake is a race with compaction.", "severity": "high" } },
+  { "at_pct": 100, "report": { "summary": "holodeck mission complete" } }
+]

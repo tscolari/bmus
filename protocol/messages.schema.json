@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/tscolari/bmus/protocol/messages.schema.json",
   "title": "bmus comms message",
-  "description": "One NDJSON line on the bridge<->combadge comms channel (spec/initial-plan-2026-10-16.md §6, D3). Every message shares this envelope; `type` selects the body shape via the if/then rules in `allOf`. Beam->bridge types: hello, heartbeat, progress, usage, hail, checkpoint_ready, report, error, consult_reply. Bridge->beam types: ack, order, answer, consult, checkpoint, stand_down, recall, belay, correction. consult and consult_reply are Command-lane only (Phase 3) and are defined here for forward compatibility; nothing emits or handles them in Phase 1. Envelope and bodies reject unknown properties so drift between the Go bridge and the TypeScript combadge is caught by the golden tests; the only free-form object is a hail's `context`.",
+  "description": "One NDJSON line on the bridge<->combadge comms channel (spec/initial-plan-2026-10-16.md §6, D3). Every message shares this envelope; `type` selects the body shape via the if/then rules in `allOf`. Beam->bridge types: hello, heartbeat, progress, usage, finding, hail, checkpoint_ready, report, error, consult_reply. Bridge->beam types: ack, order, answer, consult, checkpoint, stand_down, recall, belay, correction. consult and consult_reply are Command-lane only (Phase 3) and are defined here for forward compatibility; nothing emits or handles them in Phase 1. Envelope and bodies reject unknown properties so drift between the Go bridge and the TypeScript combadge is caught by the golden tests; the only free-form object is a hail's `context`.",
   "type": "object",
   "additionalProperties": false,
   "required": ["v", "seq", "crew", "type", "ts", "body"],
@@ -22,14 +22,14 @@
       "minLength": 1
     },
     "order": {
-      "description": "Order id the message belongs to. Required and non-empty for order-bound types (progress, usage, hail, checkpoint_ready, report, order, answer, checkpoint, recall, belay, correction); optional for hello, heartbeat, ack, error, stand_down, consult and consult_reply, which may be about the beam or tour rather than one order. Either absent or non-empty.",
+      "description": "Order id the message belongs to. Required and non-empty for order-bound types (progress, usage, finding, hail, checkpoint_ready, report, order, answer, checkpoint, recall, belay, correction); optional for hello, heartbeat, ack, error, stand_down, consult and consult_reply, which may be about the beam or tour rather than one order. Either absent or non-empty.",
       "type": "string",
       "minLength": 1
     },
     "type": {
       "description": "Message type; selects the body shape.",
       "enum": [
-        "hello", "heartbeat", "progress", "usage", "hail", "checkpoint_ready", "report", "error", "consult_reply",
+        "hello", "heartbeat", "progress", "usage", "finding", "hail", "checkpoint_ready", "report", "error", "consult_reply",
         "ack", "order", "answer", "consult", "checkpoint", "stand_down", "recall", "belay", "correction"
       ]
     },
@@ -48,6 +48,7 @@
     {"if": {"$ref": "#/$defs/is_heartbeat"}, "then": {"type": "object", "properties": {"body": {"$ref": "#/$defs/heartbeat"}}}},
     {"if": {"$ref": "#/$defs/is_progress"}, "then": {"type": "object", "$ref": "#/$defs/order_bound", "properties": {"body": {"$ref": "#/$defs/progress"}}}},
     {"if": {"$ref": "#/$defs/is_usage"}, "then": {"type": "object", "$ref": "#/$defs/order_bound", "properties": {"body": {"$ref": "#/$defs/usage_report"}}}},
+    {"if": {"$ref": "#/$defs/is_finding"}, "then": {"type": "object", "$ref": "#/$defs/order_bound", "properties": {"body": {"$ref": "#/$defs/finding"}}}},
     {"if": {"$ref": "#/$defs/is_hail"}, "then": {"type": "object", "$ref": "#/$defs/order_bound", "properties": {"body": {"$ref": "#/$defs/hail"}}}},
     {"if": {"$ref": "#/$defs/is_checkpoint_ready"}, "then": {"type": "object", "$ref": "#/$defs/order_bound", "properties": {"body": {"$ref": "#/$defs/checkpoint_ready"}}}},
     {"if": {"$ref": "#/$defs/is_report"}, "then": {"type": "object", "$ref": "#/$defs/order_bound", "properties": {"body": {"$ref": "#/$defs/report"}}}},
@@ -69,6 +70,7 @@
     "is_heartbeat": {"type": "object", "required": ["type"], "properties": {"type": {"const": "heartbeat"}}},
     "is_progress": {"type": "object", "required": ["type"], "properties": {"type": {"const": "progress"}}},
     "is_usage": {"type": "object", "required": ["type"], "properties": {"type": {"const": "usage"}}},
+    "is_finding": {"type": "object", "required": ["type"], "properties": {"type": {"const": "finding"}}},
     "is_hail": {"type": "object", "required": ["type"], "properties": {"type": {"const": "hail"}}},
     "is_checkpoint_ready": {"type": "object", "required": ["type"], "properties": {"type": {"const": "checkpoint_ready"}}},
     "is_report": {"type": "object", "required": ["type"], "properties": {"type": {"const": "report"}}},
@@ -87,7 +89,7 @@
       "description": "Matches beam->bridge types, whose seq (the outbox seq) starts at 1.",
       "type": "object",
       "required": ["type"],
-      "properties": {"type": {"enum": ["hello", "heartbeat", "progress", "usage", "hail", "checkpoint_ready", "report", "error", "consult_reply"]}}
+      "properties": {"type": {"enum": ["hello", "heartbeat", "progress", "usage", "finding", "hail", "checkpoint_ready", "report", "error", "consult_reply"]}}
     },
 
     "order_bound": {
@@ -141,6 +143,27 @@
         "turns": {"description": "Main-loop turns; a subagent's are not counted.", "type": "integer", "minimum": 0}
       }
     },
+    "finding": {
+      "description": "beam->bridge. Something a crew member found while working that deserves its own tracker issue (#153). The bridge keeps it on the order and files it as an issue when the order's mission ends. A finding with a key already recorded on the order replaces it; an order keeps at most 20 keys. Goes straight to the store, never into a workflow. title's and body's limits are in characters here; the bridge and combadge count body in bytes of UTF-8.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "title", "body"],
+      "properties": {
+        "key": {"description": "The finding's key within its order, which fits a tracker marker key. Reusing it replaces the earlier finding.", "$ref": "#/$defs/finding_key"},
+        "title": {"description": "The issue's title: one line, without control characters.", "type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\x00-\\x1f\\x7f]*[^\\s\\x00-\\x1f\\x7f][^\\x00-\\x1f\\x7f]*$"},
+        "body": {"description": "The issue's body (markdown). At most 32 KiB of UTF-8.", "type": "string", "maxLength": 32768},
+        "labels": {"description": "Labels for the issue, beside the bridge's own: no commas, control characters or surrounding spaces, and none starting with bmus: in any letter case, which the bridge reserves.", "type": "array", "maxItems": 5, "items": {"type": "string", "minLength": 1, "maxLength": 50, "pattern": "^[^\\s,\\x00-\\x1f\\x7f]([^,\\x00-\\x1f\\x7f]*[^\\s,\\x00-\\x1f\\x7f])?$", "not": {"pattern": "^[Bb][Mm][Uu][Ss]:"}}},
+        "severity": {"enum": ["low", "medium", "high"]},
+        "blocked_by": {
+          "description": "What the finding waits on: the key of another finding of the same order, or a tracker ref (#12 or owner/name#12).",
+          "type": "array",
+          "maxItems": 10,
+          "items": {"anyOf": [{"$ref": "#/$defs/finding_key"}, {"$ref": "#/$defs/finding_ref"}]}
+        }
+      }
+    },
+    "finding_key": {"description": "A finding's key.", "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,39}$"},
+    "finding_ref": {"description": "A tracker ref a finding may be blocked by: #<number>, or <owner>/<name>#<number>. The bridge makes it canonical when it files the finding, and drops one its tracker refuses.", "type": "string", "maxLength": 200, "pattern": "^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]{1,10}$"},
     "hail": {
       "description": "beam->bridge. A question or permission request the agent is blocked on. Deliberate deviation from the spec §6 example: the bridge generates hail ids (H-0001, store.InsertHail), so this body carries no hail_id. It carries `ref`, the combadge's own id for the hail (unique per combadge process), which the bridge echoes in the `answer`. Conventions: a tool_approval hail carries options [\"allow\", \"deny\"]; a clarifying_question hail carries one question, with or without options.",
       "type": "object",

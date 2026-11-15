@@ -12,7 +12,7 @@ import type { Emit, Harness, HarnessOptions, OnInbound, Order } from "./types.js
  * at once (see writePlaceholderCheckpoint), emits it as checkpoint_ready with
  * `stopping: true` and rejects the run with Stopped; a belay before that
  * emit wins. It runs no model, so it
- * ignores the order's `model`.
+ * ignores the order's `model`, and it files no findings (#153).
  */
 export function echoHarness(opts: HarnessOptions): Harness {
   const workDir = path.resolve(opts.workDir);

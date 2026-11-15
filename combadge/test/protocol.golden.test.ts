@@ -45,6 +45,16 @@ describe("protocol golden files", () => {
     expect(validate.errors?.map((e) => e.keyword)).toContain("minLength");
   });
 
+  it("holds a finding's title and labels to one clean line, and reserves bmus: labels (#153)", () => {
+    const golden = JSON.parse(fs.readFileSync(path.join(goldenDir, "finding.json"), "utf8")) as Message<"finding">;
+    const withBody = (b: Partial<Message<"finding">["body"]>) => validate({ ...golden, body: { ...golden.body, ...b } });
+    expect(withBody({ labels: ["good first issue", "area:bmus"] })).toBe(true);
+    for (const title of ["t\u001b[2J", "a\tb", "a\u007f", " ", "two\nlines"]) expect(withBody({ title }), JSON.stringify(title)).toBe(false);
+    for (const label of [" bug", "bug ", "  ", "a\u001bb", "a,b", "bmus:unreviewed", "BMUS:kept"]) {
+      expect(withBody({ labels: [label] }), JSON.stringify(label)).toBe(false);
+    }
+  });
+
   it("rejects a beam->bridge message with seq 0", () => {
     const hello: Message<"hello"> = {
       v: 1, seq: 0, crew: "sorell", type: "hello", ts: "2026-10-16T09:00:00Z",

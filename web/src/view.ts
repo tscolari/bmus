@@ -108,6 +108,8 @@ export function logTag(kind: string): { tag: string; tone: Tone } {
       return { tag: "CREW", tone: "cream" };
     case "bridge":
       return { tag: "BRIDGE", tone: "grey" };
+    case "finding":
+      return { tag: "FIND", tone: "gold" };
     default:
       return { tag: kind.toUpperCase().slice(0, 6), tone: "grey" };
   }

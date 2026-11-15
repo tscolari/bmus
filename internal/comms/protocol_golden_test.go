@@ -492,3 +492,87 @@ func TestSchemaBudget(t *testing.T) {
 	bad := strings.Replace(string(raw), `"budget":{"tokens":2000000,"turns":300}`, `"budget":{"tokens":2000000}`, 1)
 	require.Error(t, validate(sch, []byte(bad)))
 }
+
+// A finding (#153) is order-bound and its body holds the plan's limits.
+// FindingBody.Check, which the pump runs since nothing validates against
+// the schema at runtime, agrees with the schema on every case.
+func TestSchemaFinding(t *testing.T) {
+	t.Parallel()
+	sch := compileSchema(t)
+	long := func(n int) string { return strings.Repeat("x", n) }
+	keys := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("k%d", i)
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name string
+		body FindingBody
+		ok   bool
+	}{
+		{"minimal", FindingBody{Key: "k", Title: "t"}, true},
+		{"full", FindingBody{Key: "snapshot-leak", Title: "Leak", Body: "b", Labels: []string{"bug"}, Severity: "low",
+			BlockedBy: []string{"flaky-test", "#12", "example/app#40", "12"}}, true},
+		{"limits", FindingBody{Key: "a" + long(39), Title: strings.Repeat("漢", MaxFindingTitle), Body: long(MaxFindingBody),
+			Labels: []string{long(50), "b", "c", "d", "e"}, Severity: "high", BlockedBy: keys(MaxFindingBlockedBy)}, true},
+		{"empty key", FindingBody{Title: "t"}, false},
+		{"key with capitals", FindingBody{Key: "Leak", Title: "t"}, false},
+		{"key with a leading dash", FindingBody{Key: "-leak", Title: "t"}, false},
+		{"key over 40", FindingBody{Key: long(41), Title: "t"}, false},
+		{"empty title", FindingBody{Key: "k"}, false},
+		{"blank title", FindingBody{Key: "k", Title: "  "}, false},
+		{"two-line title", FindingBody{Key: "k", Title: "a\nb"}, false},
+		{"title over 200", FindingBody{Key: "k", Title: long(201)}, false},
+		{"six labels", FindingBody{Key: "k", Title: "t", Labels: []string{"a", "b", "c", "d", "e", "f"}}, false},
+		{"empty label", FindingBody{Key: "k", Title: "t", Labels: []string{""}}, false},
+		{"label with a comma", FindingBody{Key: "k", Title: "t", Labels: []string{"a,b"}}, false},
+		{"label over 50", FindingBody{Key: "k", Title: "t", Labels: []string{long(51)}}, false},
+		{"title with an escape", FindingBody{Key: "k", Title: "t\x1b[2J"}, false},
+		{"title with a tab", FindingBody{Key: "k", Title: "a\tb"}, false},
+		{"title with DEL", FindingBody{Key: "k", Title: "a\x7f"}, false},
+		{"title with a NUL", FindingBody{Key: "k", Title: "a\x00"}, false},
+		{"blank label", FindingBody{Key: "k", Title: "t", Labels: []string{"  "}}, false},
+		{"label with a leading space", FindingBody{Key: "k", Title: "t", Labels: []string{" bug"}}, false},
+		{"label with a trailing space", FindingBody{Key: "k", Title: "t", Labels: []string{"bug "}}, false},
+		{"label with a control character", FindingBody{Key: "k", Title: "t", Labels: []string{"a\x1bb"}}, false},
+		{"reserved label", FindingBody{Key: "k", Title: "t", Labels: []string{"bmus:unreviewed"}}, false},
+		{"reserved label in capitals", FindingBody{Key: "k", Title: "t", Labels: []string{"BMUS:Kept"}}, false},
+		{"label with spaces inside", FindingBody{Key: "k", Title: "t", Labels: []string{"good first issue", "x", "bmus"}}, true},
+		{"label naming bmus later", FindingBody{Key: "k", Title: "t", Labels: []string{"area:bmus:x"}}, true},
+		{"unknown severity", FindingBody{Key: "k", Title: "t", Severity: "critical"}, false},
+		{"eleven blockers", FindingBody{Key: "k", Title: "t", BlockedBy: keys(11)}, false},
+		{"blocker neither key nor ref", FindingBody{Key: "k", Title: "t", BlockedBy: []string{"owner/repo"}}, false},
+		{"blocker ref without a number", FindingBody{Key: "k", Title: "t", BlockedBy: []string{"#"}}, false},
+		{"blocker ref with a long repo", FindingBody{Key: "k", Title: "t", BlockedBy: []string{long(150) + "/" + long(50) + "#1"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			m, err := NewMessage(TypeFinding, tc.body)
+			require.NoError(t, err)
+			m.Seq, m.Crew, m.Order = 1, "sorell", "ORD-0001"
+			raw, err := json.Marshal(m)
+			require.NoError(t, err)
+			if tc.ok {
+				require.NoError(t, validate(sch, raw))
+				require.NoError(t, tc.body.Check())
+			} else {
+				require.Error(t, validate(sch, raw))
+				require.Error(t, tc.body.Check())
+			}
+		})
+	}
+
+	// The body's cap is in bytes for the bridge, characters for the schema.
+	cjk := FindingBody{Key: "k", Title: "t", Body: strings.Repeat("漢", 11_000)}
+	require.Error(t, cjk.Check())
+
+	golden := loadGolden(t)
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(golden["finding"], &m))
+	delete(m, "order")
+	raw, err := json.Marshal(m)
+	require.NoError(t, err)
+	require.Error(t, validate(sch, raw), "a finding is order-bound")
+}

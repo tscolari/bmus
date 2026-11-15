@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/spf13/cobra"
 
@@ -241,9 +242,17 @@ func deciderRank(d string) int {
 	return 3
 }
 
-// oneLine keeps a table row on one line.
+// oneLine keeps a table row on one line, and keeps text from the crew
+// (a finding's title in the log, say) from moving the terminal: control
+// characters (C0, DEL and C1, escapes included) become spaces before the
+// whitespace is collapsed.
 func oneLine(s string) string {
-	return strings.Join(strings.Fields(s), " ")
+	return strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)), " ")
 }
 
 // printHails prints hails as hails list's table. A bridge-raised hail

@@ -25,7 +25,7 @@ export interface Order {
  * are not here: `serve` emits them when `run` resolves or rejects. `hello` and
  * `heartbeat` belong to `serve` too.
  */
-export type Outbound = Payload<"progress" | "usage" | "hail" | "checkpoint_ready">;
+export type Outbound = Payload<"progress" | "usage" | "finding" | "hail" | "checkpoint_ready">;
 
 /**
  * Bridge->beam commands `serve` relays to the harness running the order.

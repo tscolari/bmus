@@ -213,6 +213,41 @@ export interface UsageBody extends Usage {
 /** A harness sends `usage` every this many turns. */
 export const USAGE_EVERY_TURNS = 10;
 
+/**
+ * Something a crew member found while working that deserves its own tracker
+ * issue (#153). The bridge keeps it on the order and files it when the
+ * order's mission ends. A finding with a key already recorded on the order
+ * replaces it; an order keeps at most MAX_FINDINGS keys.
+ */
+export interface FindingBody {
+  /** Names the finding within its order (FINDING_KEY); reusing it replaces the earlier one. */
+  key: string;
+  /** The issue's title: one line of at most MAX_FINDING_TITLE characters. */
+  title: string;
+  /** The issue's body (markdown), at most MAX_FINDING_BODY bytes of UTF-8. */
+  body: string;
+  labels?: string[];
+  severity?: "low" | "medium" | "high";
+  /** What it waits on: another finding's key, or a tracker ref (#12, owner/name#12). */
+  blocked_by?: string[];
+}
+
+/** A finding's key. */
+export const FINDING_KEY = /^[a-z0-9][a-z0-9-]{0,39}$/;
+/** A tracker ref a finding may be blocked by. */
+export const FINDING_REF = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?#[0-9]{1,10}$/;
+/** The most findings, by distinct key, an order keeps (the bridge drops the rest). */
+export const MAX_FINDINGS = 20;
+/** Limits of a finding (the schema's). */
+export const MAX_FINDING_TITLE = 200;
+export const MAX_FINDING_BODY = 32 * 1024;
+export const MAX_FINDING_LABELS = 5;
+export const MAX_FINDING_LABEL = 50;
+export const MAX_FINDING_BLOCKED_BY = 10;
+export const MAX_FINDING_REF = 200;
+/** Starts the labels the bridge sets itself (bmus:unreviewed); a finding may not carry one, in any letter case. */
+export const RESERVED_LABEL_PREFIX = "bmus:";
+
 /** Final result of an order. */
 export interface ReportBody {
   summary: string;
@@ -350,6 +385,7 @@ export interface BeamToBridgeBodies {
   heartbeat: HeartbeatBody;
   progress: ProgressBody;
   usage: UsageBody;
+  finding: FindingBody;
   hail: HailBody;
   checkpoint_ready: CheckpointReadyBody;
   report: ReportBody;
@@ -376,7 +412,7 @@ export type BridgeToBeamType = keyof BridgeToBeamBodies;
 export type MessageType = keyof Bodies;
 
 export const BEAM_TO_BRIDGE_TYPES = [
-  "hello", "heartbeat", "progress", "usage", "hail", "checkpoint_ready", "report", "error", "consult_reply",
+  "hello", "heartbeat", "progress", "usage", "finding", "hail", "checkpoint_ready", "report", "error", "consult_reply",
 ] as const satisfies readonly BeamToBridgeType[];
 
 export const BRIDGE_TO_BEAM_TYPES = [
@@ -398,7 +434,7 @@ export type Payload<T extends MessageType = MessageType> = {
 
 /** Types that belong to one order: the schema requires a non-empty `order` on them. */
 export type OrderBoundType =
-  | "progress" | "usage" | "hail" | "checkpoint_ready" | "report"
+  | "progress" | "usage" | "finding" | "hail" | "checkpoint_ready" | "report"
   | "order" | "answer" | "checkpoint" | "recall" | "belay";
 
 /**

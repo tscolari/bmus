@@ -10,9 +10,13 @@ package comms
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
+	"regexp"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Version is the protocol version carried in every envelope's v field.
@@ -26,6 +30,7 @@ const (
 	TypeHeartbeat       = "heartbeat"
 	TypeProgress        = "progress"
 	TypeUsage           = "usage"
+	TypeFinding         = "finding"
 	TypeHail            = "hail"
 	TypeCheckpointReady = "checkpoint_ready"
 	TypeReport          = "report"
@@ -195,6 +200,7 @@ var bodyTypes = map[string]reflect.Type{
 	TypeHeartbeat:       reflect.TypeFor[HeartbeatBody](),
 	TypeProgress:        reflect.TypeFor[ProgressBody](),
 	TypeUsage:           reflect.TypeFor[UsageBody](),
+	TypeFinding:         reflect.TypeFor[FindingBody](),
 	TypeHail:            reflect.TypeFor[HailBody](),
 	TypeCheckpointReady: reflect.TypeFor[CheckpointReadyBody](),
 	TypeReport:          reflect.TypeFor[ReportBody](),
@@ -282,6 +288,97 @@ type UsageBody struct {
 	InputTokens  uint64 `json:"input_tokens"`
 	OutputTokens uint64 `json:"output_tokens"`
 	Turns        uint64 `json:"turns"`
+}
+
+// FindingBody is something a crew member found while working that
+// deserves its own tracker issue (#153). The bridge keeps it on the order
+// (store.InboxTx.RecordFinding) and files it when the order's mission ends.
+// A finding with a key already recorded on the order replaces it. Check
+// holds the schema's limits.
+type FindingBody struct {
+	// Key names the finding within its order; it fits a tracker marker key.
+	Key   string `json:"key"`
+	Title string `json:"title"`
+	// Body is markdown, at most MaxFindingBody bytes.
+	Body   string   `json:"body"`
+	Labels []string `json:"labels,omitempty"`
+	// Severity is low, medium or high; empty for none.
+	Severity string `json:"severity,omitempty"`
+	// BlockedBy names what the finding waits on: another finding's key, or
+	// a tracker ref (#12, owner/name#12).
+	BlockedBy []string `json:"blocked_by,omitempty"`
+}
+
+// Limits of a finding (schema $defs.finding).
+const (
+	MaxFindingTitle     = 200       // characters
+	MaxFindingBody      = 32 * 1024 // bytes of UTF-8
+	MaxFindingLabels    = 5
+	MaxFindingLabel     = 50 // characters
+	MaxFindingBlockedBy = 10
+)
+
+var (
+	findingKeyRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,39}$`)
+	findingRefRe = regexp.MustCompile(`^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]{1,10}$`)
+)
+
+// ReservedLabelPrefix starts the labels the bridge sets itself (such as
+// bmus:unreviewed); a finding may not carry one, in any letter case.
+const ReservedLabelPrefix = "bmus:"
+
+// ReservedLabel reports whether label starts with ReservedLabelPrefix, in
+// any letter case.
+func ReservedLabel(label string) bool {
+	return len(label) >= len(ReservedLabelPrefix) && strings.EqualFold(label[:len(ReservedLabelPrefix)], ReservedLabelPrefix)
+}
+
+// hasControl reports whether s holds a C0 control character or DEL, as
+// combadge's ONE_LINE refuses.
+func hasControl(s string) bool {
+	return strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f })
+}
+
+// FindingKey reports whether key is a valid finding key.
+func FindingKey(key string) bool { return findingKeyRe.MatchString(key) }
+
+// Check returns an error naming the first of b's fields outside the
+// schema's limits, nil when b is valid.
+func (b FindingBody) Check() error {
+	switch {
+	case !FindingKey(b.Key):
+		return fmt.Errorf("key %q is not lowercase letters, digits and dashes, 1-40 long, starting with a letter or digit", b.Key)
+	case strings.TrimSpace(b.Title) == "" || hasControl(b.Title):
+		return errors.New("title must be one non-blank line, without control characters")
+	case utf8.RuneCountInString(b.Title) > MaxFindingTitle:
+		return fmt.Errorf("title is over %d characters", MaxFindingTitle)
+	case len(b.Body) > MaxFindingBody:
+		return fmt.Errorf("body is over %d bytes", MaxFindingBody)
+	case len(b.Labels) > MaxFindingLabels:
+		return fmt.Errorf("%d labels, over %d", len(b.Labels), MaxFindingLabels)
+	case len(b.BlockedBy) > MaxFindingBlockedBy:
+		return fmt.Errorf("%d blocked_by entries, over %d", len(b.BlockedBy), MaxFindingBlockedBy)
+	}
+	for _, l := range b.Labels {
+		switch {
+		case l == "" || utf8.RuneCountInString(l) > MaxFindingLabel || strings.TrimSpace(l) != l ||
+			strings.Contains(l, ",") || hasControl(l):
+			return fmt.Errorf("label %q must be 1-%d characters, without commas, control characters or surrounding spaces", l, MaxFindingLabel)
+		case ReservedLabel(l):
+			return fmt.Errorf("label %q is the bridge's: labels starting with %s are reserved", l, ReservedLabelPrefix)
+		}
+	}
+	switch b.Severity {
+	case "", "low", "medium", "high":
+	default:
+		return fmt.Errorf("severity %q is not low, medium or high", b.Severity)
+	}
+	for _, x := range b.BlockedBy {
+		if !FindingKey(x) && (len(x) > 200 || !findingRefRe.MatchString(x)) {
+			return fmt.Errorf("blocked_by %q is neither a finding key nor a tracker ref (#12, owner/name#12)", x)
+		}
+	}
+	return nil
 }
 
 // HailBody is a question or permission request the agent is blocked on.

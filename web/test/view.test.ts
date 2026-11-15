@@ -75,6 +75,7 @@ describe("formatters", () => {
     expect(priorityInfo(0)).toEqual({ label: "Routine", tone: "slate" });
     expect(logTag("done")).toEqual({ tag: "BACK", tone: "green" });
     expect(logTag("fail").tag).toBe("LOST");
+    expect(logTag("finding")).toEqual({ tag: "FIND", tone: "gold" });
     expect(logTag("whatever").tag).toBe("WHATEV");
   });
 
