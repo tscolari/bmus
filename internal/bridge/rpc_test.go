@@ -405,7 +405,13 @@ func TestRPCShutdownErrorsAreDown(t *testing.T) {
 	idle, err := net.Dial("unix", sock)
 	require.NoError(t, err)
 	defer idle.Close()
-	time.Sleep(200 * time.Millisecond)
+	// The clients must get calls through before the stop: wait for one,
+	// a fixed pause isn't enough on a loaded runner.
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return oks > 0
+	}, 30*time.Second, 10*time.Millisecond)
 	r.stop(t)
 	time.Sleep(100 * time.Millisecond)
 	close(quit)
