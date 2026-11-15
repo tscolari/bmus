@@ -1038,6 +1038,10 @@ test("an order's findings, filed and triaged by Command, are reviewed from the p
     await expect(card.getByText("Command: 3 is a typo in a comment; 2 repeats #1", { exact: true })).toHaveCount(1);
     await expect(card).toContainText("Dropped: duplicate of acme/app#1");
     await expect(card).toContainText("Dropped by Command");
+    // Rows take Command's triage numbers, so its rationale matches them:
+    // a-leak, d-lock, then b-flaky (2) and c-typo (3).
+    await expect(card.locator(".review-n")).toHaveText(["1", "4", "2", "3"]);
+    await expect(card.locator("li", { hasText: "c-typo" }).locator(".review-n")).toHaveText("3");
 
     // Discard all asks first; Cancel puts it back and sends nothing.
     await card.getByRole("button", { name: "Discard all 2 issues from" }).click();

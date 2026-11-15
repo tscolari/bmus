@@ -678,6 +678,19 @@ function withRestores(rc: ReviewContext, head: string, restore: ReadonlySet<stri
   return keys.length > 0 ? `${head}; restore ${keys.join(" ")}` : head;
 }
 
+/**
+ * Each key of the review's issues, dropped and failed findings mapped to
+ * its rank among them, from 1 in key order: the number Command's triage
+ * gave the finding (#155), so a rationale such as "3 is a typo" names the
+ * row numbered 3. Keys are ASCII, so code-unit order is the bridge's byte
+ * order. An empty key gets no number.
+ */
+export function reviewNumbers(rc: ReviewContext): Map<string, number> {
+  const keys = [...new Set([...rc.issues, ...rc.dropped, ...rc.failed].map((e) => e.key).filter((k) => k !== ""))];
+  keys.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return new Map(keys.map((k, i) => [k, i + 1]));
+}
+
 /** What Apply does with the boxes ticked: "Apply keeps 2, discards 1, restores 1". */
 export function reviewSummary(rc: ReviewContext, discard: ReadonlySet<string>, restore: ReadonlySet<string>): string {
   const discards = rc.issues.filter((i) => discard.has(i.ref)).length;

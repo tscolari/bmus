@@ -55,6 +55,31 @@ N  REF/KEY  STATE    TITLE                     WHY
 	require.True(t, strings.HasSuffix(b.String(), "decision: discard #2\n"), b.String())
 }
 
+// Rows take their key's number in Command's triage, the rank among every
+// key of the review in key order, whichever list holds them; an issue
+// without a key has none.
+func TestPrintReviewNumbers(t *testing.T) {
+	t.Parallel()
+	raw, err := json.Marshal(bridge.ReviewContext{Order: "ORD-0001",
+		Issues: []bridge.ReviewIssue{{Ref: "#2", Key: "b-leak", Title: "Leak"}, {Ref: "#4", Key: "e-lock", Title: "Lock"},
+			{Ref: "#5", Title: "No key"}},
+		Dropped: []bridge.ReviewDropped{{Key: "c-typo", Title: "Typo", Why: "noise"}, {Key: "a-flaky", Title: "Flaky", DuplicateOf: "#1"}},
+		Failed:  []bridge.ReviewFailed{{Key: "d-lost", Title: "Lost", Error: "tracker down"}}})
+	require.NoError(t, err)
+	var b bytes.Buffer
+	require.NoError(t, printReview(&b, bridge.HailView{ID: "H-0002", Status: store.HailOpen,
+		Category: regs.CategoryTrackerReview, Question: "Review?", Context: raw}))
+	require.Equal(t, `H-0002 open: Review?
+N  REF/KEY  STATE    TITLE   WHY
+2  #2       filed    Leak    -
+5  #4       filed    Lock    -
+-  #5       filed    No key  -
+3  c-typo   dropped  Typo    noise
+1  a-flaky  dropped  Flaky   duplicate of #1
+4  d-lost   failed   Lost    tracker down
+`, b.String())
+}
+
 func TestReviewDecision(t *testing.T) {
 	t.Parallel()
 	require.Equal(t, "keep", reviewDecision(nil, nil))

@@ -74,6 +74,7 @@ import {
   restoreKeys,
   reviewAllDecision,
   reviewContext,
+  reviewNumbers,
   reviewDecision,
   reviewSummary,
   triageRationale,
@@ -838,8 +839,9 @@ type ReviewSent = "" | "answer" | "confirmed";
 /**
  * The findings review (#156, #157): the issues filed from an order's
  * findings, each with a Discard box, and the findings triage dropped or
- * filing failed, each with a Restore box and its reason, numbered as
- * `bmus hails review` numbers them. Command's rationale shows once, above
+ * filing failed, each with a Restore box and its reason. Rows are
+ * numbered as Command's triage numbers the findings (reviewNumbers), as
+ * `bmus hails review` does. Command's rationale shows once, above
  * the findings it dropped.
  *
  * Keep all keeps every issue and Discard all discards every one, behind a
@@ -903,6 +905,7 @@ export function ReviewCard(props: { hail: HailView; repoUrls: Readonly<Record<st
     ...rc.failed.map((f) => ({ key: f.key, title: f.title, kind: "failed" as const, dup: undefined, error: f.error })),
   ];
   const rationale = triageRationale(rc);
+  const numbers = reviewNumbers(rc);
   const keys = restoreKeys(rc, restore);
   const keepDecision = reviewAllDecision(rc, "keep", restore);
   const discardDecision = reviewAllDecision(rc, "discard", restore);
@@ -934,7 +937,7 @@ export function ReviewCard(props: { hail: HailView; repoUrls: Readonly<Record<st
               return (
                 <li key={is.ref} class={`review-item discard${discard.has(is.ref) ? " ticked" : ""}`}>
                   <span class="review-n mono" aria-hidden="true">
-                    {i + 1}
+                    {numbers.get(is.key)}
                   </span>
                   <input
                     id={id}
@@ -971,7 +974,7 @@ export function ReviewCard(props: { hail: HailView; repoUrls: Readonly<Record<st
               return (
                 <li key={f.key} class={`review-item restore${restore.has(f.key) ? " ticked" : ""}`}>
                   <span class="review-n mono" aria-hidden="true">
-                    {rc.issues.length + i + 1}
+                    {numbers.get(f.key)}
                   </span>
                   <input
                     id={id}

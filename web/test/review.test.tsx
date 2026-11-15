@@ -12,6 +12,7 @@ import {
   reviewAllDecision,
   reviewContext,
   reviewDecision,
+  reviewNumbers,
   reviewSummary,
   triageRationale,
 } from "../src/view.js";
@@ -73,8 +74,8 @@ describe("ReviewCard (#157)", () => {
     expect(html).toContain("Dropped: duplicate of ");
     // Command's rationale, the same on both dropped rows, shows once.
     expect(html.split("Command: ").length - 1).toBe(1);
-    // Rows are numbered on through the lists, as bmus hails review numbers them.
-    expect([...html.matchAll(/<span class="review-n mono" aria-hidden="true">(\d+)<\/span>/g)].map((m) => m[1])).toEqual(["1", "2", "3", "4", "5", "6"]);
+    // Rows take their key's number in Command's triage: a b c dup lost noise.
+    expect([...html.matchAll(/<span class="review-n mono" aria-hidden="true">(\d+)<\/span>/g)].map((m) => m[1])).toEqual(["1", "2", "3", "6", "4", "5"]);
     // Nothing ticked: Apply keeps everything.
     expect(html).toContain("Apply keeps 3, discards 0, restores 0");
   });
@@ -91,6 +92,25 @@ describe("ReviewCard (#157)", () => {
     expect(buttons[2]).toContain(">Discard all<");
     expect(html).not.toContain("Close all 3 issues as not planned?");
     expect(html).toContain('role="status" aria-live="polite"');
+  });
+
+  it("numbers a mixed batch by key, as Command's triage does, and leaves an issue without a key unnumbered", () => {
+    const mixed: ReviewContext = {
+      order: "ORD-0001",
+      issues: [
+        { ref: "#2", key: "b-leak", title: "Leak" },
+        { ref: "#4", key: "e-lock", title: "Lock" },
+        { ref: "#5", key: "", title: "No key" },
+      ],
+      dropped: [
+        { key: "c-typo", title: "Typo", why: "3 is a typo" },
+        { key: "a-flaky", title: "Flaky", why: "", duplicate_of: "#1" },
+      ],
+      failed: [{ key: "d-lost", title: "Lost", error: "tracker down" }],
+    };
+    expect([...reviewNumbers(mixed)]).toEqual([["a-flaky", 1], ["b-leak", 2], ["c-typo", 3], ["d-lost", 4], ["e-lock", 5]]);
+    const out = renderToString(<ReviewCard hail={bridgeHail("H-0010", { context: mixed })} repoUrls={{}} csrf="c" />);
+    expect([...out.matchAll(/<span class="review-n mono" aria-hidden="true">(\d*)<\/span>/g)].map((m) => m[1])).toEqual(["2", "5", "", "3", "1", "4"]);
   });
 
   it("has no Discard all without issues", () => {
