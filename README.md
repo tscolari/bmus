@@ -4,6 +4,34 @@ A bridge that runs a crew of coding agents on Teleport Beams. Design and decisio
 
 ![Bridge](https://github.com/tscolari/bmus/blob/images/screenshots/1.png?raw=true)
 
+## Quick start
+
+You need Go 1.26, Node 22 or later, `tsh` 18.8 or later, and a Teleport cluster with Beams. Crew members run Claude Code on their beams, which reaches the model through the cluster, so there is no API key to set.
+
+```sh
+make                                              # builds combadge and ./bmus
+tsh login --proxy=example.teleport.sh             # your cluster
+./bmus bridge run --repo app=git@github.com:you/app.git &   # from the repo root, where it finds combadge
+./bmus crew add sorell --name Sorell --division science
+./bmus console                                    # opens the console in your browser
+```
+
+The bridge keeps its state in `~/.bmus` (`BMUS_HOME` to change it; keep the path short). The crew member shows as beaming in until its beam is up and its combadge says hello, then on deck. Give it an order from the console's Issue Order panel, or from the CLI:
+
+```sh
+cat > order.yaml <<'EOF'
+title: README greeting
+assignee: sorell
+repos:
+  - name: app
+    base_ref: main
+body: Add a one-line greeting at the end of README.md and commit it.
+EOF
+./bmus order create order.yaml
+```
+
+Answer its hails in the console, or with `./bmus hails list` and `./bmus hails answer`. Once it's done, read its mission report in the console and push its branch with Push, or `./bmus order push ORD-0001`. To try bmus without a cluster, see [Running the bridge locally with holodeck](#running-the-bridge-locally-with-holodeck).
+
 ## Roadmap
 
 A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026-10-16.md`](spec/initial-plan-2026-10-16.md#9-delivery-plan) and [`spec/campaigns-plan-2026-11-03.md`](spec/campaigns-plan-2026-11-03.md#6-stages).
