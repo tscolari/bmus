@@ -1079,7 +1079,7 @@ func (s *Store) ListOrders(ctx context.Context) ([]Order, error) {
 
 // ClaimOldestDirectedOrder returns the order crewID should be working on. A
 // crew member runs one mission at a time, so if it already has an away order
-// that order is returned unchanged; otherwise the highest-priority directed
+// (or a parked one still hailing, #145) that order is returned unchanged; otherwise the highest-priority directed
 // order assigned to it, the oldest of those, is moved to away and returned;
 // one waiting on an order in its after not yet done is skipped (#142).
 // This makes a re-run of the
@@ -1107,8 +1107,11 @@ func (s *Store) ClaimOldestDirectedOrder(ctx context.Context, crewID string, ent
 			// beaming in: its combadge hasn't said hello (#106).
 			return sql.ErrNoRows
 		}
-		err := tx.QueryRowContext(ctx, `SELECT id FROM orders WHERE assignee = ? AND state = ? `+claimOrderBy+` LIMIT 1`,
-			crewID, OrderAway).Scan(&id)
+		// A parked order may be hailing: a hail its park checkpoint held
+		// stays open while it waits (#145).
+		err := tx.QueryRowContext(ctx, `SELECT id FROM orders WHERE assignee = ?
+			AND (state = ? OR (state = ? AND parked_at IS NOT NULL)) `+claimOrderBy+` LIMIT 1`,
+			crewID, OrderAway, OrderHailing).Scan(&id)
 		if err == nil {
 			res, err := tx.ExecContext(ctx, `UPDATE crew SET status = ? WHERE id = ? AND status = ?`, CrewAway, crewID, CrewOnDeck)
 			if err != nil {
@@ -1637,15 +1640,16 @@ func (s *Store) ParkOrder(ctx context.Context, id string, entry LogEntry) (open 
 }
 
 // UnparkOrder clears order id's parked_at and appends entry, in one
-// transaction, only while the order is away with crewID as its assignee: a
-// tour resuming the order's parked mission (#100). It reports whether the
+// transaction, only while the order is away (or hailing: a hail its park
+// checkpoint held stays open, #145) with crewID as its assignee: a tour
+// resuming the order's parked mission (#100). It reports whether the
 // order is now resumed on crewID. A re-run finds it already unparked on
 // crewID and writes nothing; an order that moved on (settled, recalled)
 // reads false. A missing order returns sql.ErrNoRows.
 func (s *Store) UnparkOrder(ctx context.Context, id, crewID string, entry LogEntry) (resumed bool, err error) {
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE orders SET parked_at = NULL
-			WHERE id = ? AND state = ? AND assignee = ? AND parked_at IS NOT NULL`, id, OrderAway, crewID)
+			WHERE id = ? AND state IN (?, ?) AND assignee = ? AND parked_at IS NOT NULL`, id, OrderAway, OrderHailing, crewID)
 		if err != nil {
 			return err
 		}
@@ -1666,7 +1670,7 @@ func (s *Store) UnparkOrder(ctx context.Context, id, crewID string, entry LogEnt
 			Scan(&state, &assignee, &parked); err != nil {
 			return err
 		}
-		resumed = state == OrderAway && assignee == crewID && !parked.Valid
+		resumed = (state == OrderAway || state == OrderHailing) && assignee == crewID && !parked.Valid
 		return nil
 	})
 	return resumed, err

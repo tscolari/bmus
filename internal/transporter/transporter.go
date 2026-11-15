@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -46,8 +47,8 @@ type Beam struct {
 // CombadgeSpec says how to start combadge serve in a beam.
 //
 // serve's flags come in this order: the provider's own (--socket, --crew,
-// --work-dir, ...), --harness Harness, --role Role and --hail-park-after
-// HailParkAfter, the provider's configured harness flags
+// --work-dir, ...), --harness Harness, --role Role, --hail-park-after
+// HailParkAfter and the checkpoint cadence's flags, the provider's configured harness flags
 // (HolodeckConfig.Harness), then Args (serveArgs). serve takes the last value of a
 // repeated flag, so a later --harness overrides an earlier one: the crew
 // member's harness applies unless the provider's configuration or Args name
@@ -67,6 +68,14 @@ type CombadgeSpec struct {
 	// ends up running is sdk (servedHarness): serve refuses the flag with
 	// any other. Zero passes none, leaving serve's default (15m).
 	HailParkAfter time.Duration
+	// CheckpointEvery and CheckpointTurns are the sdk harness's checkpoint
+	// cadence (serve --checkpoint-every and --checkpoint-turns, #145): it
+	// checkpoints once that long or that many main-loop turns have passed
+	// since its latest checkpoint, when the work changed; 0 turns a
+	// trigger off. Each is passed only when set and the harness serve ends
+	// up running is sdk; nil passes none, leaving serve's default (15m, 10).
+	CheckpointEvery *time.Duration
+	CheckpointTurns *int
 	// Args are extra serve flags, e.g. harness selection for holodeck tests.
 	// They are appended verbatim, after every other flag.
 	Args []string
@@ -74,7 +83,8 @@ type CombadgeSpec struct {
 
 // serveArgs returns serve's flags after the provider's own: --harness
 // spec.Harness and --role spec.Role, each only when set, --hail-park-after
-// spec.HailParkAfter when serve will run sdk, then the provider's
+// spec.HailParkAfter, --checkpoint-every spec.CheckpointEvery and
+// --checkpoint-turns spec.CheckpointTurns when set and serve will run sdk, then the provider's
 // configured harness flags, then spec.Args.
 func (spec CombadgeSpec) serveArgs(configured []string) []string {
 	var args []string
@@ -85,8 +95,16 @@ func (spec CombadgeSpec) serveArgs(configured []string) []string {
 		args = append(args, "--role", spec.Role)
 	}
 	later := append(append([]string(nil), configured...), spec.Args...)
-	if spec.HailParkAfter > 0 && servedHarness(spec.Harness, later) == "sdk" {
-		args = append(args, "--hail-park-after", spec.HailParkAfter.String())
+	if servedHarness(spec.Harness, later) == "sdk" {
+		if spec.HailParkAfter > 0 {
+			args = append(args, "--hail-park-after", spec.HailParkAfter.String())
+		}
+		if spec.CheckpointEvery != nil {
+			args = append(args, "--checkpoint-every", spec.CheckpointEvery.String())
+		}
+		if spec.CheckpointTurns != nil {
+			args = append(args, "--checkpoint-turns", strconv.Itoa(*spec.CheckpointTurns))
+		}
 	}
 	return append(args, later...)
 }

@@ -78,6 +78,7 @@ A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026
 - [ ] Grant a crew member's beam an extra domain through an egress hail
 - [ ] Reap orphan beams and catch lost ones with a reconcile pass
 - [x] Cap an order's tokens and turns, and extend or stop it when it runs over
+- [x] Checkpoint at every park and on a cadence, with uncommitted work restored wherever an order starts
 - [ ] Hardened console: CSRF on every request, one-time launch codes, session expiry, rate limits
 - [ ] Nightly backups, and an offline restore
 - [ ] Survive a chaos run of beam loss, sleep, login expiry and crashes with zero lost orders

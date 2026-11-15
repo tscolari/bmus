@@ -70,6 +70,34 @@ func TestBridgeRunRefusesBadHailParkAfter(t *testing.T) {
 	}
 }
 
+// `bmus bridge run --checkpoint-every` and `--checkpoint-turns` refuse
+// values combadge serve wouldn't take, before touching the home (#145).
+func TestBridgeRunRefusesBadCheckpointCadence(t *testing.T) {
+	t.Parallel()
+	if testing.Short() {
+		t.Skip("builds and runs the bmus binary")
+	}
+	bin, err := buildBinary()
+	require.NoError(t, err)
+	for flag, want := range map[string]string{
+		"--checkpoint-every=600h": "--checkpoint-every: 600h0m0s is over the cap of 596h31m23.647s",
+		"--checkpoint-every=-1m":  "--checkpoint-every: -1m0s is negative",
+		"--checkpoint-turns=-3":   "--checkpoint-turns: -3 is negative",
+	} {
+		t.Run(flag, func(t *testing.T) {
+			home := filepath.Join(t.TempDir(), "home")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			out, err := (cli{bin: bin, home: home}).cmd(ctx, "bridge", "run", flag).CombinedOutput()
+			var exitErr *exec.ExitError
+			require.ErrorAs(t, err, &exitErr, "%s", out)
+			require.Equal(t, exitError, exitErr.ExitCode(), "%s", out)
+			require.Contains(t, string(out), want)
+			require.NoDirExists(t, home)
+		})
+	}
+}
+
 // The full console flow through the real CLI and a real holodeck bridge:
 // `bmus console` prints the token's URL, the token file backs it, and the
 // printed token actually exchanges for a session over the wire. Then,

@@ -41,9 +41,12 @@ type bridgeRunFlags struct {
 	tracker        string
 	consultTimeout time.Duration
 	hailParkAfter  time.Duration
-	maxBundleBytes int64
-	consolePort    int
-	noConsole      bool
+	// checkpointEvery and checkpointTurns are passed only when set (#145).
+	checkpointEvery time.Duration
+	checkpointTurns int
+	maxBundleBytes  int64
+	consolePort     int
+	noConsole       bool
 }
 
 func newBridgeCmd(a *app) *cobra.Command {
@@ -79,6 +82,10 @@ A graceful shutdown can take about a minute; a second signal kills it at once.`,
 		"how long a hail waits for Command's consult reply before it goes to the captain")
 	fl.DurationVar(&f.hailParkAfter, "hail-park-after", 0,
 		"how long an sdk beam holds a hail before it parks the session, at most "+bridge.MaxHailParkAfter.String()+" (default: unset, serve's 15m)")
+	fl.DurationVar(&f.checkpointEvery, "checkpoint-every", 0,
+		"how long an sdk beam works before it checkpoints, when the work changed; 0 turns it off, at most "+bridge.MaxHailParkAfter.String()+" (default: unset, serve's 15m)")
+	fl.IntVar(&f.checkpointTurns, "checkpoint-turns", 0,
+		"how many main-loop turns an sdk beam takes before it checkpoints, when the work changed; 0 turns it off (default: unset, serve's 10)")
 	fl.Int64Var(&f.maxBundleBytes, "max-bundle-bytes", bridge.DefaultMaxBundleBytes,
 		"maximum size, in bytes, of a work or checkpoint bundle pulled from a beam")
 	fl.IntVar(&f.consolePort, "console-port", 0, "console port, on 127.0.0.1 (0 picks a free one)")
@@ -98,6 +105,22 @@ func runBridge(cmd *cobra.Command, a *app, f bridgeRunFlags) error {
 		if err := bridge.CheckHailParkAfter(f.hailParkAfter); err != nil {
 			return fmt.Errorf("--hail-park-after: %w", err)
 		}
+	}
+	var (
+		checkpointEvery *time.Duration
+		checkpointTurns *int
+	)
+	if cmd.Flags().Changed("checkpoint-every") {
+		if err := bridge.CheckCheckpointEvery(f.checkpointEvery); err != nil {
+			return fmt.Errorf("--checkpoint-every: %w", err)
+		}
+		checkpointEvery = &f.checkpointEvery
+	}
+	if cmd.Flags().Changed("checkpoint-turns") {
+		if err := bridge.CheckCheckpointTurns(f.checkpointTurns); err != nil {
+			return fmt.Errorf("--checkpoint-turns: %w", err)
+		}
+		checkpointTurns = &f.checkpointTurns
 	}
 	if !f.noConsole {
 		if err := console.CheckPort(f.consolePort); err != nil {
@@ -214,11 +237,13 @@ func runBridge(cmd *cobra.Command, a *app, f bridgeRunFlags) error {
 		StandingOrders:    roster.StandingOrders,
 		TransporterLimits: roster.Transporter,
 
-		Regs:           rc,
-		RegsConfigured: regsFound,
-		ConsultTimeout: f.consultTimeout,
-		HailParkAfter:  f.hailParkAfter,
-		Tracker:        tr,
+		Regs:            rc,
+		RegsConfigured:  regsFound,
+		ConsultTimeout:  f.consultTimeout,
+		HailParkAfter:   f.hailParkAfter,
+		CheckpointEvery: checkpointEvery,
+		CheckpointTurns: checkpointTurns,
+		Tracker:         tr,
 	})
 }
 

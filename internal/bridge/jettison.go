@@ -305,6 +305,11 @@ func (d *Daemon) jettisonRepo(ctx context.Context, repo string, batch []Jettison
 			return deleted, skipped, kept, d.logJettisoned(ctx, deleted, orders, err)
 		}
 	}
+	// The order's latest landed checkpoint (#145) goes with its branch;
+	// best effort, as nothing reads it once the order has ended.
+	for _, b := range deleted {
+		runGit(ctx, dir, "update-ref", "-d", checkpointRef(strings.TrimPrefix(b.Branch, "bmus/"))) //nolint:errcheck
+	}
 	deleted, restored, err := d.restoreBases(ctx, repo, dir, deleted, orders)
 	kept += restored
 	return deleted, skipped, kept, d.logJettisoned(ctx, deleted, orders, err)

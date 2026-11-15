@@ -286,6 +286,12 @@ func (d *Daemon) fetchBundle(ctx context.Context, name, orderID, bundle, commit 
 // fetchBundleLocked is fetchBundle for a caller already holding the repo's
 // lock (ship-repos landing a checkpoint, #100).
 func (d *Daemon) fetchBundleLocked(ctx context.Context, name, orderID, bundle, commit string) error {
+	return d.fetchBundleAs(ctx, name, orderID, bundle, commit, "refs/heads/"+orderBranch(orderID))
+}
+
+// fetchBundleAs is fetchBundleLocked fetching the bundle's bmus/<order>
+// into ref instead (pull-checkpoint's checkpointRef, #145).
+func (d *Daemon) fetchBundleAs(ctx context.Context, name, orderID, bundle, commit, ref string) error {
 	dir := d.repoDir(name)
 	branch := "refs/heads/" + orderBranch(orderID)
 	heads, err := runGit(ctx, dir, "bundle", "list-heads", bundle, branch)
@@ -300,17 +306,53 @@ func (d *Daemon) fetchBundleLocked(ctx context.Context, name, orderID, bundle, c
 	}
 	fctx, cancel := context.WithTimeout(ctx, gitFetchTimeout)
 	defer cancel()
-	if _, err := runGit(fctx, dir, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", bundle, "+"+branch+":"+branch); err != nil {
+	if _, err := runGit(fctx, dir, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", bundle, "+"+branch+":"+ref); err != nil {
 		return classifyBundleErr(err)
 	}
-	got, err := runGit(ctx, dir, "rev-parse", "--verify", "--end-of-options", branch+"^{commit}")
+	got, err := runGit(ctx, dir, "rev-parse", "--verify", "--end-of-options", ref+"^{commit}")
 	if err != nil {
 		return err
 	}
 	if got != commit {
-		return fmt.Errorf("%s is at %s after the fetch, not the reported %s: %w", branch, got, commit, errWorkPermanent)
+		return fmt.Errorf("%s is at %s after the fetch, not the reported %s: %w", ref, got, commit, errWorkPermanent)
 	}
 	return nil
+}
+
+// wipRef is the ref an order's work in progress travels on (#145):
+// refs/bmus/wip/<order>, never a branch, so the report, the push and
+// jettison never take it.
+func wipRef(orderID string) string { return "refs/bmus/wip/" + orderID }
+
+// checkpointRef holds the latest checkpoint pull-checkpoint landed for an
+// order in the bridge's clone (#145): a later incremental checkpoint's
+// bundle needs its commit. Jettison removes it with bmus/<order>.
+func checkpointRef(orderID string) string { return "refs/bmus/checkpoints/" + orderID }
+
+// fetchWipLocked fetches bundle's refs/bmus/wip/<order>, if it carries
+// one, into the clone of repo name as the same ref, after the object
+// check, and returns its commit ("" when the bundle has none). The caller
+// holds the repo's lock.
+func (d *Daemon) fetchWipLocked(ctx context.Context, name, orderID, bundle string) (string, error) {
+	dir := d.repoDir(name)
+	ref := wipRef(orderID)
+	heads, err := runGit(ctx, dir, "bundle", "list-heads", bundle, ref)
+	if err != nil {
+		return "", classifyBundleErr(err)
+	}
+	commit, _, _ := strings.Cut(heads, " ")
+	if commit == "" {
+		return "", nil
+	}
+	if err := verifyBundleObjects(ctx, dir, bundle); err != nil {
+		return "", err
+	}
+	fctx, cancel := context.WithTimeout(ctx, gitFetchTimeout)
+	defer cancel()
+	if _, err := runGit(fctx, dir, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", bundle, "+"+ref+":"+ref); err != nil {
+		return "", classifyBundleErr(err)
+	}
+	return commit, nil
 }
 
 // verifyBundleObjects checks every object bundle's pack would add to

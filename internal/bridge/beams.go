@@ -325,7 +325,8 @@ func provisionBeam(ctx context.Context, d *Daemon, in TransporterInput) (provisi
 			}
 		}
 	}
-	spec := transporter.CombadgeSpec{CrewID: crewID, Harness: harness, HailParkAfter: d.hailParkAfter, Args: d.combadgeArgs}
+	spec := transporter.CombadgeSpec{CrewID: crewID, Harness: harness, HailParkAfter: d.hailParkAfter,
+		CheckpointEvery: d.checkpointEvery, CheckpointTurns: d.checkpointTurns, Args: d.combadgeArgs}
 	if crew.Division == DivisionCommand {
 		// Command's sdk runs get split_order (#155).
 		spec.Role = RoleCommand

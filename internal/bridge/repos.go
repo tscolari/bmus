@@ -516,6 +516,13 @@ func (d *Daemon) bundleRepo(ctx context.Context, name, url, orderID, baseRef, ou
 // commit and the checkpoint shipped from, nil for base_ref. A checkpoint
 // without a bundle for name is skipped.
 //
+// The bundle also carries refs/bmus/wip/<order> (#145): the work in
+// progress of the checkpoint shipped from, or, when that isn't the
+// newest, the newest checkpoint's when its objects are in the cargo bay
+// and pass the object check. The ref lives in the clone only while the
+// bundle is written: bmus/<order> never takes it, so neither do the report
+// and the push.
+//
 // A base_ref of order:<id> (#143) starts from the commit order <id>'s
 // done entry records for the repo (orderBaseCommit), with no fetch: that
 // work is in the clone already. It is read only when no checkpoint is
@@ -546,10 +553,20 @@ func (d *Daemon) bundleRepoFrom(ctx context.Context, in MissionInput, name, url,
 		}
 	}
 	branch := "refs/heads/" + orderBranch(in.OrderID)
+	// The work in progress goes along on its own ref (#145), set only for
+	// the bundle below: an earlier ship's is never sent again.
+	wip := wipRef(in.OrderID)
+	if _, err := runGit(ctx, dir, "update-ref", "-d", wip); err != nil {
+		return "", nil, err
+	}
+	defer runGit(context.WithoutCancel(ctx), dir, "update-ref", "-d", wip) //nolint:errcheck // best effort: the next ship deletes it first
 
 	var (
 		commit string
 		from   *store.Checkpoint
+		// newest is the newest checkpoint's bundle of the repo, shippedFrom
+		// the one shipped, if any.
+		newest, shippedFrom *store.CheckpointRepo
 	)
 	for i := range cps {
 		cp := &cps[i]
@@ -558,6 +575,9 @@ func (d *Daemon) bundleRepoFrom(ctx context.Context, in MissionInput, name, url,
 			continue
 		}
 		r := cp.Repos[j]
+		if newest == nil {
+			newest = &r
+		}
 		_, err := os.Stat(r.BundlePath)
 		if errors.Is(err, os.ErrNotExist) {
 			err = fmt.Errorf("%w: %w", err, errWorkPermanent)
@@ -565,7 +585,11 @@ func (d *Daemon) bundleRepoFrom(ctx context.Context, in MissionInput, name, url,
 			err = d.fetchBundleLocked(ctx, name, in.OrderID, r.BundlePath, r.Commit)
 		}
 		if err == nil {
-			commit, from = r.Commit, cp
+			commit, from, shippedFrom = r.Commit, cp, &r
+			// The WIP of the checkpoint it ships from (#145).
+			if _, err := d.fetchWipLocked(ctx, name, in.OrderID, r.BundlePath); err != nil && !errors.Is(err, errWorkPermanent) {
+				return "", nil, err
+			}
 			break
 		}
 		if !errors.Is(err, errWorkPermanent) {
@@ -616,11 +640,27 @@ func (d *Daemon) bundleRepoFrom(ctx context.Context, in MissionInput, name, url,
 			return "", nil, err
 		}
 	}
+	if newest != nil && newest != shippedFrom {
+		// Shipped from an older start: the newest checkpoint's WIP still goes
+		// along as a ref when its objects are in the cargo bay, so the agent
+		// sees it even when it can't be applied (#145).
+		if _, err := os.Stat(newest.BundlePath); err == nil {
+			if _, err := d.fetchWipLocked(ctx, name, in.OrderID, newest.BundlePath); err != nil && !errors.Is(err, errWorkPermanent) {
+				return "", nil, err
+			}
+		}
+	}
+	refs := []string{branch}
+	if _, err := runGit(ctx, dir, "rev-parse", "--verify", "--quiet", "--end-of-options", wip+"^{commit}"); err == nil {
+		refs = append(refs, wip)
+	} else if ctx.Err() != nil {
+		return "", nil, ctx.Err()
+	}
 	if err := os.MkdirAll(filepath.Dir(out), 0o700); err != nil {
 		return "", nil, err
 	}
 	tmp := out + ".tmp"
-	if _, err := runGit(ctx, dir, "bundle", "create", "--quiet", tmp, branch); err != nil {
+	if _, err := runGit(ctx, dir, append([]string{"bundle", "create", "--quiet", tmp}, refs...)...); err != nil {
 		os.Remove(tmp)
 		return "", nil, err
 	}

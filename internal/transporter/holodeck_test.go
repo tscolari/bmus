@@ -717,6 +717,13 @@ func TestServeArgsHailParkAfter(t *testing.T) {
 			want: []string{"--harness", "echo", "--hail-park-after", "1h30m0s", "--harness", "sdk"}},
 		"role and sub-second": {spec: CombadgeSpec{Role: "command", HailParkAfter: 1500 * time.Millisecond, Args: []string{"--x"}},
 			want: []string{"--role", "command", "--hail-park-after", "1.5s", "--x"}},
+		// The checkpoint cadence (#145): sdk only, 0 passed as off.
+		"cadence on sdk": {spec: CombadgeSpec{Harness: "sdk", CheckpointEvery: ptr(time.Hour), CheckpointTurns: ptr(0)},
+			want: []string{"--harness", "sdk", "--checkpoint-every", "1h0m0s", "--checkpoint-turns", "0"}},
+		"cadence off": {spec: CombadgeSpec{CheckpointEvery: ptr(time.Duration(0)), CheckpointTurns: ptr(25)},
+			want: []string{"--checkpoint-every", "0s", "--checkpoint-turns", "25"}},
+		"cadence on echo": {spec: CombadgeSpec{Harness: "echo", CheckpointEvery: ptr(time.Hour), CheckpointTurns: ptr(5)},
+			want: []string{"--harness", "echo"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			require.Equal(t, tc.want, tc.spec.serveArgs(tc.configured))
@@ -762,3 +769,5 @@ func TestHolodeckHailParkAfter(t *testing.T) {
 		}
 	}
 }
+
+func ptr[T any](v T) *T { return &v }
