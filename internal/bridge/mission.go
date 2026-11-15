@@ -158,7 +158,21 @@ func hailIDCompare(a, b string) int {
 // A mission never returns an error for a failed order: it ends SUCCESS with
 // Status failed, so the tour reads the outcome from the store, not from
 // the workflow's status.
+//
+// Last, after the tour is told, every ending (done, split, failed,
+// belayed) runs count-findings and starts findings/<order> when the order
+// has findings (startFindings, #155). Those steps follow the mission's
+// last earlier step, so a mission recorded before them replays.
 func missionWorkflow(ctx dbos.Context, in MissionInput) (MissionResult, error) {
+	res, err := endMission(ctx, in)
+	if err != nil && ctx.Err() != nil {
+		return res, err
+	}
+	return res, errors.Join(err, startFindings(ctx, in.OrderID))
+}
+
+// endMission is missionWorkflow up to telling the tour.
+func endMission(ctx dbos.Context, in MissionInput) (MissionResult, error) {
 	var held heldCorrections
 	res, crewID, err := runMission(ctx, in, &held)
 	if err != nil {

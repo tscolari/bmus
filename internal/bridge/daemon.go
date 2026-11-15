@@ -54,6 +54,7 @@ const (
 	missionWorkflowName     = "mission"
 	transporterWorkflowName = "transporter"
 	hailWorkflowName        = "hail"
+	// findingsWorkflowName is in findings.go.
 
 	// transporterQueueName is the DBOS queue transporter workflows run on
 	// (spec/phase-2-plan-2026-10-19.md §5). Like the workflow names, it
@@ -191,6 +192,9 @@ type Config struct {
 	// pull-work) and for fetch-work. Tests use it to shorten those steps'
 	// retries.
 	copyRetries []dbos.StepOption
+	// trackerRetries, if set, replaces the package's trackerRetries for
+	// list-backlog and file-finding (#155).
+	trackerRetries []dbos.StepOption
 }
 
 // MaxHailParkAfter is the longest Config.HailParkAfter: combadge serve's
@@ -314,6 +318,9 @@ type Daemon struct {
 	// pull-work and fetch-work: Config.copyRetries, or the package's
 	// copyRetries.
 	copyRetries []dbos.StepOption
+	// trackerRetries are the retries of list-backlog and file-finding:
+	// Config.trackerRetries, or the package's trackerRetries.
+	trackerRetries []dbos.StepOption
 }
 
 // daemonKey is the context key under which the Daemon travels to workflows.
@@ -472,6 +479,7 @@ func Run(ctx context.Context, cfg Config) (err error) {
 		loginCheckEvery:   cmp.Or(cfg.loginCheckEvery, defaultLoginCheckEvery),
 		loginWait:         cmp.Or(cfg.loginWait, defaultLoginWait),
 		copyRetries:       cfg.copyRetries,
+		trackerRetries:    cfg.trackerRetries,
 		maxBundleBytes:    cmp.Or(cfg.MaxBundleBytes, DefaultMaxBundleBytes),
 		divisions:         maps.Clone(cfg.Divisions), limits: roster.Transporter,
 		standingOrdersDefault: cfg.StandingOrders, wakeSend: cfg.wakeSend,
@@ -483,6 +491,9 @@ func Run(ctx context.Context, cfg Config) (err error) {
 	// before DBOS and the store, which they use.
 	if d.copyRetries == nil {
 		d.copyRetries = copyRetries
+	}
+	if d.trackerRetries == nil {
+		d.trackerRetries = trackerRetries
 	}
 	d.harnesses = append([]string(nil), cfg.Harnesses...)
 	if cfg.Harnesses == nil {
@@ -671,6 +682,10 @@ func (d *Daemon) register() error {
 	dbos.RegisterWorkflow(ctx, hailWorkflow,
 		dbos.WithWorkflowName(hailWorkflowName),
 		// A hail may wait on the captain through many restarts.
+		dbos.WithMaxRecoveryAttempts(-1))
+	dbos.RegisterWorkflow(ctx, findingsWorkflow,
+		dbos.WithWorkflowName(findingsWorkflowName),
+		// Triage may wait on Command through many restarts.
 		dbos.WithMaxRecoveryAttempts(-1))
 
 	// The queue's limits are persisted in the system database. The roster
