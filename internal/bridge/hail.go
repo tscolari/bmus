@@ -313,6 +313,11 @@ func (d *Daemon) classifyHail(ctx context.Context, id string) (hailRouting, erro
 	}
 	esc := d.regs.Escalation
 	r.RemindEvery, r.Timeout, r.OnTimeout, r.DefaultOption = esc.CaptainReminderEvery, esc.CaptainTimeout, esc.OnTimeout, esc.DefaultOption
+	if h.Category == regs.CategoryTrackerReview {
+		// Nothing waits on a review (#156): an unanswered one changes
+		// nothing, and its issues keep bmus:unreviewed.
+		r.RemindEvery, r.Timeout = 0, 0
+	}
 	if w := d.regs.CommandMayAnswer.CountermandWindow; w != nil && !r.Advisory {
 		r.CountermandWindow = *w
 	}
