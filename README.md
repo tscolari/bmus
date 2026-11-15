@@ -55,13 +55,14 @@ A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026
 - [ ] Survive a chaos run of beam loss, sleep, login expiry and crashes with zero lost orders
 - [ ] Scoped permissions per division, once Beams supports them
 
-### Phase 5: drawing board
+### Phase 5: drawing board ([#164](https://github.com/tscolari/bmus/issues/164))
 
 - [ ] Redshirts: a beam for one order, destroyed on return
 - [ ] Away teams: several crew on one parent order, led by Command
 - [ ] Rank breaks ties when crew claim pool orders
 - [ ] Shore leave: idle crew give up their beam and return on a fresh one
 - [ ] An always-on bridge on another machine, with hails reaching you by push or Slack
+- [ ] Run crew without a Teleport tenant: in containers, then in Firecracker microVMs ([#165](https://github.com/tscolari/bmus/issues/165), [#166](https://github.com/tscolari/bmus/issues/166))
 
 ### Campaigns
 
