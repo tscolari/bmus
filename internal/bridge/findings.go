@@ -45,6 +45,15 @@ const (
 	maxFindingWhy = 2 << 10
 	// maxTriageTitle caps the order's title in the triage context.
 	maxTriageTitle = 200
+	// maxTriageTightTitle and maxTriageTightList cap each finding's
+	// title, labels and blockers when the findings outgrow the triage
+	// context with empty bodies.
+	maxTriageTightTitle = 100
+	maxTriageTightList  = 2
+	// retriesBacklogDown is file-finding's retries once list-backlog
+	// failed: the tracker is likely down, and 5 slow retries per finding
+	// would hold filing up for long.
+	retriesBacklogDown = 2
 	// trackerCallTimeout bounds each tracker call the workflow makes.
 	trackerCallTimeout = 2 * time.Minute
 )
@@ -145,6 +154,9 @@ func startFindings(ctx dbos.Context, orderID string) error {
 //  5. findings-summary logs "findings of ORD-0001: filed 4, dropped 1,
 //     failed 0".
 //
+// Its notes are written once per order (store.AppendLogOnce), so a step
+// re-run after its transaction committed logs nothing twice.
+//
 // The rows hold the outcome: dropped, filed or failed, with why, ref and
 // duplicate_of. #156 raises the tracker_review hail after filing, from
 // those rows.
@@ -161,16 +173,16 @@ func findingsWorkflow(ctx dbos.Context, in FindingsInput) (FindingsResult, error
 	if len(b.Findings) == 0 {
 		return FindingsResult{}, nil
 	}
-	fs, err := triageFindings(ctx, in.OrderID, b)
+	fs, backlogDown, err := triageFindings(ctx, in.OrderID, b)
 	if err != nil {
 		return FindingsResult{}, err
 	}
-	res, err := fileFindings(ctx, in.OrderID, b, fs)
+	res, err := fileFindings(ctx, in.OrderID, b, fs, backlogDown)
 	if err != nil {
 		return res, err
 	}
 	err = storeStep(ctx, "findings-summary", func(c context.Context, d *Daemon) error {
-		return d.appendLog(c, logOrder, "", in.OrderID, fmt.Sprintf("findings of %s: filed %d, dropped %d, failed %d",
+		return d.logOnce(c, in.OrderID, "summary", fmt.Sprintf("findings of %s: filed %d, dropped %d, failed %d",
 			in.OrderID, res.Filed, res.Dropped, res.Failed), map[string]any{"filed": res.Filed, "dropped": res.Dropped, "failed": res.Failed})
 	})
 	return res, err
@@ -194,9 +206,19 @@ func (d *Daemon) beginFindings(ctx context.Context, orderID string) (findingsBeg
 	}
 	if d.tracker == nil {
 		b.NoTracker = true
-		err = d.appendLog(ctx, logOrder, "", orderID, "findings of "+orderID+" not filed: no tracker configured", nil)
+		err = d.logOnce(ctx, orderID, "not-filed", "findings of "+orderID+" not filed: no tracker configured", nil)
 	}
 	return b, err
+}
+
+// logOnce appends text to order orderID's log, kind order, unless a step
+// re-run already did (store.AppendLogOnce under once).
+func (d *Daemon) logOnce(ctx context.Context, orderID, once, text string, payload any) error {
+	e, err := logEntry(logOrder, "", orderID, text, payload)
+	if err != nil {
+		return err
+	}
+	return d.store.AppendLogOnce(ctx, orderID, once, e)
 }
 
 // ---- triage ----
@@ -206,8 +228,9 @@ func (d *Daemon) beginFindings(ctx context.Context, orderID string) (findingsBeg
 // answer (apply-triage). It returns fs with the triage applied. Triage is
 // advisory: a hail skip-advisory closed, or an answer that doesn't parse,
 // files everything, and the decision has no countermand window to wait
-// out (classify gives advisory hails none).
-func triageFindings(ctx dbos.Context, orderID string, b findingsBegin) ([]store.Finding, error) {
+// out (classify gives advisory hails none). It also reports whether the
+// backlog couldn't be read, which shortens filing's retries.
+func triageFindings(ctx dbos.Context, orderID string, b findingsBegin) ([]store.Finding, bool, error) {
 	fs := slices.Clone(b.Findings)
 	var (
 		skip    string
@@ -217,16 +240,25 @@ func triageFindings(ctx dbos.Context, orderID string, b findingsBegin) ([]store.
 	backlog, err := dbos.RunAsStep(ctx, func(c context.Context) ([]backlogItem, error) {
 		return daemonFrom(c).listBacklog(c)
 	}, append([]dbos.StepOption{dbos.WithStepName("list-backlog")}, daemonFrom(ctx).trackerRetries...)...)
+	backlogDown := err != nil
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, err
+			return nil, false, err
 		}
 		skip = "the backlog could not be read: " + stepError(err)
-	} else {
-		hctx, n, err := triageContext(orderID, b.Title, fs, backlog)
-		if err != nil {
-			return nil, err
+	}
+	var (
+		hctx json.RawMessage
+		n    int
+	)
+	if skip == "" {
+		if hctx, n, err = triageContext(orderID, b.Title, fs, backlog); errors.Is(err, errTriageTooBig) {
+			skip = err.Error()
+		} else if err != nil {
+			return nil, false, err
 		}
+	}
+	if skip == "" {
 		for _, it := range backlog[:n] {
 			offered = append(offered, it.Ref)
 		}
@@ -234,10 +266,10 @@ func triageFindings(ctx dbos.Context, orderID string, b findingsBegin) ([]store.
 			Context: hctx}, store.LogEntry{Kind: logHail, OrderID: orderID,
 			Text: fmt.Sprintf("Command asked to triage %s of %s", countFindings(len(fs)), orderID)})
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if hail, err = awaitBridgeHail(ctx, id); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if hail.Status != store.HailDecided {
 			skip = cmp.Or(hail.Rationale, "hail "+id+" closed "+hail.Status)
@@ -251,7 +283,7 @@ func triageFindings(ctx dbos.Context, orderID string, b findingsBegin) ([]store.
 		return daemonFrom(c).applyTriage(c, orderID, keys, offered, hail, skip)
 	}, append([]dbos.StepOption{dbos.WithStepName("apply-triage")}, storeRetries...)...)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	for _, t := range out.Triage {
 		i := slices.IndexFunc(fs, func(f store.Finding) bool { return f.Key == t.Key })
@@ -267,7 +299,7 @@ func triageFindings(ctx dbos.Context, orderID string, b findingsBegin) ([]store.
 			}
 		}
 	}
-	return fs, nil
+	return fs, backlogDown, nil
 }
 
 // listBacklog is the list-backlog step: the newest maxBacklog open issues.
@@ -313,23 +345,38 @@ type triageHailContext struct {
 // maxTriageBody), then backlog entries while the encoded context stays
 // within maxConsultContext, and how many were left out. When the findings
 // alone outgrow it, their bodies are cut shorter, halving the cap until
-// they fit or there is no body left.
+// they fit or there is no body left; then titles are cut to
+// maxTriageTightTitle and each finding keeps its first maxTriageTightList
+// labels and blockers. Findings that still don't fit are errTriageTooBig.
 func triageContext(orderID, title string, fs []store.Finding, backlog []backlogItem) (json.RawMessage, int, error) {
 	c := triageHailContext{Order: orderID, Title: clip(oneLine(title), maxTriageTitle), Backlog: []backlogItem{},
 		BacklogOmitted: len(backlog)}
 	var base []byte
+	tight := false
 	for cut := maxTriageBody; ; cut /= 2 {
 		c.Findings = c.Findings[:0]
 		for i, f := range fs {
-			c.Findings = append(c.Findings, triageFinding{N: i + 1, Key: f.Key, Title: f.Title, Body: clip(f.Body, cut),
-				Labels: f.Labels, Severity: f.Severity, BlockedBy: f.BlockedBy})
+			tf := triageFinding{N: i + 1, Key: f.Key, Title: f.Title, Body: clip(f.Body, cut),
+				Labels: f.Labels, Severity: f.Severity, BlockedBy: f.BlockedBy}
+			if tight {
+				tf.Title = clip(tf.Title, maxTriageTightTitle)
+				tf.Labels = tf.Labels[:min(len(tf.Labels), maxTriageTightList)]
+				tf.BlockedBy = tf.BlockedBy[:min(len(tf.BlockedBy), maxTriageTightList)]
+			}
+			c.Findings = append(c.Findings, tf)
 		}
 		var err error
 		if base, err = json.Marshal(c); err != nil {
 			return nil, 0, err
 		}
-		if len(base) <= maxConsultContext || cut == 0 {
+		if len(base) <= maxConsultContext {
 			break
+		}
+		if cut == 0 && tight {
+			return nil, 0, fmt.Errorf("%w (%d bytes without the backlog)", errTriageTooBig, len(base))
+		}
+		if cut == 0 {
+			tight, cut = true, 1 // one more pass at cut 0
 		}
 	}
 	size := len(base)
@@ -348,6 +395,10 @@ func triageContext(orderID, title string, fs []store.Finding, backlog []backlogI
 	raw, err := json.Marshal(c)
 	return raw, len(c.Backlog), err
 }
+
+// errTriageTooBig: the findings don't fit the triage context even cut
+// down (triageContext), and triage is skipped.
+var errTriageTooBig = fmt.Errorf("the findings don't fit the triage context's %d KiB", maxConsultContext>>10)
 
 // triageQuestion is the findings_triage hail's question, written by the
 // bridge.
@@ -394,7 +445,7 @@ func (d *Daemon) applyTriage(ctx context.Context, orderID string, keys, offered 
 		}
 	}
 	if skip != "" {
-		return triageOutcome{Skipped: skip}, d.appendLog(ctx, logOrder, "", orderID,
+		return triageOutcome{Skipped: skip}, d.logOnce(ctx, orderID, store.TriageOnce,
 			"findings of "+orderID+" filed without triage: "+skip, map[string]any{"hail_id": h.ID, "why": skip})
 	}
 	why := clip(h.Rationale, maxFindingWhy)
@@ -512,12 +563,11 @@ func parseTriage(answer string, keys, offered []string, canon func(string) (stri
 // ---- filing ----
 
 // fileFindings files fs's findings that triage didn't drop, in
-// plan-filing's order: one file-finding step each, with trackerRetries,
-// and finding-failed for one out of retries, after which filing goes on.
-// A blocker that is one of the order's findings links its issue: one
-// dropped as a duplicate links the issue it repeats, and one dropped or
-// failed links nothing.
-func fileFindings(ctx dbos.Context, orderID string, b findingsBegin, fs []store.Finding) (FindingsResult, error) {
+// plan-filing's order: one file-finding step each, with trackerRetries
+// (retriesBacklogDown of them when backlogDown), and finding-failed for
+// one out of retries, after which filing goes on (resolveBlockers links
+// the blockers).
+func fileFindings(ctx dbos.Context, orderID string, b findingsBegin, fs []store.Finding, backlogDown bool) (FindingsResult, error) {
 	var res FindingsResult
 	byKey := map[string]store.Finding{}
 	for _, f := range fs {
@@ -532,37 +582,26 @@ func fileFindings(ctx dbos.Context, orderID string, b findingsBegin, fs []store.
 	if err != nil {
 		return res, err
 	}
+	retries := append([]dbos.StepOption{dbos.WithStepName("file-finding")}, daemonFrom(ctx).trackerRetries...)
+	if backlogDown {
+		retries = append(retries, dbos.WithStepMaxRetries(retriesBacklogDown))
+	}
 	refs := map[string]string{} // filed key to its issue
 	for _, key := range plan.Order {
-		var blockers []string
-		for _, bl := range plan.Blockers[key] {
-			if comms.FindingKey(bl) {
-				bl = cmp.Or(refs[bl], byKey[bl].DuplicateOf)
-			}
-			if bl != "" && !slices.Contains(blockers, bl) {
-				blockers = append(blockers, bl)
-			}
-		}
+		blockers := resolveBlockers(plan.Blockers[key], refs, byKey)
 		out, err := dbos.RunAsStep(ctx, func(c context.Context) (filedFinding, error) {
 			return daemonFrom(c).fileFinding(c, orderID, key, blockers, b)
-		}, append([]dbos.StepOption{dbos.WithStepName("file-finding")}, daemonFrom(ctx).trackerRetries...)...)
+		}, retries...)
 		if err != nil {
 			if ctx.Err() != nil {
 				return res, err
 			}
 			why := clip(stepError(err), maxFindingWhy)
-			if err := storeStep(ctx, "finding-failed", func(c context.Context, d *Daemon) error {
-				entry, err := logEntry(logOrder, "", orderID, "finding "+key+" not filed: "+why, map[string]any{"key": key})
-				if err != nil {
-					return err
-				}
-				_, err = d.store.SettleFinding(c, orderID, key, store.FindingFailed, "", why, entry)
-				return err
-			}); err != nil {
+			if out, err = dbos.RunAsStep(ctx, func(c context.Context) (filedFinding, error) {
+				return daemonFrom(c).findingFailed(c, orderID, key, why)
+			}, append([]dbos.StepOption{dbos.WithStepName("finding-failed")}, storeRetries...)...); err != nil {
 				return res, err
 			}
-			res.Failed++
-			continue
 		}
 		switch out.State {
 		case store.FindingFiled:
@@ -573,6 +612,49 @@ func fileFindings(ctx dbos.Context, orderID string, b findingsBegin, fs []store.
 		}
 	}
 	return res, nil
+}
+
+// resolveBlockers is a finding's blockers as refs to link, each once: a
+// ref as it is, and a finding of the order (a key) as its issue (refs, the
+// filed ones), or the issue a duplicate repeats. A dropped or failed
+// finding links nothing.
+func resolveBlockers(blockers []string, refs map[string]string, byKey map[string]store.Finding) []string {
+	var out []string
+	for _, bl := range blockers {
+		if comms.FindingKey(bl) {
+			bl = cmp.Or(refs[bl], byKey[bl].DuplicateOf)
+		}
+		if bl != "" && !slices.Contains(out, bl) {
+			out = append(out, bl)
+		}
+	}
+	return out
+}
+
+// findingFailed is the finding-failed step, for a finding file-finding
+// gave up on with error why. A finding with a ref stored has its issue,
+// short of a link: it is filed, with why noted, so its dependents link to
+// it. Any other is failed, with why.
+func (d *Daemon) findingFailed(ctx context.Context, orderID, key, why string) (filedFinding, error) {
+	f, err := d.store.GetFinding(ctx, orderID, key)
+	if err != nil {
+		return filedFinding{}, err
+	}
+	state, text := store.FindingFailed, "finding "+key+" not filed: "+why
+	if f.Ref != "" {
+		state, text = store.FindingFiled, "finding "+key+" filed as "+f.Ref+" ("+why+")"
+	}
+	entry, err := logEntry(logOrder, "", orderID, text, map[string]any{"key": key, "ref": f.Ref})
+	if err != nil {
+		return filedFinding{}, err
+	}
+	if _, err := d.store.SettleFinding(ctx, orderID, key, state, "", why, entry); err != nil {
+		return filedFinding{}, err
+	}
+	if f, err = d.store.GetFinding(ctx, orderID, key); err != nil {
+		return filedFinding{}, err
+	}
+	return filedFinding{State: f.State, Ref: f.Ref}, nil
 }
 
 // planFiling is the plan-filing step: each finding's blockers and the
@@ -653,8 +735,12 @@ func (d *Daemon) planFiling(ctx context.Context, orderID string, fs []store.Find
 			visit(k)
 		}
 	}
+	var entries []store.LogEntry
 	for _, n := range notes {
-		if err := d.appendLog(ctx, logOrder, "", orderID, n, nil); err != nil {
+		entries = append(entries, store.LogEntry{Kind: logOrder, OrderID: orderID, Text: n})
+	}
+	if len(entries) > 0 {
+		if err := d.store.AppendLogOnce(ctx, orderID, "plan-filing", entries...); err != nil {
 			return filingPlan{}, err
 		}
 	}
@@ -674,7 +760,11 @@ func (d *Daemon) planFiling(ctx context.Context, orderID string, fs []store.Find
 //     can't add them.
 //   - A ref with any other error (a link that failed): the ref is stored
 //     and the step fails, so its retry adds the missing links.
-//   - No ref: the step fails.
+//   - Not found and no ref, with blockers: a blocker that no longer
+//     exists fails Create before it files anything. Each blocker is read
+//     (Get), those not found are dropped with a note, and Create runs
+//     again in the same attempt.
+//   - No ref otherwise: the step fails.
 func (d *Daemon) fileFinding(ctx context.Context, orderID, key string, blockers []string, b findingsBegin) (filedFinding, error) {
 	f, err := d.store.GetFinding(ctx, orderID, key)
 	if err != nil {
@@ -683,14 +773,33 @@ func (d *Daemon) fileFinding(ctx context.Context, orderID, key string, blockers 
 	if f.State != store.FindingNew {
 		return filedFinding{State: f.State, Ref: f.Ref}, nil
 	}
-	it := tracker.Item{Title: f.Title, Body: findingBody(f, orderID, func(ref string) bool {
+	sameRepo := func(ref string) bool {
 		_, err := d.tracker.Canon(ref)
 		return err == nil
-	}), Labels: append(slices.Clone(f.Labels), labelUnreviewed), BlockedBy: blockers}
+	}
+	it := tracker.Item{Title: findingTitle(f.Title, sameRepo), Body: findingBody(f, orderID),
+		Labels: append(slices.Clone(f.Labels), labelUnreviewed), BlockedBy: blockers}
 	m := tracker.Mark{Key: "finding " + b.Nonce + " " + orderID + "/" + key, Since: b.Since}
-	cctx, cancel := context.WithTimeout(ctx, trackerCallTimeout)
-	got, err := d.tracker.Create(cctx, it, m)
-	cancel()
+	got, err := d.createFinding(ctx, it, m)
+	var notes []store.LogEntry
+	if errors.Is(err, tracker.ErrNotFound) && got.Ref == "" && len(it.BlockedBy) > 0 {
+		var kept []string
+		for _, bl := range it.BlockedBy {
+			gctx, cancel := context.WithTimeout(ctx, trackerCallTimeout)
+			_, gerr := d.tracker.Get(gctx, bl)
+			cancel()
+			if errors.Is(gerr, tracker.ErrNotFound) {
+				notes = append(notes, store.LogEntry{Kind: logOrder, OrderID: orderID,
+					Text: "finding " + key + ": blocker " + bl + " dropped: " + gerr.Error()})
+				continue
+			}
+			kept = append(kept, bl)
+		}
+		if len(notes) > 0 {
+			it.BlockedBy = kept
+			got, err = d.createFinding(ctx, it, m)
+		}
+	}
 	var note string
 	switch {
 	case err == nil:
@@ -712,12 +821,19 @@ func (d *Daemon) fileFinding(ctx context.Context, orderID, key string, blockers 
 	if err != nil {
 		return filedFinding{}, err
 	}
-	settled, err := d.store.SettleFinding(ctx, orderID, key, store.FindingFiled, got.Ref, note, entry)
+	settled, err := d.store.SettleFinding(ctx, orderID, key, store.FindingFiled, got.Ref, note, append(notes, entry)...)
 	if err != nil || settled {
 		return filedFinding{State: store.FindingFiled, Ref: got.Ref}, err
 	}
 	f, err = d.store.GetFinding(ctx, orderID, key)
 	return filedFinding{State: f.State, Ref: f.Ref}, err
+}
+
+// createFinding is one Create, bounded by trackerCallTimeout.
+func (d *Daemon) createFinding(ctx context.Context, it tracker.Item, m tracker.Mark) (tracker.Item, error) {
+	ctx, cancel := context.WithTimeout(ctx, trackerCallTimeout)
+	defer cancel()
+	return d.tracker.Create(ctx, it, m)
 }
 
 // stepError is the last attempt's error of a step that ran out of
@@ -739,22 +855,30 @@ func stepError(err error) string {
 	return msg
 }
 
-// ---- the issue's body ----
+// ---- the issue's text ----
 
-// findingBody is the body of finding f's issue: its own body, made safe
-// to file (neutralise), then "Filed by <crew> from <order> (severity
-// high)."
-func findingBody(f store.Finding, orderID string, sameRepo func(ref string) bool) string {
+// findingBody is the body of finding f's issue: the agent's body as a
+// text code block, then "Filed by <crew> from <order> (severity high)."
+// as the bridge's own text.
+//
+// GitHub links and notifies nothing inside a code block: no @-mention,
+// issue reference, URL, HTML or entity in the body reaches anyone (#153's
+// review). The fence is a backtick run longer than any in the body, and
+// at least three, so no line of the body can close it, whatever fences,
+// tildes or HTML the body holds. The tracker's marker follows the bridge's
+// line, outside the block.
+func findingBody(f store.Finding, orderID string) string {
 	line := "Filed by " + f.CrewID + " from " + orderID
 	if f.Severity != "" {
 		line += " (severity " + f.Severity + ")"
 	}
 	line += "."
-	body := strings.TrimSpace(neutralise(f.Body, sameRepo))
-	if body == "" {
+	body := strings.Trim(f.Body, "\n")
+	if strings.TrimSpace(body) == "" {
 		return line
 	}
-	return body + "\n\n" + line
+	fence := strings.Repeat("`", max(3, longestRun(body, '`')+1))
+	return fence + "text\n" + body + "\n" + fence + "\n\n" + line
 }
 
 var (
@@ -764,157 +888,21 @@ var (
 	// crossRefRe is a reference to an issue of a repository by name:
 	// owner/name#12.
 	crossRefRe = regexp.MustCompile(`[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+#[0-9]+`)
-	// fenceRe opens or closes a fenced code block.
-	fenceRe = regexp.MustCompile("^ {0,3}(`{3,}|~{3,})(.*)$")
 )
 
-// neutralise makes an agent-written markdown body safe to file as an
-// issue (#153's review): every @-mention and every owner/name#N reference
-// to an issue outside the tracker's repository (sameRepo false) is
-// wrapped in a code span, where GitHub neither notifies nor links. A
-// finding can then ping nobody and backlink no other repository. Refs to
-// the tracker's own repository (#12 too) stay links.
-//
-// It reads just enough markdown to stay safe: fenced code blocks are left
-// alone (nothing in them links), and so are code spans, which a
-// backslash-escaped backtick doesn't open. The wrapping span's backticks
-// outnumber any run in its paragraph, so it pairs with nothing else
-// there, and a space keeps it apart from a backtick beside it. A fence the
-// body leaves open is closed, so the lines filed after the body stay
-// outside it. Text that only looks like either (an e-mail address, a
-// path, a URL) is kept: the match must not follow a letter, digit or one
-// of _.+-/. Text in an indented code block may gain visible backticks.
-func neutralise(body string, sameRepo func(ref string) bool) string {
-	var (
-		out   []string
-		para  []string
-		fence string // the open fence's run, "" outside one
-	)
-	flush := func() {
-		if len(para) > 0 {
-			out = append(out, neutraliseParagraph(strings.Join(para, "\n"), sameRepo))
-			para = nil
-		}
-	}
-	for _, line := range strings.Split(body, "\n") {
-		m := fenceRe.FindStringSubmatch(line)
-		switch {
-		case fence != "":
-			out = append(out, line)
-			if m != nil && m[1][0] == fence[0] && len(m[1]) >= len(fence) && strings.TrimSpace(m[2]) == "" {
-				fence = ""
-			}
-		case m != nil && !(m[1][0] == '`' && strings.Contains(m[2], "`")):
-			flush()
-			out = append(out, line)
-			fence = m[1]
-		case strings.TrimSpace(line) == "":
-			flush()
-			out = append(out, line)
-		default:
-			para = append(para, line)
-		}
-	}
-	flush()
-	if fence != "" {
-		out = append(out, fence)
-	}
-	return strings.Join(out, "\n")
-}
+// zeroWidthSpace breaks a mention or a reference in a title.
+const zeroWidthSpace = "\u200b"
 
-// neutraliseParagraph wraps p's mentions and foreign refs outside its
-// code spans (neutralise).
-func neutraliseParagraph(p string, sameRepo func(ref string) bool) string {
-	spans := codeSpans(p)
-	inSpan := func(i, j int) bool {
-		return slices.ContainsFunc(spans, func(s [2]int) bool { return i < s[1] && j > s[0] })
-	}
-	ok := func(i, j int) bool {
-		if i > 0 && (strings.ContainsRune("_.+-/", rune(p[i-1])) || isWordByte(p[i-1])) {
-			return false
+// findingTitle is finding title as filed: a zero-width space follows the
+// @ of every @-mention, and precedes the # of every owner/name#N
+// reference that sameRepo refuses, so the title notifies nobody and
+// backlinks no other repository. The tracker's own refs stay.
+func findingTitle(title string, sameRepo func(ref string) bool) string {
+	title = crossRefRe.ReplaceAllStringFunc(title, func(ref string) string {
+		if sameRepo(ref) {
+			return ref
 		}
-		return !inSpan(i, j)
-	}
-	var wrap [][2]int
-	for _, m := range mentionRe.FindAllStringIndex(p, -1) {
-		if ok(m[0], m[1]) {
-			wrap = append(wrap, [2]int{m[0], m[1]})
-		}
-	}
-	for _, m := range crossRefRe.FindAllStringIndex(p, -1) {
-		overlaps := slices.ContainsFunc(wrap, func(w [2]int) bool { return m[0] < w[1] && m[1] > w[0] })
-		if !overlaps && ok(m[0], m[1]) && !sameRepo(p[m[0]:m[1]]) {
-			wrap = append(wrap, [2]int{m[0], m[1]})
-		}
-	}
-	if len(wrap) == 0 {
-		return p
-	}
-	slices.SortFunc(wrap, func(a, b [2]int) int { return a[0] - b[0] })
-	ticks := strings.Repeat("`", longestRun(p, '`')+1)
-	var sb strings.Builder
-	last := 0
-	for _, w := range wrap {
-		sb.WriteString(p[last:w[0]])
-		// A backtick beside the span would join its run and unpair it.
-		if w[0] > 0 && p[w[0]-1] == '`' {
-			sb.WriteByte(' ')
-		}
-		sb.WriteString(ticks + p[w[0]:w[1]] + ticks)
-		if w[1] < len(p) && p[w[1]] == '`' {
-			sb.WriteByte(' ')
-		}
-		last = w[1]
-	}
-	sb.WriteString(p[last:])
-	return sb.String()
-}
-
-func isWordByte(c byte) bool {
-	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
-}
-
-// codeSpans are p's code spans, delimiters included, as CommonMark reads
-// them: a backtick run not escaped by a backslash opens one, which the
-// next run of the same length closes; a run nothing closes is text.
-func codeSpans(p string) [][2]int {
-	var spans [][2]int
-	for i := 0; i < len(p); {
-		switch p[i] {
-		case '\\':
-			i += 2
-			continue
-		case '`':
-		default:
-			i++
-			continue
-		}
-		j := i
-		for j < len(p) && p[j] == '`' {
-			j++
-		}
-		n, closed := j-i, -1
-		for k := j; k < len(p); {
-			if p[k] != '`' {
-				k++
-				continue
-			}
-			e := k
-			for e < len(p) && p[e] == '`' {
-				e++
-			}
-			if e-k == n {
-				closed = e
-				break
-			}
-			k = e
-		}
-		if closed < 0 {
-			i = j
-			continue
-		}
-		spans = append(spans, [2]int{i, closed})
-		i = closed
-	}
-	return spans
+		return strings.Replace(ref, "#", zeroWidthSpace+"#", 1)
+	})
+	return mentionRe.ReplaceAllStringFunc(title, func(m string) string { return "@" + zeroWidthSpace + m[1:] })
 }

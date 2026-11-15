@@ -1,12 +1,15 @@
 package bridge
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,53 +22,55 @@ import (
 	"github.com/tscolari/bmus/internal/tracker/trackertest"
 )
 
-// sameRepoFake is Canon of the fake tracker: refs of another repository
-// are foreign.
-func sameRepoFake(ref string) bool {
-	_, err := (&trackertest.Fake{}).Canon(ref)
-	return err == nil
-}
-
-// #153's review: @-mentions and other repositories' refs are wrapped in
-// code spans outside code; the tracker's own refs, e-mail addresses, paths
-// and URLs stay as they are.
-func TestNeutralise(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct{ name, in, want string }{
-		{"mention", "ping @alice and @org/team.", "ping `@alice` and `@org/team`."},
-		{"cross-repo ref", "see other/repo#12, and #3", "see `other/repo#12`, and #3"},
-		{"start of line", "@bob look", "`@bob` look"},
-		{"e-mail and path", "mail a@example.com, see docs/@x and x.y/z#1", "mail a@example.com, see docs/@x and x.y/z#1"},
-		{"url", "https://example.com/o/r#3 and https://example.com/@u", "https://example.com/o/r#3 and https://example.com/@u"},
-		{"code span kept", "run `git blame @alice` now", "run `git blame @alice` now"},
-		{"code span across lines", "a `b\n@c` d", "a `b\n@c` d"},
-		{"longer span ticks", "a `` x ` @y `` and @z", "a `` x ` @y `` and ```@z```"},
-		{"lone backtick", "a ` b @c", "a ` b ``@c``"},
-		{"beside a backtick", "`@c", "` ``@c``"},
-		{"escaped backtick", "\\`@x`", "\\` ``@x`` `"},
-		{"fence kept", "```\n@alice o/r#1\n```\n@bob", "```\n@alice o/r#1\n```\n`@bob`"},
-		{"tilde fence", "~~~go\n@a\n~~~", "~~~go\n@a\n~~~"},
-		{"open fence closed", "```\n@alice", "```\n@alice\n```"},
-		{"mention and ref", "@o/r#1", "`@o/r`#1"},
-		{"paragraphs", "`a\n\n@b`", "`a\n\n``@b`` `"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			require.Equal(t, tc.want, neutralise(tc.in, sameRepoFake))
-		})
-	}
-	// The tracker's own repository's refs stay links.
-	own := func(ref string) bool { return strings.HasPrefix(ref, "acme/app#") }
-	require.Equal(t, "acme/app#1 and `other/app#2`", neutralise("acme/app#1 and other/app#2", own))
-}
-
-// The issue's body: the neutralised body, then who filed it, from which
-// order and how severe.
+// #153's review and its probes: the agent's body is filed as a text code
+// block, whatever it holds. Only the closing fence closes it, once, at the
+// end, and the bridge's line follows outside it.
 func TestFindingBody(t *testing.T) {
 	t.Parallel()
-	f := store.Finding{CrewID: "sorell", Body: "Leaks @alice's handle.\n", Severity: "high"}
-	require.Equal(t, "Leaks `@alice`'s handle.\n\nFiled by sorell from ORD-0001 (severity high).", findingBody(f, "ORD-0001", sameRepoFake))
-	require.Equal(t, "Filed by sorell from ORD-0001.", findingBody(store.Finding{CrewID: "sorell"}, "ORD-0001", sameRepoFake))
+	fenceLine := regexp.MustCompile("^ {0,3}(`{3,}|~{3,})[ \t]*$")
+	for _, probe := range []string{
+		"_@octocat_",
+		"-@octocat",
+		"<div>\n@octocat\n</div>",
+		"<details>\n```\n</details>\n@octocat\n```\nother/repo#1",
+		"# `x\n@octocat`",
+		"- `a\n- @octocat`",
+		"&#64;octocat",
+		"other&#47;repo#1",
+		"https://github.com/other/repo/issues/1",
+		"[x](https://github.com/other/repo/issues/1)",
+		`<a href="https://github.com/other/repo/issues/1">x</a>`,
+		"~~~\n@octocat",
+		"````\n@octocat",
+		"``````\n@octocat\n``````",
+		"\n\nlead and trail\n\n",
+		"`@octocat` and o/r#1",
+	} {
+		got := findingBody(store.Finding{CrewID: "sorell", Body: probe, Severity: "high"}, "ORD-0001")
+		fence := strings.Repeat("`", max(3, longestRun(probe, '`')+1))
+		require.Equal(t, fence+"text\n"+strings.Trim(probe, "\n")+"\n"+fence+"\n\nFiled by sorell from ORD-0001 (severity high).", got, probe)
+		lines := strings.Split(got, "\n")
+		require.Equal(t, fence+"text", lines[0])
+		closing := -1
+		for i, l := range lines[1:] {
+			if m := fenceLine.FindStringSubmatch(l); m != nil && m[1][0] == '`' && len(m[1]) >= len(fence) {
+				require.Equal(t, -1, closing, "closed once: %q", probe)
+				closing = i + 1
+			}
+		}
+		require.Equal(t, len(lines)-3, closing, "closed at the end: %q", probe)
+	}
+	require.Equal(t, "Filed by sorell from ORD-0001.", findingBody(store.Finding{CrewID: "sorell", Body: " \n"}, "ORD-0001"))
+}
+
+// Titles: a zero-width space breaks every @-mention and every other
+// repository's ref; the tracker's own refs stay.
+func TestFindingTitle(t *testing.T) {
+	t.Parallel()
+	own := func(ref string) bool { return strings.HasPrefix(ref, "acme/app#") }
+	require.Equal(t, "Ask @\u200balice and @\u200borg/team about acme/app#1, other/app\u200b#2 and #3",
+		findingTitle("Ask @alice and @org/team about acme/app#1, other/app#2 and #3", own))
+	require.Equal(t, "Plain title", findingTitle("Plain title", own))
 }
 
 // Command's answer is parsed strictly against the batch and the backlog
@@ -261,7 +266,7 @@ func TestFileFindingReplay(t *testing.T) {
 	}
 	it, err := fake.Get(ctx, "#2")
 	require.NoError(t, err)
-	require.Equal(t, tracker.Item{Ref: "#2", Title: "Leak", Body: "Ask `@alice`.\n\nFiled by sorell from " + id + " (severity high).",
+	require.Equal(t, tracker.Item{Ref: "#2", Title: "Leak", Body: "```text\nAsk @alice.\n```\n\nFiled by sorell from " + id + " (severity high).",
 		Labels: []string{"bug", labelUnreviewed}, State: tracker.StateOpen, BlockedBy: []string{blocker}}, it)
 
 	// The crash: the row is still new, and the issue exists.
@@ -412,7 +417,7 @@ func TestFindingsTriageSkipped(t *testing.T) {
 			require.Equal(t, []string{"test", labelUnreviewed}, flake.Labels)
 			require.Equal(t, "Filed by sorell from "+id+" (severity low).", flake.Body)
 			require.Equal(t, []string{flake.Ref, existing}, leak.BlockedBy)
-			require.Equal(t, "Seen by `@alice` in `other/repo#4`.\n\nFiled by sorell from "+id+".", leak.Body)
+			require.Equal(t, "```text\nSeen by @alice in other/repo#4.\n```\n\nFiled by sorell from "+id+".", leak.Body)
 			require.Empty(t, foreign.BlockedBy, "another repository's ref is dropped")
 
 			got, err := d.store.OrderFindings(t.Context(), id)
@@ -442,10 +447,11 @@ func TestFindingsTriageSkipped(t *testing.T) {
 // the error, filing going on to the next.
 func TestFindingsTrackerDown(t *testing.T) {
 	t.Parallel()
-	fake := &trackertest.Fake{Err: errors.New("tracker down")}
+	fake := &creates{Fake: trackertest.Fake{Err: errors.New("tracker down")}}
 	d, id := findingsDaemon(t, fake, defaultRegs(t),
 		store.Finding{Key: "a", Title: "A"}, store.Finding{Key: "b", Title: "B", BlockedBy: []string{"a"}})
 	require.Equal(t, FindingsResult{Failed: 2}, runFindings(t, d, id))
+	require.Equal(t, 2*(1+retriesBacklogDown), fake.count(), "fewer retries once the backlog was unreadable")
 	got, err := d.store.OrderFindings(t.Context(), id)
 	require.NoError(t, err)
 	for _, f := range got {
@@ -504,4 +510,158 @@ func TestFindingsWorkflowRetries(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, store.FindingFiled, f.State)
 	require.Contains(t, f.Why, "created without the labels bmus:unreviewed")
+}
+
+// creates is a fake tracker that counts Create calls, and fails those for
+// the titles in fail without filing anything.
+type creates struct {
+	trackertest.Fake
+	fail map[string]bool
+	mu   sync.Mutex
+	n    int
+}
+
+func (c *creates) Create(ctx context.Context, it tracker.Item, m tracker.Mark) (tracker.Item, error) {
+	c.mu.Lock()
+	c.n++
+	c.mu.Unlock()
+	if c.fail[it.Title] {
+		return tracker.Item{}, errors.New("refused " + it.Title)
+	}
+	return c.Fake.Create(ctx, it, m)
+}
+
+func (c *creates) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+// A blocker that was dropped links nothing, one dropped as a duplicate
+// links the issue it repeats, a filed one its issue, and one that failed
+// nothing; each link once.
+func TestResolveBlockers(t *testing.T) {
+	t.Parallel()
+	byKey := map[string]store.Finding{
+		"noise": {Key: "noise", State: store.FindingDropped},
+		"dup":   {Key: "dup", State: store.FindingDropped, DuplicateOf: "#1"},
+		"filed": {Key: "filed", State: store.FindingNew},
+		"fail":  {Key: "fail", State: store.FindingNew},
+	}
+	refs := map[string]string{"filed": "#7"}
+	require.Equal(t, []string{"#1", "#7", "#2"},
+		resolveBlockers([]string{"noise", "dup", "filed", "fail", "#2", "#1", "#7"}, refs, byKey))
+	require.Empty(t, resolveBlockers([]string{"noise", "fail"}, refs, byKey))
+}
+
+// A finding that failed to file leaves its dependent filed without the
+// link.
+func TestFindingsFailedBlocker(t *testing.T) {
+	t.Parallel()
+	fake := &creates{fail: map[string]bool{"A": true}}
+	d, id := findingsDaemon(t, fake, nil,
+		store.Finding{Key: "a", Title: "A"}, store.Finding{Key: "b", Title: "B", BlockedBy: []string{"a"}})
+	require.Equal(t, FindingsResult{Filed: 1, Failed: 1}, runFindings(t, d, id))
+	it, err := fake.Get(t.Context(), "#1")
+	require.NoError(t, err)
+	require.Equal(t, "B", it.Title)
+	require.Empty(t, it.BlockedBy)
+	a, err := d.store.GetFinding(t.Context(), id, "a")
+	require.NoError(t, err)
+	require.Equal(t, store.FindingFailed, a.State)
+	require.Equal(t, "refused A", a.Why)
+}
+
+// N1: a finding whose link keeps failing has its issue: out of retries it
+// is filed with the link error noted, and its dependent links to it.
+func TestFindingsLinkOutOfRetries(t *testing.T) {
+	t.Parallel()
+	fake := &linkFails{}
+	existing := fake.Add(tracker.Item{Title: "existing"})
+	d, id := findingsDaemon(t, fake, nil,
+		store.Finding{Key: "a", Title: "A", BlockedBy: []string{existing}},
+		store.Finding{Key: "b", Title: "B", BlockedBy: []string{"a"}})
+	require.Equal(t, FindingsResult{Filed: 2}, runFindings(t, d, id))
+	a, err := d.store.GetFinding(t.Context(), id, "a")
+	require.NoError(t, err)
+	require.Equal(t, store.FindingFiled, a.State)
+	require.Equal(t, "#2", a.Ref)
+	require.Equal(t, "linking #2 to #1 failed", a.Why)
+	b, err := d.store.GetFinding(t.Context(), id, "b")
+	require.NoError(t, err)
+	require.Equal(t, "linking #3 to #2 failed", b.Why, "its dependent links to it")
+	items, err := fake.List(t.Context(), tracker.Query{})
+	require.NoError(t, err)
+	require.Len(t, items, 3, "one issue each")
+	texts := orderLogTexts(t, d, id)
+	require.Contains(t, texts, "finding a filed as #2 (linking #2 to #1 failed)")
+	require.Contains(t, texts, "findings of "+id+": filed 2, dropped 0, failed 0")
+}
+
+// linkFails is a fake tracker whose every link fails: Create files the
+// item without blockers and returns it with an error.
+type linkFails struct{ trackertest.Fake }
+
+func (l *linkFails) Create(ctx context.Context, it tracker.Item, m tracker.Mark) (tracker.Item, error) {
+	blockers := it.BlockedBy
+	it.BlockedBy = nil
+	got, err := l.Fake.Create(ctx, it, m)
+	if err != nil || len(blockers) == 0 {
+		return got, err
+	}
+	return got, errors.New("linking " + got.Ref + " to " + strings.Join(blockers, ", ") + " failed")
+}
+
+// N2: a blocker that no longer exists is dropped with a note, and the
+// finding is filed in the same attempt.
+func TestFileFindingMissingBlocker(t *testing.T) {
+	t.Parallel()
+	fake := &trackertest.Fake{}
+	existing := fake.Add(tracker.Item{Title: "existing"})
+	d, id := findingsStore(t, fake, store.Finding{Key: "leak", Title: "Leak"})
+	got, err := d.fileFinding(t.Context(), id, "leak", []string{"#9", existing}, findingsBegin{Since: time.Now(), Nonce: d.store.Nonce()})
+	require.NoError(t, err)
+	require.Equal(t, filedFinding{State: store.FindingFiled, Ref: "#2"}, got)
+	it, err := fake.Get(t.Context(), "#2")
+	require.NoError(t, err)
+	require.Equal(t, []string{existing}, it.BlockedBy)
+	require.Equal(t, []string{"created", "finding leak: blocker #9 dropped: item #9: tracker: not found", "finding leak filed as #2"},
+		orderLogTexts(t, d, id))
+}
+
+// N3: findings that outgrow the context with empty bodies get shorter
+// titles and fewer labels and blockers; past that, triage is skipped.
+func TestTriageContextTight(t *testing.T) {
+	t.Parallel()
+	var labels, blockers []string
+	for i := range 5 {
+		labels = append(labels, strings.Repeat(string(rune('a'+i)), 50))
+	}
+	for i := range 10 {
+		blockers = append(blockers, "o/"+strings.Repeat("r", 190)+"#"+strings.Repeat("1", 1+i%5))
+	}
+	finding := func(i int) store.Finding {
+		return store.Finding{Key: "k" + strings.Repeat("x", i%39), Title: strings.Repeat("t", 200), Body: "b",
+			Labels: labels, BlockedBy: blockers}
+	}
+	var fs []store.Finding
+	for i := range store.MaxFindings {
+		fs = append(fs, finding(i))
+	}
+	raw, _, err := triageContext("ORD-0001", "t", fs, nil)
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(raw), maxConsultContext)
+	var c triageHailContext
+	require.NoError(t, json.Unmarshal(raw, &c))
+	require.Len(t, c.Findings[0].Title, maxTriageTightTitle)
+	require.Len(t, c.Findings[0].Labels, maxTriageTightList)
+	require.Len(t, c.Findings[0].BlockedBy, maxTriageTightList)
+	require.Empty(t, c.Findings[0].Body)
+
+	for i := range 3 * store.MaxFindings {
+		fs = append(fs, finding(i))
+	}
+	_, _, err = triageContext("ORD-0001", "t", fs, nil)
+	require.ErrorIs(t, err, errTriageTooBig)
+	require.ErrorContains(t, err, "the findings don't fit the triage context's 32 KiB")
 }

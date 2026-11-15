@@ -99,7 +99,7 @@ func findingStep(pct int, f map[string]any) map[string]any {
 // duplicate of an existing issue and adds blockers to another. The two
 // left are filed blockers first, with the duplicate's blocker linked to
 // the issue it repeats, another repository's ref dropped and the body's
-// mention neutralised.
+// body filed as a code block.
 func TestFindingsTriageByCommand(t *testing.T) {
 	t.Parallel()
 	steps := []map[string]any{
@@ -169,7 +169,7 @@ func TestFindingsTriageByCommand(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{flaky, leakOld, "#3"}, main.BlockedBy)
 	require.Equal(t, []string{labelUnreviewed}, main.Labels)
-	require.Equal(t, "Ask `@alice`.\n\nFiled by sorell from "+id+" (severity high).", main.Body)
+	require.Equal(t, "```text\nAsk @alice.\n```\n\nFiled by sorell from "+id+" (severity high).", main.Body)
 	base, err := fake.Get(t.Context(), "#3")
 	require.NoError(t, err)
 	require.Empty(t, base.BlockedBy)
@@ -216,4 +216,61 @@ func TestFindingsOfFailedOrder(t *testing.T) {
 	texts := orderTexts(hd.logEntries(t), id, "")
 	require.Contains(t, texts, "findings of "+id+" filed without triage: "+infoRegsNotConfigured)
 	require.Contains(t, texts, "findings of "+id+": filed 1, dropped 0, failed 0")
+}
+
+// Command's triage unused: an answer that doesn't parse, and a consult
+// that times out (skip-advisory), each file every finding with the reason
+// logged.
+func TestFindingsTriageUnused(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		consult any
+		timeout time.Duration
+		why     string
+	}{
+		{"unparseable", map[string]any{"decision": "answer", "answer": "file them all", "rationale": "fine", "confidence": 0.9}, time.Minute,
+			"Command's answer was not used: not a JSON object"},
+		{"consult timeout", "silence", time.Second, "Command did not reply within 1s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			script, err := json.Marshal(map[string]any{"steps": []map[string]any{
+				findingStep(10, map[string]any{"key": "leak", "title": "Leak", "body": "b"}),
+				{"at_pct": 100, "report": map[string]any{"summary": "done"}},
+			}, "consult": tc.consult})
+			require.NoError(t, err)
+			fake := &trackertest.Fake{}
+			b := newHolodeckBridge(t, writeScript(t, string(script)))
+			b.regs = defaultRegs(t)
+			b.tracker = fake
+			b.consultTimeout = tc.timeout
+			hd := b.start(t)
+			hd.addCommand(t)
+			hd.addCrew(t)
+			id := hd.createOrder(t)
+			require.Equal(t, FindingsResult{Filed: 1}, findingsResult(t, hd.d, id))
+			require.Len(t, consults(t, b.stepLog), 1)
+			texts := orderTexts(hd.logEntries(t), id, "")
+			require.Contains(t, texts, "findings of "+id+" filed without triage: "+tc.why)
+			require.Contains(t, texts, "finding leak filed as #1")
+		})
+	}
+}
+
+// A mission that ends with no findings counts them and starts no findings
+// workflow.
+func TestNoFindingsNoWorkflow(t *testing.T) {
+	t.Parallel()
+	b := newHolodeckBridge(t, hailsScript(t))
+	b.tracker = &trackertest.Fake{}
+	hd := b.start(t)
+	hd.addCrew(t)
+	id := hd.createOrder(t)
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		require.Len(c, workflows(c, hd.d, missionWorkflowID(id)), 1)
+	}, 30*time.Second, 20*time.Millisecond)
+	require.Equal(t, MissionDone, missionResult(t, hd.d, id).Status)
+	require.Contains(t, stepNames(t, hd.d, missionWorkflowID(id)), "count-findings")
+	require.Empty(t, workflows(t, hd.d, findingsWorkflowID(id)))
 }

@@ -220,12 +220,60 @@ type FindingTriage struct {
 	AddBlockedBy []string
 }
 
+// findingsOnce is the payload field that marks a findings workflow's log
+// entry as written once per order (appendOnce).
+const findingsOnce = "findings_once"
+
+// appendOnce appends entries to the captain's log in tx, each with once in
+// its payload, unless order id's log already holds an entry marked once.
+// It reports whether it wrote them. A step that re-runs after its
+// transaction committed then writes nothing twice.
+func (s *Store) appendOnce(ctx context.Context, tx *sql.Tx, id, once string, entries []LogEntry) (bool, error) {
+	var done int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM log WHERE order_id = ? AND json_valid(payload)
+		AND json_extract(payload, '$.`+findingsOnce+`') = ?)`, id, once).Scan(&done); err != nil {
+		return false, err
+	}
+	if done == 1 {
+		return false, nil
+	}
+	for _, e := range entries {
+		var err error
+		if e.Payload, err = withField(e.Payload, findingsOnce, once); err != nil {
+			return false, err
+		}
+		if _, err := s.appendLog(ctx, tx, e); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// AppendLogOnce appends entries to order id's log, marked once, unless an
+// entry marked once is there already (#155): a findings workflow's notes,
+// written by steps a crash may re-run.
+func (s *Store) AppendLogOnce(ctx context.Context, id, once string, entries ...LogEntry) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		_, err := s.appendOnce(ctx, tx, id, once, entries)
+		return err
+	})
+}
+
+// TriageOnce marks TriageFindings' entry.
+const TriageOnce = "triage"
+
 // TriageFindings applies Command's triage to order id's findings that are
 // still new, and appends entry to the captain's log, in one transaction
 // (#155). A dropped finding becomes FindingDropped with its Why and
-// DuplicateOf; added blockers join its blocked_by, each once.
+// DuplicateOf; added blockers join its blocked_by, each once. It runs once
+// per order: the entry is marked TriageOnce, and with one already in the
+// log nothing is written.
 func (s *Store) TriageFindings(ctx context.Context, id string, triage []FindingTriage, entry LogEntry) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
+		wrote, err := s.appendOnce(ctx, tx, id, TriageOnce, []LogEntry{entry})
+		if err != nil || !wrote {
+			return err
+		}
 		for _, t := range triage {
 			f, err := scanFinding(tx.QueryRowContext(ctx, `SELECT `+findingCols+` FROM findings WHERE order_id = ? AND key = ?`, id, t.Key))
 			if errors.Is(err, sql.ErrNoRows) {
@@ -256,8 +304,7 @@ func (s *Store) TriageFindings(ctx context.Context, id string, triage []FindingT
 				return err
 			}
 		}
-		_, err := s.appendLog(ctx, tx, entry)
-		return err
+		return nil
 	})
 }
 
@@ -273,11 +320,11 @@ func (s *Store) SetFindingRef(ctx context.Context, id, key, ref string) error {
 }
 
 // SettleFinding moves finding key of order id from new to state (filed or
-// failed), with why and, when not empty, ref, and appends entry to the
+// failed), with why and, when not empty, ref, and appends entries to the
 // captain's log, in one transaction (#155). It reports whether the
 // finding was still new; one that wasn't is left alone and nothing is
 // logged.
-func (s *Store) SettleFinding(ctx context.Context, id, key, state, ref, why string, entry LogEntry) (bool, error) {
+func (s *Store) SettleFinding(ctx context.Context, id, key, state, ref, why string, entries ...LogEntry) (bool, error) {
 	var settled bool
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE findings SET state = ?, why = ?, ref = CASE WHEN ? = '' THEN ref ELSE ? END
@@ -290,8 +337,12 @@ func (s *Store) SettleFinding(ctx context.Context, id, key, state, ref, why stri
 			return err
 		}
 		settled = true
-		_, err = s.appendLog(ctx, tx, entry)
-		return err
+		for _, e := range entries {
+			if _, err := s.appendLog(ctx, tx, e); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	return settled, err
 }

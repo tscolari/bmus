@@ -200,6 +200,12 @@ func TestFindingWorkflowWrites(t *testing.T) {
 		{Key: "c", Drop: true, Why: "too late"},
 		{Key: "missing", Drop: true},
 	}, LogEntry{Kind: "order", OrderID: id, Text: "triaged"}))
+	// A re-run of the step writes nothing twice.
+	require.NoError(t, s.TriageFindings(ctx, id, []FindingTriage{{Key: "b", AddBlockedBy: []string{"c"}}},
+		LogEntry{Kind: "order", OrderID: id, Text: "triaged"}))
+	require.NoError(t, s.AppendLogOnce(ctx, id, "notes", LogEntry{Kind: "order", OrderID: id, Text: "note 1"},
+		LogEntry{Kind: "order", OrderID: id, Text: "note 2"}))
+	require.NoError(t, s.AppendLogOnce(ctx, id, "notes", LogEntry{Kind: "order", OrderID: id, Text: "note 1"}))
 	a, err := s.GetFinding(ctx, id, "a")
 	require.NoError(t, err)
 	require.Equal(t, FindingDropped, a.State)
@@ -239,7 +245,7 @@ func TestFindingWorkflowWrites(t *testing.T) {
 			texts = append(texts, e.Text)
 		}
 	}
-	require.Equal(t, []string{"c filed", "triaged", "b failed"}, texts)
+	require.Equal(t, []string{"c filed", "triaged", "note 1", "note 2", "b failed"}, texts)
 	_, err = s.GetFinding(ctx, id, "missing")
 	require.ErrorIs(t, err, sql.ErrNoRows)
 }
