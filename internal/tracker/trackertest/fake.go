@@ -28,7 +28,8 @@ type Comment struct {
 // order under a Parent (a parent's order), and stops at a Query's Limit.
 // It honours a Mark's key (Since aside): a second Comment on a ref under
 // a key already recorded there posts nothing, and a second Create under
-// a key returns the item filed under it. Its zero value is ready to use;
+// a key returns the item filed under it, adding the blocker links it
+// lacks, as the GitHub adapter does. FailLinks makes Create fail a link. Its zero value is ready to use;
 // it is safe for concurrent use.
 type Fake struct {
 	mu       sync.Mutex
@@ -42,6 +43,11 @@ type Fake struct {
 	// return it with tracker.ErrLabels; a retry under the same Mark
 	// returns the same.
 	DropLabels bool
+	// FailLinks is how many more Creates with blockers fail their last
+	// blocker link: the item is filed with the others and returned with
+	// an error, as the GitHub adapter returns a link that failed after
+	// the issue was created. A retry under the same Mark adds the link.
+	FailLinks int
 	// Err, if set, is returned by every call.
 	Err error
 }
@@ -148,6 +154,15 @@ func (f *Fake) Create(_ context.Context, it tracker.Item, m tracker.Mark) (track
 		return tracker.Item{}, err
 	}
 	if i, ok := f.created[m.Key]; ok && m.Key != "" {
+		for _, b := range it.BlockedBy {
+			if slices.Contains(f.items[i].BlockedBy, b) {
+				continue
+			}
+			if _, err := f.index(b); err != nil {
+				return f.view(i), err
+			}
+			f.items[i].BlockedBy = append(f.items[i].BlockedBy, b)
+		}
 		return f.view(i), f.labelsErr(i, it.Labels)
 	}
 	for _, r := range append(slices.Clone(it.BlockedBy), it.Parent) {
@@ -166,12 +181,21 @@ func (f *Fake) Create(_ context.Context, it tracker.Item, m tracker.Mark) (track
 		it.Labels = nil
 	}
 	it.BlockedBy = slices.Clone(it.BlockedBy)
+	var linkErr error
+	if n := len(it.BlockedBy); n > 0 && f.FailLinks > 0 {
+		f.FailLinks--
+		linkErr = fmt.Errorf("%s created, but linking blocker %s failed", it.Ref, it.BlockedBy[n-1])
+		it.BlockedBy = it.BlockedBy[:n-1]
+	}
 	f.items = append(f.items, it)
 	if m.Key != "" {
 		if f.created == nil {
 			f.created = map[string]int{}
 		}
 		f.created[m.Key] = len(f.items) - 1
+	}
+	if linkErr != nil {
+		return f.view(len(f.items) - 1), linkErr
 	}
 	return f.view(len(f.items) - 1), f.labelsErr(len(f.items)-1, want)
 }

@@ -263,3 +263,28 @@ func TestFakeDropLabels(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "#3", f.Add(in), "Add ignores the labels error")
 }
+
+// FailLinks files the item without its last blocker link and returns it
+// with an error; a retry under the same Mark adds that link alone.
+func TestFakeFailLinks(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := &trackertest.Fake{}
+	a, b := f.Add(tracker.Item{Title: "a"}), f.Add(tracker.Item{Title: "b"})
+	f.FailLinks = 1
+	m := tracker.Mark{Key: "finding ORD-0001/k", Since: time.Now()}
+	in := tracker.Item{Title: "t", BlockedBy: []string{a, b}}
+	it, err := f.Create(ctx, in, m)
+	require.ErrorContains(t, err, "#3 created, but linking blocker #2 failed")
+	require.Equal(t, "#3", it.Ref)
+	require.Equal(t, []string{a}, it.BlockedBy)
+	for range 2 {
+		it, err = f.Create(ctx, in, m)
+		require.NoError(t, err)
+		require.Equal(t, "#3", it.Ref)
+		require.Equal(t, []string{a, b}, it.BlockedBy, "each link once")
+	}
+	it, err = f.Create(ctx, tracker.Item{Title: "u", BlockedBy: []string{a}}, tracker.Mark{})
+	require.NoError(t, err, "FailLinks spent")
+	require.Equal(t, "#4", it.Ref)
+}

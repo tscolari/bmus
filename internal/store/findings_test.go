@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"testing"
@@ -169,4 +170,76 @@ func TestRecordFinding(t *testing.T) {
 	}
 	require.Len(t, findings(other), 2)
 	require.Len(t, findings(id), MaxFindings, "the other order's findings count apart")
+}
+
+// The findings workflow's writes (#155): triage drops and adds blockers to
+// new rows only, a ref is stored without settling, and a settle moves a
+// new row once, logging it.
+func TestFindingWorkflowWrites(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := openTest(t)
+	id, err := s.InsertOrder(ctx, Order{Title: "t", Assignee: "a"}, LogEntry{Kind: "order"})
+	require.NoError(t, err)
+	for i, k := range []string{"a", "b", "c"} {
+		_, err := s.RecordInbox(ctx, "a", 0, uint64(i+1), func(tx InboxTx) error {
+			return tx.RecordFinding(id, Finding{Key: k, Title: k, BlockedBy: []string{"#1"}}, time.Time{})
+		})
+		require.NoError(t, err)
+	}
+	n, err := s.CountFindings(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, 3, n)
+
+	settled, err := s.SettleFinding(ctx, id, "c", FindingFiled, "#9", "", LogEntry{Kind: "order", OrderID: id, Text: "c filed"})
+	require.NoError(t, err)
+	require.True(t, settled)
+	require.NoError(t, s.TriageFindings(ctx, id, []FindingTriage{
+		{Key: "a", Drop: true, Why: "noise", DuplicateOf: "#2"},
+		{Key: "b", AddBlockedBy: []string{"#1", "a"}},
+		{Key: "c", Drop: true, Why: "too late"},
+		{Key: "missing", Drop: true},
+	}, LogEntry{Kind: "order", OrderID: id, Text: "triaged"}))
+	a, err := s.GetFinding(ctx, id, "a")
+	require.NoError(t, err)
+	require.Equal(t, FindingDropped, a.State)
+	require.Equal(t, "noise", a.Why)
+	require.Equal(t, "#2", a.DuplicateOf)
+	b, err := s.GetFinding(ctx, id, "b")
+	require.NoError(t, err)
+	require.Equal(t, FindingNew, b.State)
+	require.Equal(t, []string{"#1", "a"}, b.BlockedBy)
+	c, err := s.GetFinding(ctx, id, "c")
+	require.NoError(t, err)
+	require.Equal(t, FindingFiled, c.State, "a settled row is left alone")
+	require.Equal(t, "#9", c.Ref)
+
+	require.NoError(t, s.SetFindingRef(ctx, id, "b", "#5"))
+	b, err = s.GetFinding(ctx, id, "b")
+	require.NoError(t, err)
+	require.Equal(t, FindingNew, b.State)
+	require.Equal(t, "#5", b.Ref)
+	settled, err = s.SettleFinding(ctx, id, "b", FindingFailed, "", "boom", LogEntry{Kind: "order", OrderID: id, Text: "b failed"})
+	require.NoError(t, err)
+	require.True(t, settled)
+	b, err = s.GetFinding(ctx, id, "b")
+	require.NoError(t, err)
+	require.Equal(t, FindingFailed, b.State)
+	require.Equal(t, "#5", b.Ref, "an empty ref keeps the stored one")
+	require.Equal(t, "boom", b.Why)
+	settled, err = s.SettleFinding(ctx, id, "b", FindingFiled, "#6", "", LogEntry{Kind: "order", OrderID: id, Text: "b again"})
+	require.NoError(t, err)
+	require.False(t, settled)
+
+	entries, err := s.ListLog(ctx, 0)
+	require.NoError(t, err)
+	var texts []string
+	for _, e := range entries {
+		if e.Kind == "order" && e.OrderID == id && e.Text != "" {
+			texts = append(texts, e.Text)
+		}
+	}
+	require.Equal(t, []string{"c filed", "triaged", "b failed"}, texts)
+	_, err = s.GetFinding(ctx, id, "missing")
+	require.ErrorIs(t, err, sql.ErrNoRows)
 }

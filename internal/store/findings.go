@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -156,31 +157,141 @@ func jsonList(l []string) (string, error) {
 	return string(b), err
 }
 
+// findingCols are the columns scanFinding reads.
+const findingCols = `order_id, key, crew_id, title, body, labels, severity, blocked_by,
+	received_at, state, why, duplicate_of, ref`
+
+func scanFinding(row interface{ Scan(...any) error }) (Finding, error) {
+	var (
+		f               Finding
+		labels, blocked string
+	)
+	if err := row.Scan(&f.OrderID, &f.Key, &f.CrewID, &f.Title, &f.Body, &labels, &f.Severity, &blocked,
+		&f.ReceivedAt, &f.State, &f.Why, &f.DuplicateOf, &f.Ref); err != nil {
+		return Finding{}, err
+	}
+	if err := json.Unmarshal([]byte(labels), &f.Labels); err != nil {
+		return Finding{}, fmt.Errorf("finding %s/%s labels: %w", f.OrderID, f.Key, err)
+	}
+	if err := json.Unmarshal([]byte(blocked), &f.BlockedBy); err != nil {
+		return Finding{}, fmt.Errorf("finding %s/%s blocked_by: %w", f.OrderID, f.Key, err)
+	}
+	return f, nil
+}
+
 // OrderFindings returns order id's findings, by key.
 func (s *Store) OrderFindings(ctx context.Context, id string) ([]Finding, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT order_id, key, crew_id, title, body, labels, severity, blocked_by,
-		received_at, state, why, duplicate_of, ref FROM findings WHERE order_id = ? ORDER BY key`, id)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+findingCols+` FROM findings WHERE order_id = ? ORDER BY key`, id)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Finding
 	for rows.Next() {
-		var (
-			f               Finding
-			labels, blocked string
-		)
-		if err := rows.Scan(&f.OrderID, &f.Key, &f.CrewID, &f.Title, &f.Body, &labels, &f.Severity, &blocked,
-			&f.ReceivedAt, &f.State, &f.Why, &f.DuplicateOf, &f.Ref); err != nil {
+		f, err := scanFinding(rows)
+		if err != nil {
 			return nil, err
-		}
-		if err := json.Unmarshal([]byte(labels), &f.Labels); err != nil {
-			return nil, fmt.Errorf("finding %s/%s labels: %w", id, f.Key, err)
-		}
-		if err := json.Unmarshal([]byte(blocked), &f.BlockedBy); err != nil {
-			return nil, fmt.Errorf("finding %s/%s blocked_by: %w", id, f.Key, err)
 		}
 		out = append(out, f)
 	}
 	return out, rows.Err()
+}
+
+// GetFinding returns finding key of order id, or sql.ErrNoRows.
+func (s *Store) GetFinding(ctx context.Context, id, key string) (Finding, error) {
+	return scanFinding(s.db.QueryRowContext(ctx, `SELECT `+findingCols+` FROM findings WHERE order_id = ? AND key = ?`, id, key))
+}
+
+// CountFindings is how many findings order id has, in any state.
+func (s *Store) CountFindings(ctx context.Context, id string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM findings WHERE order_id = ?`, id).Scan(&n)
+	return n, err
+}
+
+// FindingTriage is what Command's triage (#155) does to one finding:
+// drop it (with DuplicateOf, as a duplicate of that issue), with Why its
+// rationale, or add blockers to it (finding keys or tracker refs).
+type FindingTriage struct {
+	Key          string
+	Drop         bool
+	Why          string
+	DuplicateOf  string
+	AddBlockedBy []string
+}
+
+// TriageFindings applies Command's triage to order id's findings that are
+// still new, and appends entry to the captain's log, in one transaction
+// (#155). A dropped finding becomes FindingDropped with its Why and
+// DuplicateOf; added blockers join its blocked_by, each once.
+func (s *Store) TriageFindings(ctx context.Context, id string, triage []FindingTriage, entry LogEntry) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		for _, t := range triage {
+			f, err := scanFinding(tx.QueryRowContext(ctx, `SELECT `+findingCols+` FROM findings WHERE order_id = ? AND key = ?`, id, t.Key))
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if f.State != FindingNew {
+				continue
+			}
+			blocked := f.BlockedBy
+			for _, b := range t.AddBlockedBy {
+				if !slices.Contains(blocked, b) {
+					blocked = append(blocked, b)
+				}
+			}
+			list, err := jsonList(blocked)
+			if err != nil {
+				return err
+			}
+			state := FindingNew
+			if t.Drop {
+				state = FindingDropped
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE findings SET state = ?, why = ?, duplicate_of = ?, blocked_by = ?
+				WHERE order_id = ? AND key = ?`, state, t.Why, t.DuplicateOf, list, id, t.Key); err != nil {
+				return err
+			}
+		}
+		_, err := s.appendLog(ctx, tx, entry)
+		return err
+	})
+}
+
+// SetFindingRef stores ref as finding key's issue while the finding is
+// still new, leaving its state alone: the issue exists, and the findings
+// workflow is still adding its links (#155).
+func (s *Store) SetFindingRef(ctx context.Context, id, key, ref string) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE findings SET ref = ? WHERE order_id = ? AND key = ? AND state = ?`,
+			ref, id, key, FindingNew)
+		return err
+	})
+}
+
+// SettleFinding moves finding key of order id from new to state (filed or
+// failed), with why and, when not empty, ref, and appends entry to the
+// captain's log, in one transaction (#155). It reports whether the
+// finding was still new; one that wasn't is left alone and nothing is
+// logged.
+func (s *Store) SettleFinding(ctx context.Context, id, key, state, ref, why string, entry LogEntry) (bool, error) {
+	var settled bool
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE findings SET state = ?, why = ?, ref = CASE WHEN ? = '' THEN ref ELSE ? END
+			WHERE order_id = ? AND key = ? AND state = ?`, state, why, ref, ref, id, key, FindingNew)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil || n == 0 {
+			return err
+		}
+		settled = true
+		_, err = s.appendLog(ctx, tx, entry)
+		return err
+	})
+	return settled, err
 }
