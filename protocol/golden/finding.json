@@ -1,0 +1,1 @@
+{"v":1,"seq":1848,"crew":"sorell","order":"ORD-0414","type":"finding","ts":"2026-10-16T09:20:00Z","body":{"key":"snapshot-leak","title":"Snapshot writer leaks a file handle on error","body":"`writeSnapshot` returns early on a short write without closing the temp file.","labels":["bug","raft"],"severity":"medium","blocked_by":["raft-api","#12","example/raft#40"]}}

@@ -44,7 +44,7 @@ function expectCheckpoint(m: BeamToBridgeMessage, dir: string, index: number, no
 
 describe("holodeck harness", () => {
   it("fixtures are valid scripts", () => {
-    for (const f of ["default.json", "crash.json", "pause.json", "work.json"]) expect(() => loadScript(fixture(f))).not.toThrow();
+    for (const f of ["default.json", "crash.json", "pause.json", "work.json", "usage.json", "findings.json"]) expect(() => loadScript(fixture(f))).not.toThrow();
     expect(loadScript(fixture("default.json")).steps.some((s) => "request_handover" in s)).toBe(true);
   });
 
@@ -143,6 +143,23 @@ describe("holodeck harness", () => {
     git(src, "fetch", "-q", out, `+refs/heads/bmus/${ORDER}:refs/heads/bmus/${ORDER}`);
     expect(git(src, "rev-parse", `bmus/${ORDER}`)).toBe(second);
     expect(fs.readdirSync(path.join(dir, "work", ORDER, "out"))).toEqual(["app.bundle"]);
+    await a.close();
+  });
+
+  it("emits a finding step's body as given through serve, and the walk goes on without an answer (#153)", async () => {
+    const dir = tempDir();
+    await startServe(dir, 60_000, holodeck(fixture("findings.json"), dir));
+    const a = new Attach(dir, 0); // validates every message against the schema
+    a.send({ seq: 1, order: ORDER, type: "order", body: orderBody });
+    const steps = loadScript(fixture("findings.json")).steps;
+    expect(await a.next(ofOrder)).toMatchObject({ type: "progress" });
+    for (const i of [1, 2, 3]) {
+      const m = await a.next(ofOrder);
+      expect(m).toMatchObject({ type: "finding", order: ORDER });
+      expect(m.body).toEqual((steps[i] as { finding: unknown }).finding);
+    }
+    expect(await a.next(ofOrder)).toMatchObject({ type: "report", body: { summary: "holodeck mission complete" } });
+    expect(stepLog(dir).map((e) => e.action)).toEqual(["progress", "finding", "finding", "finding", "report"]);
     await a.close();
   });
 
@@ -479,6 +496,8 @@ describe("validateScript", () => {
     ["usage unknown key", [{ at_pct: 0, usage: { input_tokens: 1, output_tokens: 1, turns: 1, seq: 1 } }, report], "step 0: unknown usage key seq"],
     ["usage without turns", [{ at_pct: 0, usage: { input_tokens: 1, output_tokens: 1 } }, report], "step 0: usage.turns must be a non-negative integer"],
     ["usage negative tokens", [{ at_pct: 0, usage: { input_tokens: -1, output_tokens: 1, turns: 1 } }, report], "step 0: usage.input_tokens must be a non-negative integer"],
+    ["finding not an object", [{ at_pct: 0, finding: "a bug" }, report], "step 0: finding must be an object"],
+    ["finding as an array", [{ at_pct: 0, finding: [] }, report], "step 0: finding must be an object"],
     ["report unknown key", [{ at_pct: 100, report: { summary: "x", usage: {} } }], "step 0: unknown report key usage"],
     ["report with branch", [{ at_pct: 100, report: { summary: "x", branch: "b" } }], "step 0: unknown report key branch"],
     ["report no summary", [{ at_pct: 100, report: {} }], "step 0: report.summary must be a string"],
@@ -535,6 +554,17 @@ describe("holodeck run (in process)", () => {
     const usage = { input_tokens: 5, output_tokens: 1, turns: 1 };
     expect((await p.run({ id: ORDER, body: orderBody, repos: [], usage }, () => {}, () => {})).usage).toEqual({ input_tokens: 5, output_tokens: 1 });
     expect((await p.run({ id: ORDER, body: orderBody, repos: [] }, () => {}, () => {})).usage).toEqual({ input_tokens: 0, output_tokens: 0 });
+  });
+
+  it("emits a finding step's body unchecked, for the bridge to drop (#153)", async () => {
+    const dir = tempDir();
+    const script = path.join(dir, "bad-finding.json");
+    const bad = { key: "Not A Key", title: "two\nlines", body: "", extra: true };
+    fs.writeFileSync(script, JSON.stringify([{ at_pct: 10, finding: bad }, { at_pct: 100, report: { summary: "done" } }]));
+    const h = holodeckHarness({ script, workDir: path.join(dir, "work") });
+    const emitted: Outbound[] = [];
+    await h.run({ id: ORDER, body: orderBody, repos: [] }, (m) => emitted.push(m), () => {});
+    expect(emitted).toEqual([{ type: "finding", body: bad }]);
   });
 
   it("records each repo's checkout dir in the step log", async () => {

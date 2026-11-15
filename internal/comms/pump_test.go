@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -626,6 +627,88 @@ func TestPumpUsageRecorded(t *testing.T) {
 	sink.mu.Lock()
 	defer sink.mu.Unlock()
 	require.Equal(t, []string{id, id}, sink.usages, "the backstop runs for each report that changed the row (#119)")
+}
+
+// A finding goes straight to the store in the inbox transaction (#153):
+// kept ones land in findings and log "finding <key>: <title>" (kind
+// finding) on their order; a bad body, one without an order and one the
+// store drops are recorded in the inbox, dropped with a warning and logged
+// nowhere. None reaches a mission.
+func TestPumpFindingRecorded(t *testing.T) {
+	t.Parallel()
+	st := openStore(t)
+	ctx := t.Context()
+	id, err := st.InsertOrder(ctx, store.Order{Title: "t", Assignee: "crew-1"}, store.LogEntry{Kind: "order"})
+	require.NoError(t, err)
+	other, err := st.InsertOrder(ctx, store.Order{Title: "o", Assignee: "crew-2"}, store.LogEntry{Kind: "order"})
+	require.NoError(t, err)
+	logger, records := newRecordingLogger()
+	link, sink := newFakeLink(), &fakeSink{}
+	cfg := testPumpConfig(st, link, sink)
+	cfg.Logger = logger
+	startTestPump(t, cfg)
+	s := link.nextSession(t)
+
+	s.emit(t, beamMsg(t, 1, TypeFinding, id, FindingBody{Key: "leak", Title: "Snapshot leaks", Body: "b",
+		Labels: []string{"bug"}, Severity: "high", BlockedBy: []string{"flaky", "#12"}}))
+	s.emit(t, beamMsg(t, 2, TypeFinding, id, FindingBody{Key: "flaky", Title: "Flaky test"}))
+	s.emit(t, beamMsg(t, 3, TypeFinding, id, FindingBody{Key: "leak", Title: "Snapshot leaks twice"}))
+	bad := []Message{
+		beamMsg(t, 4, TypeFinding, id, FindingBody{Key: "Not A Key", Title: "t"}),
+		beamMsg(t, 5, TypeFinding, id, FindingBody{Key: "k", Title: "two\nlines"}),
+		beamMsg(t, 6, TypeFinding, id, FindingBody{Key: "k", Title: "t", Severity: "critical"}),
+		beamMsg(t, 7, TypeFinding, id, FindingBody{Key: "k", Title: "t", BlockedBy: []string{"owner/repo"}}),
+		beamMsg(t, 8, TypeFinding, id, FindingBody{}),
+		beamMsg(t, 9, TypeFinding, "", FindingBody{Key: "k", Title: "t"}),
+		beamMsg(t, 10, TypeFinding, other, FindingBody{Key: "k", Title: "t"}),
+		beamMsg(t, 11, TypeFinding, "ORD-9999", FindingBody{Key: "k", Title: "t"}),
+	}
+	bad[4].Body = json.RawMessage(`{"key":"k","title":"t","labels":"bug"}`)
+	for _, m := range bad {
+		s.emit(t, m)
+	}
+	for seq := uint64(1); seq <= 11; seq++ {
+		require.Equal(t, seq, s.nextAck(t))
+	}
+
+	got, err := st.OrderFindings(ctx, id)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	require.Equal(t, []string{"flaky", "leak"}, []string{got[0].Key, got[1].Key})
+	require.Equal(t, "Snapshot leaks twice", got[1].Title, "the same key replaced the first")
+	require.Empty(t, got[1].BlockedBy)
+	require.Equal(t, "crew-1", got[1].CrewID)
+	none, err := st.OrderFindings(ctx, other)
+	require.NoError(t, err)
+	require.Empty(t, none)
+
+	entries, err := st.ListLog(ctx, 0)
+	require.NoError(t, err)
+	var logged []string
+	for _, e := range entries {
+		if e.Kind == FindingLogKind {
+			require.Equal(t, id, e.OrderID)
+			require.Equal(t, "crew-1", e.CrewID)
+			logged = append(logged, e.Text)
+		}
+	}
+	require.Equal(t, []string{"finding leak: Snapshot leaks", "finding flaky: Flaky test", "finding leak: Snapshot leaks twice"}, logged)
+
+	var warned []uint64
+	for _, r := range records() {
+		if !strings.HasPrefix(r.Message, "comms: dropping finding") {
+			continue
+		}
+		require.Equal(t, slog.LevelWarn, r.Level, r.Message)
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "seq" {
+				warned = append(warned, a.Value.Uint64())
+			}
+			return true
+		})
+	}
+	require.Equal(t, []uint64{4, 5, 6, 7, 8, 9, 10, 11}, warned)
+	require.Empty(t, sink.missions(), "a finding never reaches a mission")
 }
 
 func TestPumpErrorRouting(t *testing.T) {

@@ -358,7 +358,7 @@ describe("sdk harness", () => {
     expect(o.cwd).toBe(dir);
     expect(o.permissionMode).toBe("bypassPermissions");
     expect(o.allowDangerouslySkipPermissions).toBe(true);
-    expect(o.allowedTools).toEqual(["mcp__combadge__progress", "mcp__combadge__report", "mcp__combadge__request_handover", "mcp__combadge__tracker_comment", "mcp__combadge__tracker_close"]);
+    expect(o.allowedTools).toEqual(["mcp__combadge__progress", "mcp__combadge__report", "mcp__combadge__request_handover", "mcp__combadge__tracker_comment", "mcp__combadge__tracker_close", "mcp__combadge__file_finding"]);
     // No report tool call: the agent's final text is the summary. serve adds the repos.
     expect(report).toEqual({ summary: "final text", usage: { input_tokens: 120, output_tokens: 11 } });
   });
@@ -493,7 +493,7 @@ describe("sdk harness", () => {
     await run.result;
     expect(run.emitted).toHaveLength(2);
     const o = run.options();
-    expect(o.allowedTools).toEqual(["mcp__combadge__progress", "mcp__combadge__report", "mcp__combadge__request_handover", "mcp__combadge__tracker_comment", "mcp__combadge__tracker_close", "mcp__combadge__split_order", "mcp__combadge__reorder_orders"]);
+    expect(o.allowedTools).toEqual(["mcp__combadge__progress", "mcp__combadge__report", "mcp__combadge__request_handover", "mcp__combadge__tracker_comment", "mcp__combadge__tracker_close", "mcp__combadge__file_finding", "mcp__combadge__split_order", "mcp__combadge__reorder_orders"]);
     expect(o.systemPrompt).toMatchObject({ append: expect.stringContaining("You are Command.") });
   });
 
@@ -608,6 +608,64 @@ describe("sdk harness", () => {
     expect(run.options().allowedTools).toContain("mcp__combadge__tracker_comment");
     expect(run.options().allowedTools).toContain("mcp__combadge__tracker_close");
     expect(run.options().systemPrompt).toMatchObject({ append: expect.stringContaining("mcp__combadge__tracker_close") });
+  });
+
+  it.each([undefined, "command"] as const)("gives every crew member file_finding, which emits a finding and holds nothing (role %s, #153)", async (role) => {
+    const dir = tempDir();
+    const ok = (key: string) => ({ content: [{ type: "text", text: `Finding ${key} recorded: the bridge files it as an issue when the order ends.` }] });
+    const run = start(async function* (agent) {
+      yield init;
+      expect(await agent.callTool("file_finding", { key: "snapshot-leak", title: "  Snapshot writer leaks a handle  ", body: "Short writes skip the close." })).toEqual(ok("snapshot-leak"));
+      const full = { key: "flaky-test", title: "TestSnapshot is flaky", body: "", labels: ["bug", "tests"], severity: "high", blocked_by: ["snapshot-leak", "#12", "example/app#40"] };
+      expect(await agent.callTool("file_finding", full)).toEqual(ok("flaky-test"));
+      // The same key replaces: it is sent again and doesn't count twice.
+      expect(await agent.callTool("file_finding", { key: "snapshot-leak", title: "Snapshot writer leaks two handles", body: "Both temp files." })).toEqual(ok("snapshot-leak"));
+      // Checked before anything is sent.
+      const long = (n: number) => "x".repeat(n);
+      for (const bad of [
+        { key: "Snapshot", title: "t", body: "" },
+        { key: "-leak", title: "t", body: "" },
+        { key: long(41), title: "t", body: "" },
+        { key: "k", title: " ", body: "" },
+        { key: "k", title: "two\nlines", body: "" },
+        { key: "k", title: long(201), body: "" },
+        { key: "k", title: "t", body: "\u6f22".repeat(11_000) }, // 33000 bytes of UTF-8
+        { key: "k", title: "t" },
+        { key: "k", title: "t", body: "", labels: ["a", "b", "c", "d", "e", "f"] },
+        { key: "k", title: "t", body: "", labels: ["a,b"] },
+        { key: "k", title: "t", body: "", labels: [long(51)] },
+        { key: "k", title: "t", body: "", labels: [""] },
+        { key: "k", title: "t", body: "", severity: "critical" },
+        { key: "k", title: "t", body: "", blocked_by: ["Not A Key"] },
+        { key: "k", title: "t", body: "", blocked_by: ["owner/repo"] },
+        { key: "k", title: "t", body: "", blocked_by: Array.from({ length: 11 }, (_, i) => `k${i}`) },
+      ]) {
+        expect((await agent.callTool("file_finding", bad)).isError, JSON.stringify(bad).slice(0, 80)).toBe(true);
+      }
+      // The limits themselves pass.
+      expect(await agent.callTool("file_finding", { key: long(40), title: "\u6f22".repeat(200), body: long(32 * 1024), labels: [long(50)] })).toEqual(ok(long(40)));
+      // 3 keys so far: 17 more fill the order, the 21st is refused, and a known key still replaces.
+      for (let i = 0; i < 17; i++) expect(await agent.callTool("file_finding", { key: `more-${i}`, title: `More ${i}`, body: "" })).toEqual(ok(`more-${i}`));
+      expect(await agent.callTool("file_finding", { key: "one-too-many", title: "Over", body: "" })).toEqual({
+        isError: true,
+        content: [{ type: "text", text: "Not recorded: this order already has 20 findings. File one of their keys again to revise it instead." }],
+      });
+      expect(await agent.callTool("file_finding", { key: "flaky-test", title: "TestSnapshot races compaction", body: "" })).toEqual(ok("flaky-test"));
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), ...(role !== undefined && { role }) });
+    await run.result;
+    const findings = run.emitted.filter((m) => m.type === "finding").map((m) => m.body);
+    expect(run.emitted).toHaveLength(findings.length); // no hail
+    expect(findings).toHaveLength(22);
+    expect(findings.slice(0, 3)).toEqual([
+      { key: "snapshot-leak", title: "Snapshot writer leaks a handle", body: "Short writes skip the close." },
+      { key: "flaky-test", title: "TestSnapshot is flaky", body: "", labels: ["bug", "tests"], severity: "high", blocked_by: ["snapshot-leak", "#12", "example/app#40"] },
+      { key: "snapshot-leak", title: "Snapshot writer leaks two handles", body: "Both temp files." },
+    ]);
+    expect(findings.map((f) => f.key)).not.toContain("one-too-many");
+    expect(findings.at(-1)).toEqual({ key: "flaky-test", title: "TestSnapshot races compaction", body: "" });
+    expect(run.options().allowedTools).toContain("mcp__combadge__file_finding");
+    expect(run.options().systemPrompt).toMatchObject({ append: expect.stringContaining("mcp__combadge__file_finding") });
   });
 
   it("gives no other crew member split_order or reorder_orders", async () => {
@@ -2528,7 +2586,7 @@ describe("sdk startup check", () => {
     expect(o).toMatchObject({
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
-      allowedTools: ["mcp__combadge__progress", "mcp__combadge__report", "mcp__combadge__request_handover", "mcp__combadge__tracker_comment", "mcp__combadge__tracker_close"],
+      allowedTools: ["mcp__combadge__progress", "mcp__combadge__report", "mcp__combadge__request_handover", "mcp__combadge__tracker_comment", "mcp__combadge__tracker_close", "mcp__combadge__file_finding"],
       mcpServers: {},
       strictMcpConfig: true,
       maxTurns: 2,

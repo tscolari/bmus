@@ -44,6 +44,12 @@
  *     answered. The beam holds no tracker credentials (D6): the bridge runs
  *     an allowed request itself, and answers option 0 with what it did, or
  *     option 1 with why it didn't (no tracker configured, say).
+ *   - `file_finding({key, title, body, labels?, severity?, blocked_by?})`, for
+ *     every role (#153): emits a `finding` message and returns at once; no
+ *     hail, and parking is left alone. The bridge keeps the finding on the
+ *     order and files it as an issue when the order ends. The same key
+ *     again replaces the earlier finding; a run refuses a 21st distinct key
+ *     (MAX_FINDINGS) with an error result.
  *   - `split_order({children})`, only with `--role command` (Command's crew
  *     members, #155): asks the captain to split the order into child orders,
  *     as an `order_split` hail (allow/deny, context {parent, children}),
@@ -194,6 +200,16 @@ import {
   CATEGORY_TOOL_APPROVAL,
   CATEGORY_TRACKER_CLOSE,
   CATEGORY_TRACKER_COMMENT,
+  FINDING_KEY,
+  FINDING_REF,
+  MAX_FINDING_BLOCKED_BY,
+  MAX_FINDING_BODY,
+  MAX_FINDING_LABEL,
+  MAX_FINDING_LABELS,
+  MAX_FINDING_REF,
+  MAX_FINDING_TITLE,
+  MAX_FINDINGS,
+  type FindingBody,
   MAX_REORDER_CHANGES,
   MAX_REORDER_IDS,
   MAX_REORDER_ONTO,
@@ -251,7 +267,7 @@ export const CHECK_TIMEOUT_MS = 2 * 60_000;
 
 /** Name of the in-process MCP server; its tools are `mcp__combadge__<tool>`. */
 export const MCP_SERVER = "combadge";
-export const ALLOWED_TOOLS = ["progress", "report", "request_handover", "tracker_comment", "tracker_close"].map((t) => `mcp__${MCP_SERVER}__${t}`);
+export const ALLOWED_TOOLS = ["progress", "report", "request_handover", "tracker_comment", "tracker_close", "file_finding"].map((t) => `mcp__${MCP_SERVER}__${t}`);
 /** Command's tool for splitting its order into child orders (#155). */
 export const SPLIT_ORDER_TOOL = `mcp__${MCP_SERVER}__split_order`;
 /** Command's tool for changing the base and after of orders nobody has started (#148). */
@@ -463,7 +479,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
         return i < 0 ? undefined : grants.splice(i, 1)[0];
       };
 
-      const state: RunState = { handovers: 0, handing: Promise.resolve() };
+      const state: RunState = { handovers: 0, handing: Promise.resolve(), findings: new Set() };
       /** Emits a checkpoint; when it answers a stop, marks it stopping and ends the run. */
       const checkpointReady = (body: CheckpointReadyBody) => {
         if (halted) return;
@@ -719,6 +735,8 @@ interface RunState {
   handing: Promise<unknown>;
   /** A stand_down, recall or budget stop the run is answering, and its fallback timer. */
   stop?: { stopped: Stopped | BudgetExceeded; timer: NodeJS.Timeout };
+  /** The keys file_finding sent this run (#153): a key again replaces its finding, a new one past MAX_FINDINGS is refused. */
+  findings: Set<string>;
 }
 
 // ---- policy ----
@@ -1231,6 +1249,54 @@ export function reorderHail(input: z.infer<z.ZodObject<typeof reorderOrdersInput
   };
 }
 
+/** Characters as the schema counts them: code points. */
+const chars = (s: string) => [...s].length;
+
+/** file_finding's input schema: the finding message's limits, which the bridge checks again (comms.FindingBody.Check). */
+export const fileFindingInput = {
+  key: z.string().regex(FINDING_KEY, "a key of lowercase letters, digits and dashes, 1-40 long, starting with a letter or digit"),
+  title: z
+    .string()
+    .trim()
+    .min(1)
+    .regex(ONE_LINE, "title is one line")
+    .refine((s) => chars(s) <= MAX_FINDING_TITLE, `title is at most ${MAX_FINDING_TITLE} characters`),
+  body: z.string().refine((s) => Buffer.byteLength(s) <= MAX_FINDING_BODY, `body is at most ${MAX_FINDING_BODY} bytes of UTF-8`),
+  labels: z
+    .array(
+      z
+        .string()
+        .trim()
+        .min(1)
+        .refine((s) => chars(s) <= MAX_FINDING_LABEL, `a label is at most ${MAX_FINDING_LABEL} characters`)
+        .refine((s) => !/[,\r\n]/.test(s), "a label has no commas or line breaks"),
+    )
+    .max(MAX_FINDING_LABELS)
+    .optional(),
+  severity: z.enum(["low", "medium", "high"]).optional(),
+  blocked_by: z
+    .array(
+      z
+        .string()
+        .trim()
+        .refine((s) => FINDING_KEY.test(s) || (s.length <= MAX_FINDING_REF && FINDING_REF.test(s)), "another finding's key, or a tracker ref such as #12 or owner/name#12"),
+    )
+    .max(MAX_FINDING_BLOCKED_BY)
+    .optional(),
+};
+
+/** The finding message file_finding emits for input. */
+export function findingBody(input: z.infer<z.ZodObject<typeof fileFindingInput>>): FindingBody {
+  return {
+    key: input.key,
+    title: input.title,
+    body: input.body,
+    ...(input.labels !== undefined && input.labels.length > 0 && { labels: input.labels }),
+    ...(input.severity !== undefined && { severity: input.severity }),
+    ...(input.blocked_by !== undefined && input.blocked_by.length > 0 && { blocked_by: input.blocked_by }),
+  };
+}
+
 /** tracker_comment's input schema; the bridge checks it again (bridge.checkTrackerRequest). */
 const trackerCommentInput = {
   ref: z.string().trim().min(1),
@@ -1344,11 +1410,31 @@ function combadgeServer(
         ),
       ]
     : [];
+  const findingTool = tool(
+    "file_finding",
+    "File something you found that deserves its own issue: a bug, a gap or follow-up work outside this order's scope. " +
+      "The bridge keeps it and files it as a tracker issue when this order ends; it doesn't wait for anyone. " +
+      "key names it within this order (lowercase letters, digits and dashes): filing the same key again replaces it, so you can revise one. " +
+      `At most ${MAX_FINDINGS} findings per order. blocked_by lists what it waits on: another finding's key, or a tracker ref such as #12.`,
+    fileFindingInput,
+    (input) => {
+      if (live.aborted) return dropped();
+      if (!state.findings.has(input.key) && state.findings.size >= MAX_FINDINGS) {
+        return Promise.resolve(
+          text(`Not recorded: this order already has ${MAX_FINDINGS} findings. File one of their keys again to revise it instead.`, true),
+        );
+      }
+      state.findings.add(input.key);
+      emit({ type: "finding", body: findingBody(input) });
+      return Promise.resolve(text(`Finding ${input.key} recorded: the bridge files it as an issue when the order ends.`));
+    },
+  );
   return createSdkMcpServer({
     name: MCP_SERVER,
     tools: [
       ...split,
       ...trackerTools,
+      findingTool,
       tool(
         "progress",
         "Tell the captain how far along the order is. pct is 0-100; note is one short line.",
@@ -1588,6 +1674,7 @@ function instructions(order: Order, checkout: RepoCheckout, role?: Role): string
     "If you need a decision from the captain, ask with AskUserQuestion; the answer may take a while.",
     `When the work is finished and committed, call mcp__${MCP_SERVER}__report with a summary and any artifact paths, then stop.`,
     `You have no issue tracker access. To comment on or close a tracker item, ask the bridge with mcp__${MCP_SERVER}__tracker_comment or mcp__${MCP_SERVER}__tracker_close; it may be refused.`,
+    `When you find something outside this order's scope that deserves its own issue (a bug, a gap, follow-up work), file it with mcp__${MCP_SERVER}__file_finding and carry on; the bridge files it once the order ends.`,
   ];
   if (role === "command") {
     lines.push(
