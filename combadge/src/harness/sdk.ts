@@ -2,7 +2,8 @@
  * sdk: the real harness (spec D4; plan §5). It runs the order through the
  * Claude Agent SDK's `query()` and maps the agent's needs onto the protocol.
  *
- * `serve --harness sdk [--claude-path <path>] [--work-dir <dir>] [--hail-park-after <duration>] [--check-model <model>]`
+ * `serve --harness sdk [--claude-path <path>] [--work-dir <dir>] [--hail-park-after <duration>]
+ *  [--checkpoint-every <duration>] [--checkpoint-turns <n>] [--check-model <model>]`
  *
  * - The SDK starts a native `claude` binary that no bundle can carry, so the
  *   harness passes `pathToClaudeCodeExecutable`: `--claude-path` when given
@@ -70,6 +71,22 @@
  *     each repo's `bmus/<order>` from its base commit (`<name>.bundle`, see
  *     bundleWork), a copy of the session transcript, and the note in
  *     handover.md. Then it emits checkpoint_ready.
+ * - Automatic checkpoints (#145). Every checkpoint, the agent's or the
+ *   harness's, snapshots the uncommitted work (tracked and untracked, minus
+ *   ignored files) on `refs/bmus/wip/<order>`, whose parent is the
+ *   `bmus/<order>` tip, in a temporary index (snapshotWip), and its bundle
+ *   carries that ref. After the run's first checkpoint, each bundles only
+ *   what came after the previous one's commit, with the full bundle beside
+ *   it for the bridge to fall back on. The harness writes its own:
+ *   - at every park, before the abort (see Parking), naming the held hails
+ *     in its note and in `held`;
+ *   - on a cadence: once `--checkpoint-turns` main-loop turns (default 10)
+ *     or `--checkpoint-every` (default 15m) have passed since the latest
+ *     checkpoint, when `bmus/<order>` or the work tree changed since then
+ *     (workKey). 0 turns that trigger off. It costs no inference and
+ *     doesn't interrupt the agent; it waits while parked or stopping.
+ *   Neither ever answers a stop: the stop's checkpoint is the agent's, or
+ *   the fallback's.
  * - The prompt is a streaming input: the order, then nothing until the first
  *   result, when the input closes and the query ends. The run resolves then:
  *   with the recorded report, or with the agent's final text as the summary
@@ -112,8 +129,8 @@
  * Parking (phase 3 plan §7, #154): each `tool_approval` or
  * `clarifying_question` hail starts a `--hail-park-after` timer (default
  * 15m; HarnessOptions.hailParkAfterMs). The first to fire parks the run: every
- * hail held then is parked, the query is aborted (its own AbortController,
- * not the run's) and the run stays open. The order stays `hailing`; the
+ * hail held then is parked, a checkpoint is written (#145), the query is
+ * aborted (its own AbortController, not the run's) and the run stays open. The order stays `hailing`; the
  * bridge can't tell. Once every parked hail is answered, the session resumes
  * (`query({resume})`) with one message carrying every answer (resumeText).
  * An allowed or denied call leaves a single-use entry for the resumed query
@@ -232,8 +249,8 @@ import {
   type UsageBody,
   USAGE_EVERY_TURNS,
 } from "../protocol.js";
-import { abortable, Budget, BudgetExceeded, bundleCheckpoint, checkpointFiles, escalate, orderDir, Stopped, type StopCommand } from "./common.js";
-import { git, type RepoCheckout } from "../repos.js";
+import { abortable, Budget, BudgetExceeded, bundleCheckpoint, checkpointFiles, escalate, orderDir, Stopped, workKey, type StopCommand } from "./common.js";
+import { git, wipRef, type RepoCheckout } from "../repos.js";
 import type { Emit, Harness, HarnessOptions, HarnessReport, Inbound, Order, Role, SelfCheck } from "./types.js";
 
 /** The slice of the SDK's `query` the harness uses; tests pass a fake. */
@@ -257,6 +274,10 @@ export const STOP_TIMEOUT_MS = 10 * 60_000;
 export const CONSULT_TIMEOUT_MS = 2 * 60_000;
 /** Default HarnessOptions.hailParkAfterMs (`--hail-park-after`; D4's 15 minutes). */
 export const HAIL_PARK_AFTER_MS = 15 * 60_000;
+/** Default HarnessOptions.checkpointEveryMs (`--checkpoint-every`, #145). */
+export const CHECKPOINT_EVERY_MS = 15 * 60_000;
+/** Default HarnessOptions.checkpointTurns (`--checkpoint-turns`, #145). */
+export const CHECKPOINT_TURNS = 10;
 /** How long a resumed query's Grants last at most; they also end with that query. */
 export const GRANT_TTL_MS = 10 * 60_000;
 /** How long a park waits for the aborted query to end before resuming without it. */
@@ -286,6 +307,8 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
   const consultTimeoutMs = deps.consultTimeoutMs ?? CONSULT_TIMEOUT_MS;
   const checkTimeoutMs = deps.checkTimeoutMs ?? CHECK_TIMEOUT_MS;
   const hailParkAfterMs = opts.hailParkAfterMs ?? HAIL_PARK_AFTER_MS;
+  const checkpointEveryMs = opts.checkpointEveryMs ?? CHECKPOINT_EVERY_MS;
+  const checkpointTurns = opts.checkpointTurns ?? CHECKPOINT_TURNS;
   const claudePath = opts.claudePath === undefined ? undefined : checkExecutable(path.resolve(opts.claudePath));
   const workDir = path.resolve(opts.workDir);
 
@@ -333,6 +356,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
         if (halted) return;
         halted = true;
         clearTimeout(state.stop?.timer);
+        clearTimeout(cadenceTimer);
         input.close();
         halt(err); // before the abort, so the run rejects with err, not the abort
         abort.abort();
@@ -341,6 +365,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
       let input = new Input(orderPrompt(order));
       /** The running query's own abort, chained to the run's: a park aborts it alone. */
       let current = new AbortController();
+      const state: RunState = { handovers: 0, handing: Promise.resolve(), findings: new Set(), since: {} };
       /** Hails that may park, held now, by ref, with their park timers. */
       const held = new Map<string, { call: Parked; timer: NodeJS.Timeout }>();
       /**
@@ -382,12 +407,95 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
         }
         held.clear();
         warn(`parking ${order.id}: ${park.refs.size} hail(s) held past ${Math.round(hailParkAfterMs / 1000)}s; the session resumes once all are answered`);
-        input.close();
-        current.abort(new Error(`parked: ${order.id} resumes once the captain answers`));
-        windDown = setTimeout(() => {
-          warn(`${order.id}: the parked query hasn't ended ${Math.round(WIND_DOWN_MS / 1000)}s after its abort; resuming without it`);
-          abandon();
-        }, WIND_DOWN_MS);
+        const parked = park;
+        const q = current;
+        // The checkpoint goes first (#145): the work and the transcript
+        // outlive the beam if it goes away while the hails wait.
+        void parkCheckpoint(parked).finally(() => {
+          if (halted) return; // a belay or a failure ended the run meanwhile
+          input.close();
+          q.abort(new Error(`parked: ${order.id} resumes once the captain answers`));
+          windDown = setTimeout(() => {
+            warn(`${order.id}: the parked query hasn't ended ${Math.round(WIND_DOWN_MS / 1000)}s after its abort; resuming without it`);
+            abandon();
+          }, WIND_DOWN_MS);
+        });
+      };
+      /**
+       * The park's checkpoint (#145): the bundle, the transcript and a note
+       * naming the held hails, emitted with their refs in `held`, so the
+       * bridge keeps them open if the beam goes away before they are
+       * answered. A run without repos writes none; a failure is logged and
+       * the park goes on.
+       */
+      const parkCheckpoint = async (parked: Park): Promise<void> => {
+        if (order.repos.length === 0) return;
+        const refs = [...parked.refs.keys()];
+        const questions = [...parked.refs.values()].map((p) => `- ${p.question}`);
+        const note = [
+          `Order ${order.id}: the session parked on ${refs.length} hail(s) held past ${Math.round(hailParkAfterMs / 1000)}s, waiting for the captain:`,
+          ...questions,
+          `The harness wrote this checkpoint at the park, with the commits on bmus/${order.id} and the uncommitted work on ${wipRef(order.id)}. If the order resumes from it on another beam, the captain's answers come with it.`,
+        ].join("\n");
+        try {
+          const body = await checkpoint(state, order, workDir, (dir, since) =>
+            writeCheckpoint(dir, order, transcriptOf(state, order.repos[0]!.dir), note, { missingTranscript: "empty", since }),
+          );
+          checkpointReady({ ...body, held: refs }, true);
+        } catch (err) {
+          warn(`${order.id}: the park's checkpoint failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      };
+      /** turns at the latest checkpoint, or the run's start: the cadence counts from there. */
+      let turnsAt = tally.turns;
+      let cadenceTimer: NodeJS.Timeout | undefined;
+      let cadenceBusy = false;
+      /** The work as the run started, the cadence's first baseline, once read. */
+      let baseline: Promise<void> = Promise.resolve();
+      /** The run has ended: nothing arms the cadence again. */
+      let over = false;
+      /** Whether the cadence runs at all: it needs a repo and one trigger. */
+      const cadenceOn = order.repos.length > 0 && (checkpointEveryMs > 0 || checkpointTurns > 0);
+      const armCadence = () => {
+        clearTimeout(cadenceTimer);
+        if (cadenceOn && checkpointEveryMs > 0 && !halted && !over) cadenceTimer = setTimeout(() => void cadenceCheck(), checkpointEveryMs);
+      };
+      /** A checkpoint was written: the cadence counts its turns and its time from it. */
+      state.written = (key) => {
+        state.key = key;
+        turnsAt = tally.turns;
+        armCadence();
+      };
+      /**
+       * The cadence (#145): once checkpointTurns main-loop turns or
+       * checkpointEveryMs have passed since the latest checkpoint, the
+       * harness writes one itself when `bmus/<order>` or the work tree
+       * changed since then. It costs no inference and doesn't interrupt the
+       * agent. Nothing changed: it counts again from now. It waits while
+       * parked, stopping or ending.
+       */
+      const cadenceCheck = async () => {
+        if (!cadenceOn || cadenceBusy || halted || park || state.stop || input.closed) return armCadence();
+        cadenceBusy = true;
+        try {
+          await baseline;
+          const key = await workKey(order);
+          if (key === state.key || halted || park || state.stop) {
+            turnsAt = tally.turns;
+            return armCadence();
+          }
+          const note = `Order ${order.id}: a cadence checkpoint the harness wrote while the agent worked (every ${checkpointTurns > 0 ? `${checkpointTurns} turns` : ""}${checkpointTurns > 0 && checkpointEveryMs > 0 ? " or " : ""}${checkpointEveryMs > 0 ? `${Math.round(checkpointEveryMs / 1000)}s` : ""}, when the work changed). Read the transcript, the commits on bmus/${order.id} and the uncommitted work on ${wipRef(order.id)} to see where the work stands.`;
+          const body = await checkpoint(state, order, workDir, (dir, since) =>
+            writeCheckpoint(dir, order, transcriptOf(state, order.repos[0]!.dir), note, { missingTranscript: "empty", since }),
+          );
+          checkpointReady(body, true);
+        } catch (err) {
+          warn(`${order.id}: a cadence checkpoint failed: ${err instanceof Error ? err.message : String(err)}`);
+          turnsAt = tally.turns;
+          armCadence();
+        } finally {
+          cadenceBusy = false;
+        }
       };
       /**
        * PostToolUse and PostToolUseFailure: a running call finished. A park it
@@ -480,12 +588,15 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
         return i < 0 ? undefined : grants.splice(i, 1)[0];
       };
 
-      const state: RunState = { handovers: 0, handing: Promise.resolve(), findings: new Set() };
-      /** Emits a checkpoint; when it answers a stop, marks it stopping and ends the run. */
-      const checkpointReady = (body: CheckpointReadyBody) => {
+      /**
+       * Emits a checkpoint; when it answers a stop, marks it stopping and
+       * ends the run. The harness's own (ordinary: a park's, the cadence's)
+       * never answer a stop.
+       */
+      const checkpointReady = (body: CheckpointReadyBody, ordinary = false) => {
         if (halted) return;
         sendUsage();
-        if (!state.stop) return emit({ type: "checkpoint_ready", body });
+        if (!state.stop || ordinary) return emit({ type: "checkpoint_ready", body });
         // A budget stop's checkpoint is an ordinary one: the run then ends with budget_exceeded, not Stopped.
         const { stopped } = state.stop;
         emit({ type: "checkpoint_ready", body: stopped instanceof Stopped ? { ...body, stopping: true } : body });
@@ -493,9 +604,9 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
       };
       /** The stop timeout: the agent wrote no checkpoint, so the harness writes one with a stub note. */
       const fallback = (stopped: Stopped | BudgetExceeded) =>
-        checkpoint(state, order, workDir, (dir) => {
-          const note = `Order ${order.id}: ${stopped.message}. The agent wrote no handover within ${Math.round(stopTimeoutMs / 1000)}s, so the harness wrote this checkpoint: read the transcript and the commits on bmus/${order.id} to see where the work stands.`;
-          return writeCheckpoint(dir, order, transcriptOf(state, order.repos[0]?.dir ?? workDir), note, { missingTranscript: "empty" });
+        checkpoint(state, order, workDir, (dir, since) => {
+          const note = `Order ${order.id}: ${stopped.message}. The agent wrote no handover within ${Math.round(stopTimeoutMs / 1000)}s, so the harness wrote this checkpoint: read the transcript, the commits on bmus/${order.id} and the uncommitted work on ${wipRef(order.id)} to see where the work stands.`;
+          return writeCheckpoint(dir, order, transcriptOf(state, order.repos[0]?.dir ?? workDir), note, { missingTranscript: "empty", since });
         }).then(checkpointReady, (err: unknown) => end(err instanceof Error ? err : new Error(String(err))));
       /**
        * The captain answered the budget hail stop (#119): the stand-down path,
@@ -581,6 +692,14 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
           allowedTools: allowedTools(opts.role),
           ...(order.body.model !== undefined && order.body.model !== "" && { model: order.body.model }),
         };
+        if (cadenceOn) {
+          // The cadence's first baseline is the work as the run starts; it doesn't hold the query up.
+          baseline = workKey(order).then(
+            (key) => void (state.key ??= key),
+            (err: unknown) => warn(`${order.id}: reading the work for the checkpoint cadence: ${err instanceof Error ? err.message : String(err)}`),
+          );
+          armCadence();
+        }
         let result: SDKResultMessage | undefined;
         /** The session a resumed query continues. */
         let resume: string | undefined;
@@ -611,7 +730,10 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
               // Aborted (a park, a belay, a stop's end): its messages change nothing. A belay or stop then ends the run below.
               if (q.signal.aborted) return;
               if ("session_id" in m && typeof m.session_id === "string") state.sessionId = m.session_id;
-              if (m.type === "assistant" && tally.assistant(m) && tally.turns % USAGE_EVERY_TURNS === 0) sendUsage();
+              if (m.type === "assistant" && tally.assistant(m)) {
+                if (tally.turns % USAGE_EVERY_TURNS === 0) sendUsage();
+                if (checkpointTurns > 0 && tally.turns - turnsAt >= checkpointTurns) void cadenceCheck();
+              }
               if (m.type === "result") {
                 tally.result(m);
                 result ??= m;
@@ -667,6 +789,8 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
       };
       const driven = drive().finally(() => {
         input.close();
+        over = true;
+        clearTimeout(cadenceTimer);
         clearTimeout(state.stop?.timer);
         clearTimeout(windDown);
         clearTimeout(grace);
@@ -734,6 +858,12 @@ interface RunState {
   handovers: number;
   /** The latest checkpoint being written, which the next one waits for. */
   handing: Promise<unknown>;
+  /** Each repo's commit in the latest checkpoint, by name: the next one bundles what came after it (#145). */
+  since: Record<string, string>;
+  /** What the latest checkpoint held (workKey), or the work at the run's start: the cadence checks against it. */
+  key?: string;
+  /** Called with each checkpoint's key once it is written. */
+  written?: (key: string) => void;
   /** A stand_down, recall or budget stop the run is answering, and its fallback timer. */
   stop?: { stopped: Stopped | BudgetExceeded; timer: NodeJS.Timeout };
   /** The keys file_finding sent this run (#153): a key again replaces its finding, a new one past MAX_FINDINGS is refused. */
@@ -1125,11 +1255,13 @@ function checkpoint(
   state: RunState,
   order: Order,
   workDir: string,
-  write: (dir: string) => Promise<CheckpointReadyBody>,
+  write: (dir: string, since: Record<string, string>) => Promise<Written>,
 ): Promise<CheckpointReadyBody> {
   const run = state.handing.then(async () => {
-    const body = await write(path.join(orderDir(workDir, order), String(state.handovers + 1)));
+    const { body, key } = await write(path.join(orderDir(workDir, order), String(state.handovers + 1)), state.since);
     state.handovers++;
+    state.since = Object.fromEntries(body.repos.map((r) => [r.name, r.commit]));
+    state.written?.(key);
     return body;
   });
   state.handing = run.catch(() => {});
@@ -1460,12 +1592,12 @@ function combadgeServer(
       ),
       tool(
         "request_handover",
-        `Checkpoint the work for whoever continues it: bundles the commits on branch bmus/${order.id} (commit there first; uncommitted changes and other branches are not included), copies this session's transcript and stores the note.`,
+        `Checkpoint the work for whoever continues it: bundles the commits on branch bmus/${order.id} (commit there first; other branches are not included) with a snapshot of the uncommitted changes, copies this session's transcript and stores the note.`,
         { note: z.string() },
         async ({ note }) => {
           if (live.aborted) return dropped();
           try {
-            const body = await checkpoint(state, order, dirs.workDir, (dir) => writeCheckpoint(dir, order, transcriptOf(state, dirs.repo), note));
+            const body = await checkpoint(state, order, dirs.workDir, (dir, since) => writeCheckpoint(dir, order, transcriptOf(state, dirs.repo), note, { since }));
             checkpointReady(body);
             const bundles = body.repos.map((r) => `${r.bundle_path} at ${r.commit}`);
             return text(`checkpoint written: ${[...bundles, body.transcript_path, body.handover_path].join(", ")}`);
@@ -1486,10 +1618,18 @@ function transcriptOf(state: RunState, cwd: string): string | undefined {
   return path.join(config, "projects", cwd.replace(/[^a-zA-Z0-9]/g, "-"), `${state.sessionId}.jsonl`);
 }
 
+/** A checkpoint as written: its body and what it holds (see bundleCheckpoint's key). */
+export interface Written {
+  body: CheckpointReadyBody;
+  key: string;
+}
+
 /**
- * Writes one bundle per repo of the order (`<name>.bundle`, see bundleWork:
- * `bmus/<order>` minus its base commit, or the whole history when it has
- * nothing beyond it), transcript.jsonl and handover.md into dir. Without a
+ * Writes one bundle per repo of the order (`<name>.bundle`, see
+ * bundleCheckpoint: `bmus/<order>` minus its base commit, or the whole
+ * history when it has nothing beyond it, with the work in progress on
+ * `refs/bmus/wip/<order>`; from opts.since's commit when given, with the
+ * full one beside it), transcript.jsonl and handover.md into dir. Without a
  * session transcript it throws, or with `missingTranscript: "empty"` writes
  * an empty transcript.jsonl.
  */
@@ -1498,8 +1638,8 @@ export async function writeCheckpoint(
   order: Order,
   transcript: string | undefined,
   note: string,
-  opts: { missingTranscript?: "throw" | "empty" } = {},
-): Promise<CheckpointReadyBody> {
+  opts: { missingTranscript?: "throw" | "empty"; since?: Record<string, string> } = {},
+): Promise<Written> {
   const found = transcript !== undefined && fs.existsSync(transcript);
   if (!found && opts.missingTranscript !== "empty") throw new Error(`session transcript not found${transcript ? ` at ${transcript}` : ""}`);
   for (const r of order.repos) await git(r.dir, "rev-parse", "--verify", "--quiet", `refs/heads/bmus/${order.id}^{commit}`);
@@ -1507,11 +1647,11 @@ export async function writeCheckpoint(
   const files = checkpointFiles(dir);
   fs.mkdirSync(dir, { recursive: true });
   try {
-    const repos = await bundleCheckpoint(dir, order);
+    const { repos, key } = await bundleCheckpoint(dir, order, opts.since);
     if (found) fs.copyFileSync(transcript, files.transcript_path);
     else fs.writeFileSync(files.transcript_path, "");
     fs.writeFileSync(files.handover_path, note.endsWith("\n") ? note : note + "\n");
-    return { repos, ...files };
+    return { body: { repos, ...files }, key };
   } catch (err) {
     fs.rmSync(dir, { recursive: true, force: true });
     throw err;

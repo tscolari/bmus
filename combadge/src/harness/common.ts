@@ -16,7 +16,7 @@ import {
   type UsageBody,
   type WorkRepo,
 } from "../protocol.js";
-import { bundleWork } from "../repos.js";
+import { bundleWork, snapshotWip } from "../repos.js";
 import type { Order } from "./types.js";
 
 /** Rejects with the signal's reason once it aborts, if p hasn't settled. */
@@ -48,11 +48,39 @@ export function checkpointFiles(dir: string) {
   };
 }
 
-/** Bundles each of the order's repos into `<dir>/<name>.bundle` (see bundleWork), in order. */
-export async function bundleCheckpoint(dir: string, order: Order): Promise<WorkRepo[]> {
-  const out: WorkRepo[] = [];
-  for (const r of order.repos) out.push(await bundleWork(r, order.id, path.join(dir, `${r.name}.bundle`)));
-  return out;
+/**
+ * Snapshots each of the order's repos' work in progress (snapshotWip,
+ * #145) and bundles it into `<dir>/<name>.bundle` (see bundleWork), with
+ * `refs/bmus/wip/<order>` when there is any, in order. since holds each
+ * repo's previous checkpoint commit, by name: that repo's bundle holds only
+ * what came after it, with the full one beside it. key says what the
+ * checkpoint holds (each repo's tip and work tree), so a harness can tell
+ * whether anything changed since (workKey).
+ */
+export async function bundleCheckpoint(dir: string, order: Order, since: Record<string, string> = {}): Promise<{ repos: WorkRepo[]; key: string }> {
+  const repos: WorkRepo[] = [];
+  const keys: string[] = [];
+  for (const r of order.repos) {
+    const snap = await snapshotWip(r, order.id);
+    keys.push(`${r.name}:${snap.tip}:${snap.tree}`);
+    const prev = since[r.name];
+    repos.push(await bundleWork(r, order.id, path.join(dir, `${r.name}.bundle`), { wip: true, ...(prev !== undefined && { since: prev }) }));
+  }
+  return { repos, key: keys.join(" ") };
+}
+
+/**
+ * What the order's repos hold now, as bundleCheckpoint's key: each repo's
+ * `bmus/<order>` tip and work tree (its WIP snapshot's tree). Snapshotting
+ * moves only `refs/bmus/wip/<order>`.
+ */
+export async function workKey(order: Order): Promise<string> {
+  const keys: string[] = [];
+  for (const r of order.repos) {
+    const snap = await snapshotWip(r, order.id);
+    keys.push(`${r.name}:${snap.tip}:${snap.tree}`);
+  }
+  return keys.join(" ");
 }
 
 /**
@@ -65,9 +93,10 @@ export async function writePlaceholderCheckpoint(
   order: Order,
   transcript: Record<string, unknown>,
   note: string,
+  since: Record<string, string> = {},
 ): Promise<CheckpointReadyBody> {
   fs.mkdirSync(dir, { recursive: true });
-  const repos = await bundleCheckpoint(dir, order);
+  const { repos } = await bundleCheckpoint(dir, order, since);
   const files = checkpointFiles(dir);
   // No fsync on purpose: these are placeholders, written before checkpoint_ready is emitted.
   fs.writeFileSync(files.transcript_path, JSON.stringify(transcript) + "\n");

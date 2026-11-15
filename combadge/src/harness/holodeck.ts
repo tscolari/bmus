@@ -21,7 +21,19 @@
  *   {"at_pct": 40, "hail": {"category": "...", "question": "...", "options": [...], "context": {...}}}
  *       Emits a hail with ref `holodeck-<order>-<index>` (options/context
  *       optional) and waits for the answer echoing that ref. The answer's
- *       decision and decided_by go into the step log.
+ *       decision and decided_by go into the step log. With `"park_after_ms":
+ *       N` beside `hail` (#145), a hail still unanswered after N ms parks:
+ *       the holodeck writes a placeholder checkpoint into
+ *       `<work-dir>/<order>/<index>/`, its note naming the hail and the step,
+ *       emits it with `held: [ref]`, logs a `park` step at the index, and
+ *       goes on waiting. An order whose handover note carries a holodeck
+ *       park ("The holodeck parked its script at step N") walks from step
+ *       N + 1: its hail is the bridge's to carry, and the run raises it no
+ *       second time.
+ *   {"at_pct": 30, "write": "notes.txt"}
+ *       In each of the order's repos, appends `<order> step <index>` to that
+ *       file (a relative path, created with its dirs) and leaves it
+ *       uncommitted: work in progress for the checkpoints to snapshot (#145).
  *   {"at_pct": 50, "commit": "message"}
  *       In each of the order's repos, appends `<order> step <index>: <message>`
  *       to holodeck.txt and commits it with that message on the checked-out
@@ -29,7 +41,9 @@
  *       repo's new commit under `"commits"`. With no repos it only logs.
  *   {"at_pct": 60, "request_handover": "note"}
  *       Writes one git bundle per repo of `bmus/<order>` (`<name>.bundle`, as
- *       the sdk harness does), plus transcript.jsonl (a placeholder) and
+ *       the sdk harness does, with the work in progress on
+ *       `refs/bmus/wip/<order>` and, after the run's first checkpoint, only
+ *       what came after it, beside the full one), plus transcript.jsonl (a placeholder) and
  *       handover.md (the note), into `<work-dir>/<order>/<index>/` (one dir
  *       per step, so a later handover doesn't overwrite an earlier one), then
  *       emits checkpoint_ready with their absolute paths.
@@ -131,7 +145,8 @@ export type Step = { at_pct: number } & (
   | { progress: string }
   | { usage: UsageSpec }
   | { finding: FindingBody }
-  | { hail: HailSpec }
+  | { hail: HailSpec; park_after_ms?: number }
+  | { write: string }
   | { commit: string }
   | { request_handover: string }
   | { sleep_ms: number }
@@ -150,7 +165,9 @@ type Delivered<T> = { body: T; delivery: number };
 
 export type ConsultSpec = (Omit<ConsultReplyBody, "hail_id" | "rationale"> & { rationale?: string }) | "silence";
 
-const ACTIONS = ["progress", "usage", "finding", "hail", "commit", "request_handover", "sleep_ms", "report", "crash"] as const;
+const ACTIONS = ["progress", "usage", "finding", "hail", "write", "commit", "request_handover", "sleep_ms", "report", "crash"] as const;
+/** A holodeck park's mark in its checkpoint's note, which a resumed order's handover carries (#145). */
+const PARKED_AT = /The holodeck parked its script at step ([0-9]+)\./;
 type Action = (typeof ACTIONS)[number];
 const TERMINAL = new Set<Action>(["report", "crash"]);
 /** Longest Node timer; anything above it fires after 1ms. */
@@ -206,13 +223,20 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
         } else warn(`ignoring ${m.type} for ${order.id}`);
       });
 
+      /** Each repo's commit in the run's latest checkpoint: the next one bundles what came after it (#145). */
+      let since: Record<string, string> = {};
+      /** writePlaceholderCheckpoint, from the run's previous checkpoint. */
+      const placeholder = async (dir: string, transcript: Record<string, unknown>, note: string) => {
+        const body = await writePlaceholderCheckpoint(dir, order, transcript, note, since);
+        since = Object.fromEntries(body.repos.map((r) => [r.name, r.commit]));
+        return body;
+      };
       /** Once the walk has stopped, writes and emits the stopping checkpoint, then ends the run with Stopped. */
       const stop = async (stopped: Stopped) => {
         await walked.catch(() => {});
         try {
-          const body = await writePlaceholderCheckpoint(
+          const body = await placeholder(
             path.join(orderDir(workDir, order), String(steps.length)),
-            order,
             { holodeck: true, order: order.id, stopped: stopped.command },
             `Order ${order.id}: ${stopped.message}. The holodeck stopped its script here.`,
           );
@@ -253,9 +277,8 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
           appendStep(stepLog, { order: order.id, index, action: "budget", ts: new Date().toISOString(), ...recorded, decision: a.decision, decided_by: a.decided_by, delivery });
         if (budget.answer(a)) return;
         const stopped = new BudgetExceeded(order.id, budget.context(own));
-        const body = await writePlaceholderCheckpoint(
+        const body = await placeholder(
           path.join(orderDir(workDir, order), String(steps.length)),
-          order,
           { holodeck: true, order: order.id, stopped: "budget" },
           `Order ${order.id}: ${stopped.message}. The holodeck stopped its script here.`,
         );
@@ -263,8 +286,11 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
         emit({ type: "checkpoint_ready", body });
         throw stopped;
       };
+      /** A resumed order's holodeck park (#145): the walk goes on after that step. */
+      const parkedAt = Number(PARKED_AT.exec(order.body.handover ?? "")?.[1] ?? -1);
       const walk = async (): Promise<HarnessReport> => {
         for (const [index, step] of steps.entries()) {
+          if (index <= parkedAt && index < steps.length - 1) continue;
           signal.throwIfAborted();
           const log = (extra: Record<string, unknown> = {}) =>
             stepLog && appendStep(stepLog, { order: order.id, index, action: actionOf(step), ts: new Date().toISOString(), ...recorded, ...extra });
@@ -285,17 +311,42 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
             const ref = `holodeck-${order.id}-${index}`;
             const answer = abortable(new Promise<Delivered<AnswerBody>>((resolve) => answers.set(ref, resolve)), signal);
             emit({ type: "hail", body: { ref, ...step.hail } });
+            if (step.park_after_ms !== undefined) {
+              const parkAfter = step.park_after_ms;
+              const timer = new AbortController();
+              const cancel = () => timer.abort();
+              signal.addEventListener("abort", cancel, { once: true });
+              void answer.then(cancel, cancel);
+              void (async () => {
+                const late = await delay(parkAfter, true, { signal: timer.signal }).catch(() => false);
+                if (!late || signal.aborted) return;
+                const body = await placeholder(
+                  path.join(orderDir(workDir, order), String(index)),
+                  { holodeck: true, order: order.id, parked: index },
+                  `Order ${order.id}: the holodeck parked on hail ${ref} (${step.hail.question}). The holodeck parked its script at step ${index}.`,
+                );
+                if (signal.aborted) return;
+                emit({ type: "checkpoint_ready", body: { ...body, held: [ref] } });
+                log({ action: "park" });
+              })().catch((err: unknown) => warn(`${order.id}: the park's checkpoint failed: ${err instanceof Error ? err.message : String(err)}`));
+            }
             const { body: a, delivery } = await answer;
             signal.throwIfAborted();
             log({ decision: a.decision, decided_by: a.decided_by, delivery });
+          } else if ("write" in step) {
+            for (const r of order.repos) {
+              const file = path.join(r.dir, step.write);
+              fs.mkdirSync(path.dirname(file), { recursive: true });
+              fs.appendFileSync(file, `${order.id} step ${index}\n`);
+            }
+            log();
           } else if ("commit" in step) {
             const commits = await commitWork(order, index, step.commit);
             signal.throwIfAborted();
             log(order.repos.length > 0 ? { commits } : {});
           } else if ("request_handover" in step) {
-            const body = await writePlaceholderCheckpoint(
+            const body = await placeholder(
               path.join(orderDir(workDir, order), String(index)),
-              order,
               { holodeck: true, order: order.id, step: index },
               step.request_handover,
             );
@@ -408,13 +459,26 @@ export function validateScript(raw: unknown): Step[] {
     if (typeof pct !== "number" || !(pct >= 0 && pct <= 100)) fail("at_pct must be a number from 0 to 100");
     if ((pct as number) < lastPct) fail(`at_pct ${String(pct)} is below the previous step's ${lastPct}`);
     lastPct = pct as number;
-    const keys = Object.keys(s).filter((k) => k !== "at_pct");
+    if (s.park_after_ms !== undefined) {
+      if (!("hail" in s)) fail("park_after_ms goes only with hail");
+      if (!Number.isSafeInteger(s.park_after_ms) || (s.park_after_ms as number) < 0 || (s.park_after_ms as number) > MAX_SLEEP_MS) {
+        fail(`park_after_ms must be an integer from 0 to ${MAX_SLEEP_MS}`);
+      }
+    }
+    const keys = Object.keys(s).filter((k) => k !== "at_pct" && k !== "park_after_ms");
     const unknown = keys.filter((k) => !(ACTIONS as readonly string[]).includes(k));
     if (unknown.length) fail(`unknown key ${unknown.join(", ")}`);
     if (keys.length !== 1) fail(`needs exactly one action (${ACTIONS.join(", ")})`);
     const action = keys[0] as Action;
     const v = s[action];
     switch (action) {
+      case "write": {
+        const parts = typeof v === "string" ? v.split(/[\\/]/) : [];
+        if (typeof v !== "string" || v === "" || path.isAbsolute(v) || parts.includes("..") || parts[0] === ".git") {
+          fail("write must be a relative path inside the repo, outside .git");
+        }
+        break;
+      }
       case "progress":
       case "commit":
       case "request_handover":

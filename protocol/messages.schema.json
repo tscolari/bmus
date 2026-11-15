@@ -298,7 +298,8 @@
         },
         "transcript_path": {"description": "Agent session transcript.", "type": "string", "minLength": 1},
         "handover_path": {"description": "Handover note written by the agent.", "type": "string", "minLength": 1},
-        "stopping": {"description": "True on the checkpoint that answers a stand_down or recall: the harness stops after it and the order ends with no report or error. Absent means the order runs on.", "type": "boolean"}
+        "stopping": {"description": "True on the checkpoint that answers a stand_down or recall: the harness stops after it and the order ends with no report or error. Absent means the order runs on.", "type": "boolean"},
+        "held": {"description": "The refs of the hails a park checkpoint holds (#145): the run parked on them, and the bridge keeps them open if the order parks before they are answered. Absent on any other checkpoint.", "type": "array", "items": {"type": "string", "minLength": 1}}
       }
     },
     "report": {
@@ -326,7 +327,8 @@
         "name": {"description": "The order repo's name.", "$ref": "#/$defs/repo_name"},
         "bundle_path": {"description": "Absolute path on the beam of a git bundle of `branch` minus the order's base commit, or of its whole history when the branch has no commits past it (git refuses an empty bundle).", "type": "string", "minLength": 1},
         "commit": {"description": "The commit `branch` points at in the bundle.", "type": "string", "minLength": 1},
-        "branch": {"description": "The branch the bundle carries, `bmus/<order>`.", "type": "string", "minLength": 1}
+        "branch": {"description": "The branch the bundle carries, `bmus/<order>`.", "type": "string", "minLength": 1},
+        "full_bundle_path": {"description": "A checkpoint's full bundle (#145), when bundle_path holds only what came after the previous checkpoint's commit: the bridge takes it when the incremental one doesn't verify. Absent when bundle_path is the full one.", "type": "string", "minLength": 1}
       }
     },
     "repo_name": {

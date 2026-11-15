@@ -178,6 +178,12 @@ export interface CheckpointReadyBody {
   handover_path: string;
   /** True on the checkpoint that answers a stand_down or recall: the run stops after it, with no report or error. */
   stopping?: boolean;
+  /**
+   * The refs of the hails a park checkpoint holds (#145): the run parked on
+   * them, and the bridge keeps them open if the order parks before they are
+   * answered. Absent on any other checkpoint.
+   */
+  held?: string[];
 }
 
 /** The work in one repo of an order, as a git bundle on the beam's disk. */
@@ -190,6 +196,12 @@ export interface WorkRepo {
   commit: string;
   /** The branch the bundle carries, `bmus/<order>`. */
   branch: string;
+  /**
+   * A checkpoint's full bundle (#145), when bundle_path holds only what came
+   * after the previous checkpoint's commit: the bridge takes it when the
+   * incremental one doesn't verify. Absent when bundle_path is the full one.
+   */
+  full_bundle_path?: string;
 }
 
 export interface Usage {

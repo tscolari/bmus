@@ -410,6 +410,10 @@ type CheckpointReadyBody struct {
 	// the harness stops after it, and the order ends with no report or
 	// error.
 	Stopping bool `json:"stopping,omitempty"`
+	// Held are the refs of the hails a park checkpoint holds (#145): the
+	// run parked on them, and the bridge keeps them open if the order
+	// parks before they are answered.
+	Held []string `json:"held,omitempty"`
 }
 
 // MarshalJSON writes a nil Repos as [], which the schema requires.
@@ -450,6 +454,10 @@ type WorkRepo struct {
 	BundlePath string `json:"bundle_path"`
 	Commit     string `json:"commit"`
 	Branch     string `json:"branch"`
+	// FullBundlePath is a checkpoint's full bundle (#145), when BundlePath
+	// holds only what came after the previous checkpoint's commit: the
+	// bridge takes it when the incremental one doesn't verify.
+	FullBundlePath string `json:"full_bundle_path,omitempty"`
 }
 
 // Usage is token usage for an order.

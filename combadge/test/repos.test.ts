@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { bundleWork, checkoutRepos } from "../src/repos.js";
+import { bundleWork, checkoutRepos, previousCheckout, snapshotWip, wipNote, wipRef } from "../src/repos.js";
 import { git, orderBundle } from "./gitfix.js";
 import { cleanup, tempDir } from "./procs.js";
 
@@ -134,5 +134,139 @@ describe("bundleWork", () => {
     expect(got).toEqual({ name: "app", bundle_path: path.join(dir, "out", "app.bundle"), commit: later, branch: `bmus/${ORDER}` });
     expect(git(dir, "bundle", "list-heads", got.bundle_path)).toBe(`${later} refs/heads/bmus/${ORDER}`);
     expect(base).not.toBe(later);
+  });
+});
+
+describe("work in progress (#145)", () => {
+  const WIP = wipRef(ORDER);
+
+  /** A checkout of a fresh order bundle with uncommitted work: a staged edit, an unstaged one, an untracked and an ignored file. */
+  async function dirty(dir: string) {
+    const { repo } = orderBundle(dir, ORDER);
+    const [c] = await checkoutRepos(path.join(dir, "work"), ORDER, [repo]);
+    const d = c!.dir;
+    fs.writeFileSync(path.join(d, ".gitignore"), "*.log\n");
+    git(d, "add", ".gitignore");
+    git(d, "commit", "-q", "-m", "ignore logs");
+    fs.writeFileSync(path.join(d, "a.txt"), "staged\n");
+    git(d, "add", "a.txt");
+    fs.writeFileSync(path.join(d, "a.txt"), "unstaged\n");
+    fs.writeFileSync(path.join(d, "new.txt"), "untracked\n");
+    fs.writeFileSync(path.join(d, "debug.log"), "ignored\n");
+    return c!;
+  }
+
+  it("snapshots tracked and untracked changes, not ignored ones, on the WIP ref, leaving the index and work tree as they were", async () => {
+    const dir = tempDir();
+    const c = await dirty(dir);
+    const state = () => [git(c.dir, "status", "--porcelain", "--ignored"), git(c.dir, "ls-files", "--stage"), git(c.dir, "diff"), git(c.dir, "diff", "--cached")];
+    const before = state();
+    const tip = git(c.dir, "rev-parse", `bmus/${ORDER}`);
+    const snap = await snapshotWip(c, ORDER);
+    expect(state()).toEqual(before);
+    expect(git(c.dir, "rev-parse", `bmus/${ORDER}`)).toBe(tip); // the branch takes no WIP commit
+    expect(snap.tip).toBe(tip);
+    expect(snap.commit).toBe(git(c.dir, "rev-parse", WIP));
+    expect(git(c.dir, "rev-parse", `${WIP}^`)).toBe(tip);
+    expect(git(c.dir, "show", `${WIP}:a.txt`)).toBe("unstaged");
+    expect(git(c.dir, "show", `${WIP}:new.txt`)).toBe("untracked");
+    expect(git(c.dir, "ls-tree", "--name-only", WIP)).not.toContain("debug.log");
+    expect(fs.readdirSync(path.join(c.dir, ".git")).filter((f) => f.includes("bmus-wip"))).toEqual([]);
+  });
+
+  it("has no WIP ref with nothing uncommitted, and the bundle carries none", async () => {
+    const dir = tempDir();
+    const c = await dirty(dir);
+    await snapshotWip(c, ORDER);
+    git(c.dir, "add", "-A");
+    git(c.dir, "commit", "-q", "-m", "all of it");
+    fs.writeFileSync(path.join(c.dir, "more.log"), "still ignored\n");
+    const snap = await snapshotWip(c, ORDER);
+    expect(snap.commit).toBeUndefined();
+    expect(() => git(c.dir, "rev-parse", "--verify", "--quiet", WIP)).toThrow();
+    const b = await bundleWork(c, ORDER, path.join(dir, "cp", "app.bundle"), { wip: true });
+    expect(git(dir, "bundle", "list-heads", b.bundle_path)).toBe(`${b.commit} refs/heads/bmus/${ORDER}`);
+  });
+
+  it("bundles a checkpoint from the previous one's commit, with the full bundle beside it, and only the full one without commits past it", async () => {
+    const dir = tempDir();
+    const c = await dirty(dir);
+    const first = git(c.dir, "rev-parse", `bmus/${ORDER}`);
+    git(c.dir, "commit", "-q", "-m", "staged a");
+    await snapshotWip(c, ORDER);
+    const b = await bundleWork(c, ORDER, path.join(dir, "cp2", "app.bundle"), { wip: true, since: first });
+    expect(b.full_bundle_path).toBe(path.join(dir, "cp2", "app.full.bundle"));
+    expect(git(dir, "bundle", "list-heads", b.bundle_path)).toContain(WIP);
+    // The incremental one needs the previous commit; the full one only the base.
+    expect(execFileSync("git", ["bundle", "verify", b.bundle_path], { cwd: c.dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })).toBeDefined();
+    const header = (f: string) => fs.readFileSync(f, "latin1").split("\n\n")[0]!;
+    expect(header(b.bundle_path)).toContain(`-${first}`);
+    expect(header(b.full_bundle_path!)).toContain(`-${c.base_commit}`);
+    // Nothing committed since: just the full bundle.
+    const again = await bundleWork(c, ORDER, path.join(dir, "cp3", "app.bundle"), { wip: true, since: b.commit });
+    expect(again.full_bundle_path).toBeUndefined();
+    expect(header(again.bundle_path)).toContain(`-${c.base_commit}`);
+  });
+
+  it("restores the shipped bundle's WIP on its tip with nothing staged, and says so in the note", async () => {
+    const dir = tempDir();
+    const c = await dirty(dir);
+    await snapshotWip(c, ORDER);
+    // The bridge ships bmus/<order> and the WIP ref with their history.
+    const shipped = path.join(dir, "ship", "in", "app.bundle");
+    fs.mkdirSync(path.dirname(shipped), { recursive: true });
+    git(c.dir, "bundle", "create", "--quiet", shipped, `refs/heads/bmus/${ORDER}`, WIP);
+    const [got] = await checkoutRepos(path.join(dir, "ship"), ORDER, [{ name: "app", base_ref: "main", bundle_path: shipped }]);
+    expect(got!.wip).toMatchObject({ from: "bundle", restored: true, files: ["a.txt", "new.txt"] });
+    expect(fs.readFileSync(path.join(got!.dir, "a.txt"), "utf8")).toBe("unstaged\n");
+    expect(fs.readFileSync(path.join(got!.dir, "new.txt"), "utf8")).toBe("untracked\n");
+    expect(git(got!.dir, "diff", "--cached", "--name-only")).toBe(""); // nothing staged
+    expect(git(got!.dir, "status", "--porcelain")).toBe("M a.txt\n?? new.txt");
+    expect(git(got!.dir, "rev-parse", WIP)).toBe(git(c.dir, "rev-parse", WIP));
+    const note = wipNote(ORDER, [got!]);
+    expect(note).toHaveLength(1);
+    expect(note[0]).toMatch(/^Uncommitted work was restored in .* from the shipped checkpoint\), unstaged; files: a\.txt, new\.txt\./);
+  });
+
+  it("keeps a WIP on another commit as the ref only, and a WIP over a dirty work tree too", async () => {
+    const dir = tempDir();
+    const c = await dirty(dir);
+    await snapshotWip(c, ORDER);
+    const wip = git(c.dir, "rev-parse", WIP);
+    git(c.dir, "commit", "-q", "-m", "moved on"); // the tip moves past the WIP's parent
+    const shipped = path.join(dir, "ship", "in", "app.bundle");
+    fs.mkdirSync(path.dirname(shipped), { recursive: true });
+    git(c.dir, "bundle", "create", "--quiet", shipped, `refs/heads/bmus/${ORDER}`, WIP);
+    const [got] = await checkoutRepos(path.join(dir, "ship"), ORDER, [{ name: "app", base_ref: "main", bundle_path: shipped }]);
+    expect(got!.wip).toMatchObject({ commit: wip, restored: false });
+    expect(got!.wip!.kept).toMatch(/^it was snapshotted on [0-9a-f]{12}, not on bmus\/ORD-0007's tip [0-9a-f]{12}$/);
+    expect(git(got!.dir, "status", "--porcelain")).toBe("");
+    expect(git(got!.dir, "rev-parse", WIP)).toBe(wip);
+    expect(wipNote(ORDER, [got!])[0]).toContain("holds uncommitted work that was not restored: it was snapshotted on");
+
+    // A kept checkout (a re-delivery) whose work tree has changes of its own keeps them.
+    git(c.dir, "reset", "-q", "--soft", "HEAD~1");
+    await snapshotWip(c, ORDER);
+    const [kept] = await checkoutRepos(path.join(dir, "work"), ORDER, [{ name: "app", base_ref: "main", bundle_path: path.join(dir, "none.bundle") }]);
+    expect(kept!.wip).toMatchObject({ from: "checkout", restored: false, kept: "the work tree already had uncommitted changes" });
+  });
+
+  it("prefers the existing checkout's WIP, set aside by a stop, over the bundle's", async () => {
+    const dir = tempDir();
+    const c = await dirty(dir);
+    await snapshotWip(c, ORDER);
+    const shipped = path.join(dir, "work", ORDER, "in", "app.bundle");
+    fs.mkdirSync(path.dirname(shipped), { recursive: true });
+    git(c.dir, "bundle", "create", "--quiet", shipped, `refs/heads/bmus/${ORDER}`, WIP);
+    // Later work on this beam, snapshotted after the bundle the bridge has.
+    fs.writeFileSync(path.join(c.dir, "later.txt"), "later\n");
+    await snapshotWip(c, ORDER);
+    const local = git(c.dir, "rev-parse", WIP);
+    fs.renameSync(c.dir, previousCheckout(c.dir)); // as serve's clearStopped does
+    const [got] = await checkoutRepos(path.join(dir, "work"), ORDER, [{ name: "app", base_ref: "main", bundle_path: shipped }]);
+    expect(got!.wip).toMatchObject({ commit: local, from: "checkout", restored: true });
+    expect(fs.readFileSync(path.join(got!.dir, "later.txt"), "utf8")).toBe("later\n");
+    expect(fs.existsSync(previousCheckout(c.dir))).toBe(false);
+    expect(wipNote(ORDER, [got!])[0]).toContain("from the order's existing checkout on this beam");
   });
 });

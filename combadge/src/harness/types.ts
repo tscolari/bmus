@@ -100,6 +100,14 @@ export interface HarnessOptions {
   claudePath?: string;
   /** sdk: how long a hail holds the query before the run parks (`--hail-park-after`, #154); 15 minutes when unset. */
   hailParkAfterMs?: number;
+  /**
+   * sdk: the checkpoint cadence (#145): once this long has passed since the
+   * latest checkpoint, the harness writes one if the work changed
+   * (`--checkpoint-every`); 15 minutes when unset, 0 turns it off.
+   */
+  checkpointEveryMs?: number;
+  /** sdk: the same, once this many main-loop turns have passed (`--checkpoint-turns`); 10 when unset, 0 turns it off. */
+  checkpointTurns?: number;
   /** sdk: the model of the startup check (`--check-model`, #172); the SDK's default when unset. */
   checkModel?: string;
   /**
