@@ -189,3 +189,77 @@ func TestFakeMark(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, items, 3)
 }
+
+// The fake keeps a created item's labels, removes one with Unlabel in any
+// case (an absent one is no error), reports each closed item's reason,
+// and lists newest first, stopping at a Query's Limit.
+func TestFakeLabelsCloseAndLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := &trackertest.Fake{}
+	a := f.Add(tracker.Item{Title: "a", Labels: []string{"bmus:unreviewed", "area:store"}})
+	b := f.Add(tracker.Item{Title: "b", Labels: []string{"bmus:unreviewed"}})
+	c := f.Add(tracker.Item{Title: "c", Labels: []string{"bmus:unreviewed"}})
+	d := f.Add(tracker.Item{Title: "d"})
+
+	it, err := f.Get(ctx, a)
+	require.NoError(t, err)
+	require.Equal(t, []string{"bmus:unreviewed", "area:store"}, it.Labels)
+	require.NoError(t, f.Unlabel(ctx, a, "BMUS:Unreviewed"))
+	require.NoError(t, f.Unlabel(ctx, a, "bmus:unreviewed"), "absent")
+	it, err = f.Get(ctx, a)
+	require.NoError(t, err)
+	require.Equal(t, []string{"area:store"}, it.Labels)
+	require.ErrorIs(t, f.Unlabel(ctx, "#9", "x"), tracker.ErrNotFound)
+	require.ErrorIs(t, f.Unlabel(ctx, "9", "x"), tracker.ErrBadRef)
+	require.ErrorContains(t, f.Unlabel(ctx, a, ""), "no label")
+
+	require.NoError(t, f.Close(ctx, b, tracker.ReasonNotPlanned))
+	require.NoError(t, f.Close(ctx, c, ""))
+	require.Equal(t, tracker.ReasonNotPlanned, f.CloseReason(b))
+	require.Equal(t, tracker.ReasonCompleted, f.CloseReason(c))
+	require.Equal(t, "", f.CloseReason(a), "open")
+
+	items, err := f.List(ctx, tracker.Query{State: tracker.StateAll, Limit: 2})
+	require.NoError(t, err)
+	require.Equal(t, []string{d, c}, refs(items), "newest first")
+	items, err = f.List(ctx, tracker.Query{Limit: 1, Labels: []string{"bmus:unreviewed"}, State: tracker.StateAll})
+	require.NoError(t, err)
+	require.Equal(t, []string{c}, refs(items), "the limit counts what fits")
+	items, err = f.List(ctx, tracker.Query{})
+	require.NoError(t, err)
+	require.Equal(t, []string{d, a}, refs(items), "no limit")
+	_, err = f.List(ctx, tracker.Query{Limit: -1})
+	require.ErrorContains(t, err, "limit -1")
+}
+
+func TestMissingLabels(t *testing.T) {
+	t.Parallel()
+	require.Nil(t, tracker.MissingLabels(nil, []string{"a"}))
+	require.Nil(t, tracker.MissingLabels([]string{"Area:Store"}, []string{"area:store"}))
+	require.Equal(t, []string{"b", "c"}, tracker.MissingLabels([]string{"a", "b", "c"}, []string{"A"}))
+}
+
+// With DropLabels, Create stores the item without its labels and returns
+// it with ErrLabels; a retry under the same Mark returns the same item
+// and error, and files nothing more.
+func TestFakeDropLabels(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := &trackertest.Fake{DropLabels: true}
+	m := tracker.Mark{Key: "finding ORD-0001/k", Since: time.Now()}
+	in := tracker.Item{Title: "t", Labels: []string{"bmus:unreviewed"}}
+	for range 2 {
+		it, err := f.Create(ctx, in, m)
+		require.ErrorIs(t, err, tracker.ErrLabels)
+		require.ErrorContains(t, err, "#1 created without the labels bmus:unreviewed")
+		require.Equal(t, "#1", it.Ref)
+		require.Empty(t, it.Labels)
+	}
+	items, err := f.List(ctx, tracker.Query{})
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	_, err = f.Create(ctx, tracker.Item{Title: "no labels asked"}, tracker.Mark{})
+	require.NoError(t, err)
+	require.Equal(t, "#3", f.Add(in), "Add ignores the labels error")
+}

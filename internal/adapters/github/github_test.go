@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -83,9 +84,21 @@ type fakeAPI struct {
 	appToken bool
 	// lag is how many more comment listings leave out the newest
 	// comment, as GitHub may list a write a moment after taking it.
-	lag   int
-	calls []string
-	srv   *httptest.Server
+	lag int
+	// dropLabels makes POST /issues ignore labels, as GitHub does for a
+	// token without push access.
+	dropLabels bool
+	// repoLabels are the repository's labels: POST /issues takes a
+	// requested label differing only in case as the repository spells it.
+	repoLabels []string
+	// label404 makes the next DELETE of a label answer 404: "gone"
+	// removes the label first (someone else did), "stays" leaves it.
+	label404 string
+	// fileOnPage2 files a new issue just before GET /issues serves its
+	// second page, shifting it by one.
+	fileOnPage2 bool
+	calls       []string
+	srv         *httptest.Server
 }
 
 func newFakeAPI(t *testing.T) *fakeAPI {
@@ -220,6 +233,11 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 		f.page(w, r, ms)
 	case r.Method == http.MethodGet && path == "/issues":
 		q := r.URL.Query()
+		if f.fileOnPage2 && q.Get("page") == "2" {
+			f.fileOnPage2 = false
+			n := len(f.issues) + 1
+			f.issues = append(f.issues, &fakeIssue{Number: n, ID: int64(1000 + n), Title: "filed meanwhile", State: "open", Updated: time.Now()})
+		}
 		since := f.since(r)
 		var out []map[string]any
 		for _, i := range f.issues {
@@ -237,11 +255,24 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 			}
 			out = append(out, f.json(i))
 		}
+		switch d := q.Get("direction"); {
+		case d == "desc" && q.Get("sort") == "created":
+			slices.Reverse(out)
+		case d != "":
+			f.fail(w, http.StatusUnprocessableEntity, "unexpected sort")
+			return
+		}
 		f.page(w, r, out)
 	case r.Method == http.MethodPost && path == "/issues":
 		i := &fakeIssue{Title: in["title"].(string), Body: in["body"].(string), State: "open", Updated: time.Now()}
 		for _, l := range asList(in["labels"]) {
-			i.Labels = append(i.Labels, l.(string))
+			name := l.(string)
+			if k := slices.IndexFunc(f.repoLabels, func(r string) bool { return strings.EqualFold(r, name) }); k >= 0 {
+				name = f.repoLabels[k]
+			}
+			if !f.dropLabels {
+				i.Labels = append(i.Labels, name)
+			}
 		}
 		if m, ok := in["milestone"].(float64); ok {
 			i.Milestone = int(m)
@@ -264,6 +295,25 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 		case rest == "" && r.Method == http.MethodPatch:
 			i.State, i.Reason = in["state"].(string), in["state_reason"].(string)
 			f.write(w, http.StatusOK, f.json(i))
+		case strings.HasPrefix(rest, "labels/") && r.Method == http.MethodDelete:
+			// The name is one path segment, escaped: read it from the raw
+			// path, where a "/" in it is still %2F.
+			_, esc, _ := strings.Cut(r.URL.EscapedPath(), "/labels/")
+			require.NotContains(f.t, esc, "/", "the label name is one path segment")
+			name, err := url.PathUnescape(esc)
+			require.NoError(f.t, err)
+			k := slices.IndexFunc(i.Labels, func(l string) bool { return strings.EqualFold(l, name) })
+			mode := f.label404
+			f.label404 = ""
+			if mode == "gone" && k >= 0 {
+				i.Labels = slices.Delete(i.Labels, k, k+1)
+			}
+			if k < 0 || mode != "" {
+				f.fail(w, http.StatusNotFound, "Label does not exist")
+				return
+			}
+			i.Labels = slices.Delete(i.Labels, k, k+1)
+			f.write(w, http.StatusOK, f.json(i)["labels"])
 		case rest == "comments" && r.Method == http.MethodPost:
 			i.Comments = append(i.Comments, fakeComment{Body: in["body"].(string), At: time.Now()})
 			f.write(w, http.StatusCreated, map[string]any{"id": len(i.Comments)})
@@ -374,12 +424,12 @@ func TestListWithBlockers(t *testing.T) {
 
 	items, err := g.List(ctx, tracker.Query{Labels: []string{"phase:1"}})
 	require.NoError(t, err)
-	require.Equal(t, []string{"o/r#2", "o/r#4", "o/r#6"}, refsOf(items))
+	require.Equal(t, []string{"o/r#6", "o/r#4", "o/r#2"}, refsOf(items), "newest first")
 	require.Equal(t, tracker.Item{Ref: "o/r#2", Title: "a", Body: "do a", Labels: []string{"phase:1", "area:store"},
-		Milestone: "Phase 1", State: "open", BlockedBy: []string{}}, items[0])
+		Milestone: "Phase 1", State: "open", BlockedBy: []string{}}, items[2])
 	require.Equal(t, []string{"o/r#2"}, items[1].BlockedBy, "the closed blocker no longer blocks")
-	require.Equal(t, []string{"o/r#4"}, items[2].BlockedBy, "no summary: read from the dependencies API")
-	require.Equal(t, "", items[2].Milestone)
+	require.Equal(t, []string{"o/r#4"}, items[0].BlockedBy, "no summary: read from the dependencies API")
+	require.Equal(t, "", items[0].Milestone)
 
 	// Labels and milestone filter on GitHub's side.
 	items, err = g.List(ctx, tracker.Query{Labels: []string{"phase:1", "area:bridge"}, Milestone: "Phase 1"})
@@ -479,6 +529,180 @@ func TestCreate(t *testing.T) {
 	require.ErrorIs(t, err, tracker.ErrNotFound)
 	require.ErrorContains(t, err, "o/r#5 created, but not blocked by o/r#2")
 	require.Equal(t, "o/r#5", it.Ref)
+}
+
+// GitHub drops labels silently for a token without push access. Create
+// reports the ones missing, wrapping tracker.ErrLabels, with the issue's
+// ref: it exists, linked as asked. A retry under the same key finds it,
+// creates no twin, and reports the same lack.
+func TestCreateMissingLabels(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFakeAPI(t)
+	blocker := f.add(fakeIssue{Title: "blocker"})
+	g := f.adapter(t, testToken)
+	f.mu.Lock()
+	f.dropLabels = true
+	f.mu.Unlock()
+
+	m := tracker.Mark{Key: "finding ORD-0001/flaky", Since: time.Now()}
+	in := tracker.Item{Title: "Flaky test", Labels: []string{"bmus:unreviewed", "area:store"}, BlockedBy: []string{"#1"}}
+	for range 2 {
+		it, err := g.Create(ctx, in, m)
+		require.ErrorIs(t, err, tracker.ErrLabels)
+		require.ErrorContains(t, err, "o/r#2 created without the labels bmus:unreviewed, area:store")
+		require.Equal(t, "o/r#2", it.Ref)
+		require.Equal(t, []string{}, it.Labels)
+		require.Equal(t, []string{"o/r#1"}, it.BlockedBy)
+	}
+	require.Equal(t, 1, f.count("POST /repos/o/r/issues"), "the retry found the issue")
+	require.Equal(t, 1, f.count("POST /repos/o/r/issues/2/dependencies/blocked_by"))
+	f.mu.Lock()
+	require.Len(t, f.issues, 2)
+	require.Equal(t, []int{blocker}, f.issue(2).BlockedBy)
+	f.dropLabels = false
+	f.mu.Unlock()
+
+	// A label the repository spells in another case is kept as GitHub
+	// spells it: no error.
+	f.mu.Lock()
+	f.repoLabels = []string{"Area:Store"}
+	f.mu.Unlock()
+	it, err := g.Create(ctx, tracker.Item{Title: "kept", Labels: []string{"area:store"}}, tracker.Mark{})
+	require.NoError(t, err)
+	require.Equal(t, []string{"Area:Store"}, it.Labels)
+}
+
+// Unlabel reads the issue first: a pull request or a missing issue is
+// refused, and a label the issue lacks (in any case) is done with no
+// DELETE. The DELETE names the label as the issue spells it, escaped as
+// one path segment. A 404 from it reads the issue again: the label gone
+// is done, the label still there is the error.
+func TestUnlabel(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFakeAPI(t)
+	odd := []string{"a/b c", "100%", "x#y", "why?", "\u00e9tiquette \u2713"}
+	n := f.add(fakeIssue{Title: "x", Labels: append([]string{"bmus:unreviewed", "area:store"}, odd...)})
+	pr := f.add(fakeIssue{Title: "a pull request", PR: true, Labels: []string{"bmus:unreviewed"}})
+	race := f.add(fakeIssue{Title: "y", Labels: []string{"bmus:unreviewed"}})
+	g := f.adapter(t, testToken)
+
+	require.NoError(t, g.Unlabel(ctx, "o/r#1", "BMUS:Unreviewed"))
+	require.Equal(t, 1, f.count("DELETE /repos/o/r/issues/1/labels/bmus:unreviewed"), "the issue's spelling")
+	for _, l := range odd {
+		require.NoError(t, g.Unlabel(ctx, "#1", l), l)
+		require.Equal(t, 1, f.count("DELETE /repos/o/r/issues/1/labels/"+l), "one escaped segment: %s", l)
+	}
+	f.mu.Lock()
+	require.Equal(t, []string{"area:store"}, f.issue(n).Labels)
+	f.mu.Unlock()
+
+	// Absent: done, with no DELETE.
+	require.NoError(t, g.Unlabel(ctx, "1", "bmus:unreviewed"))
+	require.Equal(t, 1, f.count("DELETE /repos/o/r/issues/1/labels/bmus:unreviewed"))
+
+	// A 404 from the DELETE: the issue is read again. Someone else
+	// removed the label: done. The label still there: the error.
+	f.mu.Lock()
+	f.label404 = "stays"
+	f.mu.Unlock()
+	err := g.Unlabel(ctx, "#3", "bmus:unreviewed")
+	require.ErrorIs(t, err, tracker.ErrNotFound)
+	require.ErrorContains(t, err, "DELETE /repos/o/r/issues/3/labels/bmus:unreviewed: 404")
+	require.Equal(t, 2, f.count("GET /repos/o/r/issues/3"))
+	f.mu.Lock()
+	require.Equal(t, []string{"bmus:unreviewed"}, f.issue(race).Labels)
+	f.label404 = "gone"
+	f.mu.Unlock()
+	require.NoError(t, g.Unlabel(ctx, "#3", "bmus:unreviewed"))
+	require.Equal(t, 4, f.count("GET /repos/o/r/issues/3"))
+	f.mu.Lock()
+	require.Empty(t, f.issue(race).Labels)
+	f.mu.Unlock()
+
+	// A pull request, a missing issue, a bad ref, no label, and "." or
+	// "..", which a path segment can't name: refused, nothing deleted.
+	err = g.Unlabel(ctx, "#"+strconv.Itoa(pr), "bmus:unreviewed")
+	require.ErrorIs(t, err, tracker.ErrNotFound)
+	require.ErrorContains(t, err, "is a pull request")
+	f.mu.Lock()
+	require.Equal(t, []string{"bmus:unreviewed"}, f.issue(pr).Labels)
+	f.mu.Unlock()
+	require.ErrorIs(t, g.Unlabel(ctx, "#9", "bmus:unreviewed"), tracker.ErrNotFound)
+	require.ErrorIs(t, g.Unlabel(ctx, "other/x#1", "bmus:unreviewed"), tracker.ErrBadRef)
+	require.ErrorContains(t, g.Unlabel(ctx, "#1", " "), "no label")
+	require.ErrorContains(t, g.Unlabel(ctx, "#1", "."), "can't be named")
+	require.ErrorContains(t, g.Unlabel(ctx, "#1", ".."), "can't be named")
+	require.Zero(t, f.count("DELETE /repos/o/r/issues/2/labels/bmus:unreviewed"))
+	require.Zero(t, f.count("DELETE /repos/o/r/issues/9/labels/bmus:unreviewed"))
+}
+
+// List reads newest first and stops paging once Limit issues fit,
+// reading blockers for those alone. Pull requests and issues the query
+// filters out don't count.
+func TestListLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newFakeAPI(t)
+	for k := range 8 {
+		f.add(fakeIssue{Title: "i" + strconv.Itoa(k), PR: k == 6, NoSummary: true})
+	}
+	g := f.adapter(t, testToken)
+
+	// Pages of two, newest first: #8 and the pull request #7, then #6 and
+	// #5, where three issues fit.
+	items, err := g.List(ctx, tracker.Query{Limit: 3})
+	require.NoError(t, err)
+	require.Equal(t, []string{"o/r#8", "o/r#6", "o/r#5"}, refsOf(items))
+	require.Equal(t, 2, f.count("GET /repos/o/r/issues"), "two pages read of four")
+	for k := 1; k <= 8; k++ {
+		call := fmt.Sprintf("GET /repos/o/r/issues/%d/dependencies/blocked_by", k)
+		want := 0
+		if k == 8 || k == 6 || k == 5 {
+			want = 1
+		}
+		require.Equal(t, want, f.count(call), call)
+	}
+
+	// No limit reads everything; a limit past the end is everything too.
+	items, err = g.List(ctx, tracker.Query{})
+	require.NoError(t, err)
+	require.Len(t, items, 7)
+	items, err = g.List(ctx, tracker.Query{Limit: 50})
+	require.NoError(t, err)
+	require.Len(t, items, 7)
+
+	// A parent's sub-issues, filtered here and in the parent's order,
+	// stop at the limit too.
+	f.mu.Lock()
+	for _, i := range f.issues[2:] {
+		i.Parent = 1
+	}
+	f.issues[2].State = "closed"
+	f.mu.Unlock()
+	items, err = g.List(ctx, tracker.Query{Parent: "#1", Limit: 2})
+	require.NoError(t, err)
+	require.Equal(t, []string{"o/r#4", "o/r#5"}, refsOf(items))
+	require.Equal(t, 2, f.count("GET /repos/o/r/issues/1/sub_issues"), "two pages read of three")
+
+	_, err = g.List(ctx, tracker.Query{Limit: -1})
+	require.ErrorContains(t, err, "limit -1")
+}
+
+// An issue filed while List pages shifts the next page by one, which
+// repeats the last issue read: it is listed, and counted, once.
+func TestListShiftedPage(t *testing.T) {
+	t.Parallel()
+	f := newFakeAPI(t)
+	for k := range 4 {
+		f.add(fakeIssue{Title: "i" + strconv.Itoa(k)})
+	}
+	f.fileOnPage2 = true
+	g := f.adapter(t, testToken)
+	items, err := g.List(context.Background(), tracker.Query{})
+	require.NoError(t, err)
+	require.Equal(t, []string{"o/r#4", "o/r#3", "o/r#2", "o/r#1"}, refsOf(items))
 }
 
 // A parent's sub-issue, or a blocker, in another repository keeps its own

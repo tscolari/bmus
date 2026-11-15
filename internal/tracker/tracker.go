@@ -66,12 +66,16 @@ type Item struct {
 
 // Query filters List. Every set field must fit: all of Labels, the
 // Milestone (by title), the Parent ref and the State (StateOpen,
-// StateClosed, or "" for open; "all" for both).
+// StateClosed, or "" for open; "all" for both). List returns items newest
+// first, or a Parent's in the parent's order. Limit is the most items List
+// returns, the first ones in that order (the newest, without a Parent); 0
+// is no limit.
 type Query struct {
 	Labels    []string
 	Milestone string
 	Parent    string
 	State     string
+	Limit     int
 }
 
 // StateAll asks List for open and closed items.
@@ -89,12 +93,15 @@ type Tracker interface {
 	Canon(ref string) (string, error)
 	// Get reads one item.
 	Get(ctx context.Context, ref string) (Item, error)
-	// List reads the items q fits.
+	// List reads the items q fits, at most q.Limit of them when that is
+	// set.
 	List(ctx context.Context, q Query) ([]Item, error)
 	// Create files a new item with its Title, Body, Labels, Milestone,
 	// Parent and BlockedBy, and returns it with its Ref. Ref and State
 	// are ignored. With a Mark, an item already filed under its key is
-	// returned instead of a second one.
+	// returned instead of a second one. When the item exists but a later
+	// step failed (a link, or a label the tracker dropped, ErrLabels),
+	// the item comes back with its Ref beside the error.
 	Create(ctx context.Context, it Item, m Mark) (Item, error)
 	// Comment adds a comment to item ref. With a Mark, a comment already
 	// posted under its key counts as this one, and nothing is posted.
@@ -102,6 +109,9 @@ type Tracker interface {
 	// Close closes item ref, with reason ReasonCompleted ("" too) or
 	// ReasonNotPlanned. Closing a closed item is no error.
 	Close(ctx context.Context, ref, reason string) error
+	// Unlabel removes label from item ref. Removing a label the item
+	// lacks is no error; a missing item is ErrNotFound.
+	Unlabel(ctx context.Context, ref, label string) error
 }
 
 // Mark makes a write idempotent (#206): a write retried under the same
@@ -155,7 +165,31 @@ var (
 	ErrBadRef = errors.New("tracker: bad ref")
 	// ErrRateLimited: the tracker refused the call for its rate limit.
 	ErrRateLimited = errors.New("tracker: rate limited")
+	// ErrLabels: Create filed the item, but it lacks labels it was asked
+	// for (GitHub drops them silently for a token without push access).
+	// A retry under the same Mark finds the same item and the same lack.
+	ErrLabels = errors.New("tracker: labels missing")
 )
+
+// CheckLimit refuses a negative Query.Limit.
+func CheckLimit(limit int) error {
+	if limit < 0 {
+		return fmt.Errorf("limit %d: want 0 (no limit) or more", limit)
+	}
+	return nil
+}
+
+// MissingLabels is the labels of want that have lacks, compared
+// case-insensitively, as GitHub names labels.
+func MissingLabels(want, have []string) []string {
+	var out []string
+	for _, l := range want {
+		if !slices.ContainsFunc(have, func(h string) bool { return strings.EqualFold(h, l) }) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
 
 // CheckReason checks a close reason, "" meaning ReasonCompleted.
 func CheckReason(reason string) bool {
@@ -167,10 +201,8 @@ func CheckReason(reason string) bool {
 // that filter on their side may use it to filter what they couldn't (a
 // parent's sub-items, say); Parent isn't checked.
 func Fits(it Item, q Query) bool {
-	for _, l := range q.Labels {
-		if !slices.ContainsFunc(it.Labels, func(have string) bool { return strings.EqualFold(have, l) }) {
-			return false
-		}
+	if len(MissingLabels(q.Labels, it.Labels)) > 0 {
+		return false
 	}
 	if q.Milestone != "" && it.Milestone != q.Milestone {
 		return false
