@@ -77,7 +77,7 @@ type reviewBatch struct {
 //
 //  1. raise-review reads the rows filing moved on: filed (the issues),
 //     dropped and failed. With none, no hail is raised. Rows still new
-//     are left out.
+//     are left out, and their count logged.
 //  2. raise-hail and the wait (raiseBridgeHail, awaitBridgeHail), with no
 //     deadline: classify records no reminder and no captain timeout for
 //     the hail.
@@ -85,10 +85,10 @@ type reviewBatch struct {
 //     review-discard (closes it not planned), then review-restore for
 //     each finding to restore (filed as filing does, without
 //     bmus:unreviewed, under the same marker). Each retries as filing
-//     does; one out of retries is logged on the order (review-failed) and
-//     the rest go on.
+//     does; one out of retries, or failed for good, is logged on the
+//     order (review-failed) and the rest go on.
 //  4. review-summary logs "review of ORD-0001's findings: kept 3,
-//     discarded 2, restored 1".
+//     discarded 2, restored 1", with ", failed 1" when any failed.
 func reviewFindings(ctx dbos.Context, orderID string, b findingsBegin, res *FindingsResult) error {
 	batch, err := dbos.RunAsStep(ctx, func(c context.Context) (reviewBatch, error) {
 		return daemonFrom(c).reviewBatch(c, orderID)
@@ -127,26 +127,37 @@ func reviewFindings(ctx dbos.Context, orderID string, b findingsBegin, res *Find
 		})
 	}
 	retries := daemonFrom(ctx).trackerRetries
-	act := func(step, key string, fn func(c context.Context, d *Daemon) (string, error)) (string, error) {
-		state, err := dbos.RunAsStep(ctx, func(c context.Context) (string, error) {
+	act := func(step, key string, fn func(c context.Context, d *Daemon) (reviewOutcome, error)) (string, error) {
+		out, err := dbos.RunAsStep(ctx, func(c context.Context) (reviewOutcome, error) {
 			return fn(c, daemonFrom(c))
 		}, append([]dbos.StepOption{dbos.WithStepName(step)}, retries...)...)
-		if err == nil || ctx.Err() != nil {
-			return state, err
+		if err != nil && ctx.Err() != nil {
+			return "", err
 		}
-		why := clip(stepError(err), maxFindingWhy)
-		verb := map[string]string{"review-keep": "kept", "review-discard": "discarded", "review-restore": "restored"}[step]
-		return "", storeStep(ctx, "review-failed", func(c context.Context, d *Daemon) error {
-			return d.logOnce(c, orderID, "review-failed "+key, "finding "+key+" not "+verb+": "+why,
-				map[string]any{"hail_id": id, "key": key})
-		})
+		if err == nil && out.Failed == "" {
+			return out.State, nil
+		}
+		why := out.Failed
+		if err != nil {
+			why = clip(stepError(err), maxFindingWhy)
+		}
+		out, err = dbos.RunAsStep(ctx, func(c context.Context) (reviewOutcome, error) {
+			return daemonFrom(c).reviewFailed(c, orderID, id, key, step, why)
+		}, append([]dbos.StepOption{dbos.WithStepName("review-failed")}, storeRetries...)...)
+		if err != nil {
+			return "", err
+		}
+		if out.State == "" {
+			res.ReviewFailed++
+		}
+		return out.State, nil
 	}
 	for _, is := range rc.Issues {
 		step, fn := "review-keep", (*Daemon).reviewKeep
 		if slices.Contains(dec.Discard, is.Ref) {
 			step, fn = "review-discard", (*Daemon).reviewDiscard
 		}
-		state, err := act(step, is.Key, func(c context.Context, d *Daemon) (string, error) { return fn(d, c, orderID, is.Key) })
+		state, err := act(step, is.Key, func(c context.Context, d *Daemon) (reviewOutcome, error) { return fn(d, c, orderID, is.Key) })
 		if err != nil {
 			return err
 		}
@@ -158,7 +169,7 @@ func reviewFindings(ctx dbos.Context, orderID string, b findingsBegin, res *Find
 		}
 	}
 	for _, key := range dec.Restore {
-		state, err := act("review-restore", key, func(c context.Context, d *Daemon) (string, error) {
+		state, err := act("review-restore", key, func(c context.Context, d *Daemon) (reviewOutcome, error) {
 			return d.reviewRestore(c, orderID, key, b)
 		})
 		if err != nil {
@@ -169,10 +180,53 @@ func reviewFindings(ctx dbos.Context, orderID string, b findingsBegin, res *Find
 		}
 	}
 	return storeStep(ctx, "review-summary", func(c context.Context, d *Daemon) error {
-		return d.logOnce(c, orderID, "review", fmt.Sprintf("review of %s's findings: kept %d, discarded %d, restored %d",
-			orderID, res.Kept, res.Discarded, res.Restored),
-			map[string]any{"hail_id": id, "kept": res.Kept, "discarded": res.Discarded, "restored": res.Restored})
+		text := fmt.Sprintf("review of %s's findings: kept %d, discarded %d, restored %d", orderID, res.Kept, res.Discarded, res.Restored)
+		if res.ReviewFailed > 0 {
+			text += fmt.Sprintf(", failed %d", res.ReviewFailed)
+		}
+		return d.logOnce(c, orderID, "review", text, map[string]any{"hail_id": id, "kept": res.Kept,
+			"discarded": res.Discarded, "restored": res.Restored, "failed": res.ReviewFailed})
 	})
+}
+
+// reviewOutcome is a review step's recorded result: the finding's state
+// after it, or why the action failed for good (Failed), which skips the
+// step's retries.
+type reviewOutcome struct {
+	State  string
+	Failed string `json:",omitempty"`
+}
+
+// reviewVerbs are each review step's past tense, for its failure entry.
+var reviewVerbs = map[string]string{"review-keep": "kept", "review-discard": "discarded", "review-restore": "restored"}
+
+// reviewFailed is the review-failed step, for review step step on finding
+// key, which failed for good with why. A restore whose issue exists (its
+// ref stored, short of a link) is restored, with why noted, as filing's
+// finding-failed files one. Any other logs "finding <key> not <verb>:
+// <why>" once and leaves the row as it was; its State is empty.
+func (d *Daemon) reviewFailed(ctx context.Context, orderID, hailID, key, step, why string) (reviewOutcome, error) {
+	if step == "review-restore" {
+		f, err := d.store.GetFinding(ctx, orderID, key)
+		if err != nil {
+			return reviewOutcome{}, err
+		}
+		if f.Ref != "" && (f.State == store.FindingDropped || f.State == store.FindingFailed) {
+			entry, err := logEntry(logOrder, "", orderID, "finding "+key+" restored as "+f.Ref+" ("+why+")",
+				map[string]any{"key": key, "ref": f.Ref})
+			if err != nil {
+				return reviewOutcome{}, err
+			}
+			if _, err := d.store.ReviewFinding(ctx, orderID, key, f.State, store.FindingRestored, "", &why, entry); err != nil {
+				return reviewOutcome{}, err
+			}
+		}
+		if f, err = d.store.GetFinding(ctx, orderID, key); err != nil || f.State == store.FindingRestored {
+			return reviewOutcome{State: f.State}, err
+		}
+	}
+	return reviewOutcome{}, d.logOnce(ctx, orderID, "review-failed "+key, "finding "+key+" not "+reviewVerbs[step]+": "+why,
+		map[string]any{"hail_id": hailID, "key": key})
 }
 
 // reviewBatch is the raise-review step: order orderID's findings filing
@@ -184,14 +238,23 @@ func (d *Daemon) reviewBatch(ctx context.Context, orderID string) (reviewBatch, 
 		return reviewBatch{}, err
 	}
 	rc := ReviewContext{Order: orderID, Issues: []ReviewIssue{}, Dropped: []ReviewDropped{}, Failed: []ReviewFailed{}}
+	left := 0
 	for _, f := range fs {
 		switch f.State {
+		case store.FindingNew:
+			left++
 		case store.FindingFiled:
 			rc.Issues = append(rc.Issues, ReviewIssue{Ref: f.Ref, Key: f.Key, Title: f.Title})
 		case store.FindingDropped:
 			rc.Dropped = append(rc.Dropped, ReviewDropped{Key: f.Key, Title: f.Title, Why: f.Why, DuplicateOf: f.DuplicateOf})
 		case store.FindingFailed:
 			rc.Failed = append(rc.Failed, ReviewFailed{Key: f.Key, Title: f.Title, Error: f.Why})
+		}
+	}
+	if left > 0 {
+		if err := d.logOnce(ctx, orderID, "review-new", fmt.Sprintf("findings of %s left out of the review: %d still new",
+			orderID, left), map[string]any{"new": left}); err != nil {
+			return reviewBatch{}, err
 		}
 	}
 	return reviewBatch{Context: rc, Raise: len(rc.Issues)+len(rc.Dropped)+len(rc.Failed) > 0}, nil
@@ -256,7 +319,8 @@ func (d reviewDecision) option() int {
 //
 // each optionally followed by "; restore <key> [<key>...]", or
 // "restore <key> [<key>...]" alone, which keeps every issue. Words are
-// separated by spaces or commas, and the verbs read in any case. A ref
+// separated by spaces or commas, and the verbs read in any case. Only the
+// bare word discard discards every issue: "discard ," is refused. A ref
 // is one of rc's issues, as spelled there or, with canon set, once canon
 // makes both canonical; a key is one of rc's dropped or failed findings.
 // Each is taken once.
@@ -284,6 +348,9 @@ func parseReview(answer string, rc ReviewContext, canon func(string) (string, er
 		if len(head) > 1 {
 			return d, fmt.Errorf("keep takes no refs (got %s)", strings.Join(head[1:], " "))
 		}
+	case verb == reviewDiscard && len(head) == 1 && !strings.EqualFold(strings.TrimSpace(parts[0]), reviewDiscard):
+		// "discard ," names no ref: only the bare word discards every issue.
+		return d, errors.New("discard names no ref (discard alone discards every issue)")
 	case verb == reviewDiscard && len(head) == 1:
 		for _, is := range rc.Issues {
 			d.Discard = append(d.Discard, is.Ref)
@@ -400,48 +467,78 @@ func listOrNone(l []string) string {
 }
 
 // reviewKeep is the review-keep step: finding key's issue loses
-// bmus:unreviewed, and the row moves from filed to kept. A row already
+// bmus:unreviewed, and the row moves from filed to kept. An issue that no
+// longer exists fails for good (Failed), with no retries. A row already
 // moved on is returned as it is.
-func (d *Daemon) reviewKeep(ctx context.Context, orderID, key string) (string, error) {
-	return d.reviewIssue(ctx, orderID, key, store.FindingKept, func(c context.Context, ref string) error {
-		return d.tracker.Unlabel(c, ref, labelUnreviewed)
+func (d *Daemon) reviewKeep(ctx context.Context, orderID, key string) (reviewOutcome, error) {
+	return d.reviewIssue(ctx, orderID, key, store.FindingKept, func(c context.Context, ref string) (string, error) {
+		err := d.tracker.Unlabel(c, ref, labelUnreviewed)
+		if errors.Is(err, tracker.ErrNotFound) {
+			return "", permanent{err}
+		}
+		return "", err
 	})
 }
 
 // reviewDiscard is the review-discard step: finding key's issue is closed
-// as not planned, and the row moves from filed to discarded. A row
-// already moved on is returned as it is.
-func (d *Daemon) reviewDiscard(ctx context.Context, orderID, key string) (string, error) {
-	return d.reviewIssue(ctx, orderID, key, store.FindingDiscarded, func(c context.Context, ref string) error {
-		return d.tracker.Close(c, ref, tracker.ReasonNotPlanned)
+// as not planned, and the row moves from filed to discarded. An issue
+// that no longer exists counts as discarded, noted on the row and in the
+// log. A row already moved on is returned as it is.
+func (d *Daemon) reviewDiscard(ctx context.Context, orderID, key string) (reviewOutcome, error) {
+	return d.reviewIssue(ctx, orderID, key, store.FindingDiscarded, func(c context.Context, ref string) (string, error) {
+		err := d.tracker.Close(c, ref, tracker.ReasonNotPlanned)
+		if errors.Is(err, tracker.ErrNotFound) {
+			return clip(err.Error(), maxFindingWhy), nil
+		}
+		return "", err
 	})
 }
 
+// permanent is an error a review step gives up on at once (Failed).
+type permanent struct{ error }
+
 // reviewIssue runs fn on finding key's issue, bounded by
-// trackerCallTimeout, and moves the row from filed to state. fn must be
-// safe to repeat: a re-run after a crash calls it again.
-func (d *Daemon) reviewIssue(ctx context.Context, orderID, key, state string, fn func(context.Context, string) error) (string, error) {
+// trackerCallTimeout, and moves the row from filed to state, with fn's
+// note, if any, as its why and logged as "finding <key> <state>: <note>".
+// fn must be safe to repeat: a re-run after a crash calls it again. A
+// permanent error is returned as Failed.
+func (d *Daemon) reviewIssue(ctx context.Context, orderID, key, state string, fn func(context.Context, string) (string, error)) (reviewOutcome, error) {
 	f, err := d.store.GetFinding(ctx, orderID, key)
 	if err != nil {
-		return "", fmt.Errorf("finding %s/%s: %w", orderID, key, err)
+		return reviewOutcome{}, fmt.Errorf("finding %s/%s: %w", orderID, key, err)
 	}
 	if f.State != store.FindingFiled {
-		return f.State, nil
+		return reviewOutcome{State: f.State}, nil
 	}
 	if d.tracker == nil {
-		return "", errors.New("no tracker configured")
+		return reviewOutcome{}, errors.New("no tracker configured")
 	}
 	tctx, cancel := context.WithTimeout(ctx, trackerCallTimeout)
-	err = fn(tctx, f.Ref)
+	note, err := fn(tctx, f.Ref)
 	cancel()
-	if err != nil {
-		return "", err
+	if p := (permanent{}); errors.As(err, &p) {
+		return reviewOutcome{Failed: clip(p.Error(), maxFindingWhy)}, nil
 	}
-	if _, err := d.store.ReviewFinding(ctx, orderID, key, store.FindingFiled, state, "", nil); err != nil {
-		return "", err
+	if err != nil {
+		return reviewOutcome{}, err
+	}
+	var (
+		why     *string
+		entries []store.LogEntry
+	)
+	if note != "" {
+		why = &note
+		e, err := logEntry(logOrder, "", orderID, "finding "+key+" "+state+": "+note, map[string]any{"key": key, "ref": f.Ref})
+		if err != nil {
+			return reviewOutcome{}, err
+		}
+		entries = append(entries, e)
+	}
+	if _, err := d.store.ReviewFinding(ctx, orderID, key, store.FindingFiled, state, "", why, entries...); err != nil {
+		return reviewOutcome{}, err
 	}
 	f, err = d.store.GetFinding(ctx, orderID, key)
-	return f.State, err
+	return reviewOutcome{State: f.State}, err
 }
 
 // reviewRestore is the review-restore step: finding key, dropped or
@@ -450,22 +547,24 @@ func (d *Daemon) reviewIssue(ctx context.Context, orderID, key, state string, fn
 // with its ref, logged "finding <key> restored as o/r#12". Its blockers
 // are its refs, made canonical, and the issues of the order's findings it
 // names that are filed, kept or restored, or the issue a duplicate
-// repeats; others are dropped with a note. A row already moved on is
-// returned as it is.
-func (d *Daemon) reviewRestore(ctx context.Context, orderID, key string, b findingsBegin) (string, error) {
+// repeats; others are dropped with a note. A ref returned with a link
+// error is stored on the row (store.SetFindingRefIn) and the step fails,
+// so its retry adds the link. A row already moved on is returned as it
+// is.
+func (d *Daemon) reviewRestore(ctx context.Context, orderID, key string, b findingsBegin) (reviewOutcome, error) {
 	f, err := d.store.GetFinding(ctx, orderID, key)
 	if err != nil {
-		return "", fmt.Errorf("finding %s/%s: %w", orderID, key, err)
+		return reviewOutcome{}, fmt.Errorf("finding %s/%s: %w", orderID, key, err)
 	}
 	if f.State != store.FindingDropped && f.State != store.FindingFailed {
-		return f.State, nil
+		return reviewOutcome{State: f.State}, nil
 	}
 	if d.tracker == nil {
-		return "", errors.New("no tracker configured")
+		return reviewOutcome{}, errors.New("no tracker configured")
 	}
 	all, err := d.store.OrderFindings(ctx, orderID)
 	if err != nil {
-		return "", err
+		return reviewOutcome{}, err
 	}
 	var (
 		blockers []string
@@ -501,7 +600,14 @@ func (d *Daemon) reviewRestore(ctx context.Context, orderID, key string, b findi
 	}
 	got, err := d.createFindingIssue(ctx, orderID, f, blockers, b, false)
 	if err != nil {
-		return "", err
+		if got.Ref != "" {
+			// A link that failed: the retry adds it, and review-failed
+			// restores the finding with its issue if none does.
+			if serr := d.store.SetFindingRefIn(ctx, orderID, key, got.Ref, f.State); serr != nil {
+				return reviewOutcome{}, errors.Join(err, serr)
+			}
+		}
+		return reviewOutcome{}, err
 	}
 	text := "finding " + key + " restored as " + got.Ref
 	if got.Note != "" {
@@ -509,12 +615,12 @@ func (d *Daemon) reviewRestore(ctx context.Context, orderID, key string, b findi
 	}
 	entry, err := logEntry(logOrder, "", orderID, text, map[string]any{"key": key, "ref": got.Ref})
 	if err != nil {
-		return "", err
+		return reviewOutcome{}, err
 	}
 	entries := append(append(notes, got.Notes...), entry)
 	if _, err := d.store.ReviewFinding(ctx, orderID, key, f.State, store.FindingRestored, got.Ref, &got.Note, entries...); err != nil {
-		return "", err
+		return reviewOutcome{}, err
 	}
 	f, err = d.store.GetFinding(ctx, orderID, key)
-	return f.State, err
+	return reviewOutcome{State: f.State}, err
 }

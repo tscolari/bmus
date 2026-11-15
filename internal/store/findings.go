@@ -312,9 +312,16 @@ func (s *Store) TriageFindings(ctx context.Context, id string, triage []FindingT
 // still new, leaving its state alone: the issue exists, and the findings
 // workflow is still adding its links (#155).
 func (s *Store) SetFindingRef(ctx context.Context, id, key, ref string) error {
+	return s.SetFindingRefIn(ctx, id, key, ref, FindingNew)
+}
+
+// SetFindingRefIn stores ref as finding key's issue while the finding is
+// in state, leaving its state alone: a restore (#156) stores the issue of
+// a dropped or failed finding while it still adds its links.
+func (s *Store) SetFindingRefIn(ctx context.Context, id, key, ref, state string) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `UPDATE findings SET ref = ? WHERE order_id = ? AND key = ? AND state = ?`,
-			ref, id, key, FindingNew)
+			ref, id, key, state)
 		return err
 	})
 }

@@ -106,6 +106,12 @@ func TestHailsReviewCLI(t *testing.T) {
 			`the first three optionally followed by "; restore <key>..." (refs: #2, #3; keys: c-dup, d-lost)`)
 	require.Contains(t, fail("hails", "review", "H-0001", "--restore", "a-lock"), `"a-lock" is not a dropped or failed finding's key`)
 	require.Contains(t, fail("hails", "review", "H-0001", "--keep", "--discard", "#2"), "pass --keep or --discard, not both")
+	for _, blank := range []string{"", ",", " , "} {
+		require.Contains(t, fail("hails", "review", "H-0001", "--discard", blank),
+			"--discard needs a ref; to discard every issue, run bmus hails answer <id> --option 1")
+		require.Contains(t, fail("hails", "review", "H-0001", "--restore", blank), "--restore needs a key")
+	}
+	require.Contains(t, fail("hails", "answer", "H-0001", "--decision", "discard ,"), "discard names no ref")
 	require.Contains(t, fail("hails", "review", "H-0003", "--keep"), "hail H-0003 is campaign_pick, not a findings review (tracker_review)")
 	require.Contains(t, fail("hails", "review", "H-0009"), "no hail H-0009")
 	require.Contains(t, fail("hails", "answer", "H-0001", "--decision", "maybe"), `"maybe" is not keep, discard or restore`)

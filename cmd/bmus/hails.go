@@ -181,6 +181,16 @@ one.`,
 			if keep && len(discard) > 0 {
 				return errors.New("pass --keep or --discard, not both")
 			}
+			for _, v := range discard {
+				if strings.Trim(v, " ,\t") == "" {
+					return errors.New("--discard needs a ref; to discard every issue, run bmus hails answer <id> --option 1")
+				}
+			}
+			for _, v := range restore {
+				if strings.Trim(v, " ,\t") == "" {
+					return errors.New("--restore needs a key")
+				}
+			}
 			var res bridge.HailsListResult
 			if err := a.call(cmd.Context(), "hails.list", bridge.HailsListArgs{}, &res); err != nil {
 				return err

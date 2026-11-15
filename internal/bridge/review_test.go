@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -112,6 +114,11 @@ func TestParseReview(t *testing.T) {
 		{"keep; discard #2", "after ; comes restore <key>..."},
 		{"keep; restore noise; restore lost", "more than one ;"},
 		{"restore noise; restore lost", "restore comes last"},
+		{"discard ,", "discard names no ref (discard alone discards every issue)"},
+		{"discard,", "discard names no ref (discard alone discards every issue)"},
+		{"discard , ; restore noise", "discard names no ref (discard alone discards every issue)"},
+		{"restore ,", "restore names no key"},
+		{"keep; restore ,", "restore names no key"},
 	} {
 		_, err := parseReview(tc.answer, testReview, canon)
 		require.EqualError(t, err, tc.err, tc.answer)
@@ -181,6 +188,16 @@ func TestReviewBatch(t *testing.T) {
 		Failed:  []ReviewFailed{{Key: "b", Title: "B", Error: "tracker down"}}}, b.Context, "d is still new: left out")
 	require.Equal(t, "Review 1 issue filed from "+id+"'s findings (1 dropped, 1 failed): keep, discard, "+
 		"or answer with the refs to discard and the keys to restore.", reviewQuestion(b.Context))
+	_, err = d.reviewBatch(ctx, id)
+	require.NoError(t, err)
+	var left []string
+	for _, s := range orderLogTexts(t, d, id) {
+		if strings.HasPrefix(s, "findings of "+id+" left out of the review") {
+			left = append(left, s)
+		}
+	}
+	require.Equal(t, []string{"findings of " + id + " left out of the review: 4 still new"}, left,
+		"the rows still new are counted, once per order")
 }
 
 // review-keep, review-discard and review-restore are safe to repeat: the
@@ -203,15 +220,15 @@ func TestReviewStepsRepeat(t *testing.T) {
 	require.NoError(t, d.store.TriageFindings(ctx, id, []store.FindingTriage{{Key: "c", Drop: true, Why: "noise"}}, e))
 
 	for range 2 {
-		state, err := d.reviewKeep(ctx, id, "a")
+		out, err := d.reviewKeep(ctx, id, "a")
 		require.NoError(t, err)
-		require.Equal(t, store.FindingKept, state)
-		state, err = d.reviewDiscard(ctx, id, "b")
+		require.Equal(t, reviewOutcome{State: store.FindingKept}, out)
+		out, err = d.reviewDiscard(ctx, id, "b")
 		require.NoError(t, err)
-		require.Equal(t, store.FindingDiscarded, state)
-		state, err = d.reviewRestore(ctx, id, "c", begin)
+		require.Equal(t, reviewOutcome{State: store.FindingDiscarded}, out)
+		out, err = d.reviewRestore(ctx, id, "c", begin)
 		require.NoError(t, err)
-		require.Equal(t, store.FindingRestored, state)
+		require.Equal(t, reviewOutcome{State: store.FindingRestored}, out)
 	}
 	a, err := fake.Get(ctx, "#1")
 	require.NoError(t, err)
@@ -241,12 +258,12 @@ func TestReviewStepsRepeat(t *testing.T) {
 	require.Equal(t, 1, n)
 
 	// A step for a row not filed (d is new) does nothing.
-	state, err := d.reviewKeep(ctx, id, "d")
+	out, err := d.reviewKeep(ctx, id, "d")
 	require.NoError(t, err)
-	require.Equal(t, store.FindingNew, state)
-	state, err = d.reviewRestore(ctx, id, "d", begin)
+	require.Equal(t, store.FindingNew, out.State)
+	out, err = d.reviewRestore(ctx, id, "d", begin)
 	require.NoError(t, err)
-	require.Equal(t, store.FindingNew, state)
+	require.Equal(t, store.FindingNew, out.State)
 }
 
 // Restoring a failed finding whose issue a lost answer had already filed
@@ -264,9 +281,9 @@ func TestReviewRestoreFoundByMarker(t *testing.T) {
 	_, err = d.store.SettleFinding(ctx, id, "a", store.FindingFailed, "", "timeout")
 	require.NoError(t, err)
 
-	state, err := d.reviewRestore(ctx, id, "a", begin)
+	out, err := d.reviewRestore(ctx, id, "a", begin)
 	require.NoError(t, err)
-	require.Equal(t, store.FindingRestored, state)
+	require.Equal(t, store.FindingRestored, out.State)
 	items, err := fake.List(ctx, tracker.Query{})
 	require.NoError(t, err)
 	require.Len(t, items, 1)
@@ -317,6 +334,9 @@ func TestFindingsReviewExit(t *testing.T) {
 		require.Equal(t, []string{labelUnreviewed}, it.Labels, ref)
 		require.Equal(t, blockers, it.BlockedBy, ref)
 	}
+	all, err := fake.List(t.Context(), tracker.Query{State: tracker.StateAll})
+	require.NoError(t, err)
+	require.Len(t, all, 6, "the existing issue and the five filed")
 	require.Equal(t, store.HailOpen, h.Status)
 	require.Equal(t, reviewOptions, h.Options)
 	require.Equal(t, "Review 5 issues filed from "+id+"'s findings (0 dropped, 0 failed): keep, discard, "+
@@ -335,6 +355,9 @@ func TestFindingsReviewExit(t *testing.T) {
 
 	require.NoError(t, hd.d.AnswerHail(t.Context(), h.ID, "discard #2 #4", nil))
 	require.Equal(t, FindingsResult{Filed: 5, Kept: 3, Discarded: 2}, endFindings(t, hd.d, id, ""))
+	all, err = fake.List(t.Context(), tracker.Query{State: tracker.StateAll})
+	require.NoError(t, err)
+	require.Len(t, all, 6, "the review filed nothing")
 	decided := hd.hail(t, h.ID)
 	require.Equal(t, store.HailDecided, decided.Status)
 	require.Equal(t, "discard #2 #4", decided.Decision)
@@ -456,13 +479,13 @@ func TestFindingsReviewActionFails(t *testing.T) {
 	fake := &closeFails{}
 	d, id := findingsDaemon(t, fake, nil, store.Finding{Key: "a", Title: "A"}, store.Finding{Key: "b", Title: "B"})
 	startFindingsWorkflow(t, d, id)
-	require.Equal(t, FindingsResult{Filed: 2, Kept: 1}, endFindings(t, d, id, "discard #1"))
+	require.Equal(t, FindingsResult{Filed: 2, Kept: 1, ReviewFailed: 1}, endFindings(t, d, id, "discard #1"))
 	a, err := d.store.GetFinding(t.Context(), id, "a")
 	require.NoError(t, err)
 	require.Equal(t, store.FindingFiled, a.State, "not discarded")
 	texts := orderLogTexts(t, d, id)
 	require.Contains(t, texts, "finding a not discarded: close refused")
-	require.Equal(t, "review of "+id+"'s findings: kept 1, discarded 0, restored 0", texts[len(texts)-1])
+	require.Equal(t, "review of "+id+"'s findings: kept 1, discarded 0, restored 0, failed 1", texts[len(texts)-1])
 	it, err := fake.Get(t.Context(), "#2")
 	require.NoError(t, err)
 	require.Empty(t, it.Labels)
@@ -478,4 +501,120 @@ func TestNoReviewWithoutFiling(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, hails)
 	require.NotContains(t, stepNames(t, d, findingsWorkflowID(id)), "raise-review")
+}
+
+// An issue gone before the review: discarding it counts as done, with a
+// note; keeping it fails for good at once.
+func TestReviewIssueGone(t *testing.T) {
+	t.Parallel()
+	fake := &trackertest.Fake{}
+	d, id := findingsStore(t, fake, store.Finding{Key: "a", Title: "A"}, store.Finding{Key: "b", Title: "B"})
+	ctx := t.Context()
+	for _, k := range []string{"a", "b"} {
+		_, err := d.store.SettleFinding(ctx, id, k, store.FindingFiled, "#9", "")
+		require.NoError(t, err)
+	}
+	out, err := d.reviewDiscard(ctx, id, "a")
+	require.NoError(t, err)
+	require.Equal(t, reviewOutcome{State: store.FindingDiscarded}, out)
+	a, err := d.store.GetFinding(ctx, id, "a")
+	require.NoError(t, err)
+	require.Equal(t, "item #9: tracker: not found", a.Why)
+	require.Contains(t, orderLogTexts(t, d, id), "finding a discarded: item #9: tracker: not found")
+
+	out, err = d.reviewKeep(ctx, id, "b")
+	require.NoError(t, err)
+	require.Equal(t, reviewOutcome{Failed: "item #9: tracker: not found"}, out)
+	b, err := d.store.GetFinding(ctx, id, "b")
+	require.NoError(t, err)
+	require.Equal(t, store.FindingFiled, b.State)
+}
+
+// unlabelGone is a fake tracker whose Unlabel finds no issue, counting
+// its calls.
+type unlabelGone struct {
+	trackertest.Fake
+	mu sync.Mutex
+	n  int
+}
+
+func (u *unlabelGone) Unlabel(context.Context, string, string) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.n++
+	return fmt.Errorf("item gone: %w", tracker.ErrNotFound)
+}
+
+// Through DBOS: a keep whose issue is gone runs once, with no retries,
+// and is logged once and counted as failed.
+func TestFindingsReviewKeepGone(t *testing.T) {
+	t.Parallel()
+	fake := &unlabelGone{}
+	d, id := findingsDaemon(t, fake, nil, store.Finding{Key: "a", Title: "A"})
+	startFindingsWorkflow(t, d, id)
+	require.Equal(t, FindingsResult{Filed: 1, ReviewFailed: 1}, endFindings(t, d, id, "keep"))
+	fake.mu.Lock()
+	require.Equal(t, 1, fake.n, "no retries")
+	fake.mu.Unlock()
+	texts := orderLogTexts(t, d, id)
+	require.Contains(t, texts, "finding a not kept: item gone: tracker: not found")
+	require.Equal(t, "review of "+id+"'s findings: kept 0, discarded 0, restored 0, failed 1", texts[len(texts)-1])
+}
+
+// A restore whose link keeps failing: the issue is filed and found under
+// its marker, losing bmus:unreviewed before the link error returns; its
+// ref is stored, and review-failed restores the finding with the error
+// noted.
+func TestReviewRestoreLinkFails(t *testing.T) {
+	t.Parallel()
+	fake := &linkFails{}
+	existing := fake.Add(tracker.Item{Title: "existing"})
+	d, id := findingsStore(t, fake, store.Finding{Key: "b", Title: "B", BlockedBy: []string{existing}})
+	ctx := t.Context()
+	begin := findingsBegin{Since: time.Now(), Nonce: d.store.Nonce()}
+	f, err := d.store.GetFinding(ctx, id, "b")
+	require.NoError(t, err)
+	got, err := d.createFindingIssue(ctx, id, f, []string{existing}, begin, true)
+	require.Error(t, err, "an earlier attempt filed it with the label, short of the link")
+	require.Equal(t, "#2", got.Ref)
+	_, err = d.store.SettleFinding(ctx, id, "b", store.FindingFailed, "", "link failed")
+	require.NoError(t, err)
+
+	_, err = d.reviewRestore(ctx, id, "b", begin)
+	require.ErrorContains(t, err, "linking #2 to #1 failed")
+	it, err := fake.Get(ctx, "#2")
+	require.NoError(t, err)
+	require.Empty(t, it.Labels, "unlabelled before the link error")
+	row, err := d.store.GetFinding(ctx, id, "b")
+	require.NoError(t, err)
+	require.Equal(t, store.FindingFailed, row.State)
+	require.Equal(t, "#2", row.Ref, "the ref is stored")
+
+	out, err := d.reviewFailed(ctx, id, "H-0002", "b", "review-restore", "linking #2 to #1 failed")
+	require.NoError(t, err)
+	require.Equal(t, reviewOutcome{State: store.FindingRestored}, out)
+	row, err = d.store.GetFinding(ctx, id, "b")
+	require.NoError(t, err)
+	require.Equal(t, "linking #2 to #1 failed", row.Why)
+	require.Contains(t, orderLogTexts(t, d, id), "finding b restored as #2 (linking #2 to #1 failed)")
+	items, err := fake.List(ctx, tracker.Query{State: tracker.StateAll})
+	require.NoError(t, err)
+	require.Len(t, items, 2, "one issue")
+
+	// Without a stored ref, review-failed logs the failure once.
+	d2, id2 := findingsStore(t, &trackertest.Fake{}, store.Finding{Key: "c", Title: "C"})
+	_, err = d2.store.SettleFinding(ctx, id2, "c", store.FindingFailed, "", "down")
+	require.NoError(t, err)
+	for range 2 {
+		out, err = d2.reviewFailed(ctx, id2, "H-0002", "c", "review-restore", "down again")
+		require.NoError(t, err)
+		require.Empty(t, out.State)
+	}
+	n := 0
+	for _, s := range orderLogTexts(t, d2, id2) {
+		if s == "finding c not restored: down again" {
+			n++
+		}
+	}
+	require.Equal(t, 1, n)
 }

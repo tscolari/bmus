@@ -75,8 +75,10 @@ type FindingsInput struct {
 // nothing was tried.
 type FindingsResult struct {
 	Filed, Dropped, Failed    int
-	Kept, Discarded, Restored int    `json:",omitempty"`
-	NotFiled                  string `json:",omitempty"`
+	Kept, Discarded, Restored int `json:",omitempty"`
+	// ReviewFailed counts the review's actions out of retries (#156).
+	ReviewFailed int    `json:",omitempty"`
+	NotFiled     string `json:",omitempty"`
 }
 
 // findingsBegin is the begin step's recorded result.
@@ -834,9 +836,9 @@ type findingIssue struct {
 //     exists fails Create before it files anything. Each blocker is read
 //     (Get), those not found are dropped with a note, and Create runs
 //     again.
-//   - Without unreviewed, an issue found under the marker that carries
-//     bmus:unreviewed (filed by an attempt whose answer was lost) has it
-//     removed.
+//   - Without unreviewed, an issue with bmus:unreviewed (one an attempt
+//     whose answer was lost filed under the marker) has it removed, before
+//     a link error returns.
 func (d *Daemon) createFindingIssue(ctx context.Context, orderID string, f store.Finding, blockers []string, b findingsBegin,
 	unreviewed bool) (findingIssue, error) {
 	sameRepo := func(ref string) bool {
@@ -870,19 +872,22 @@ func (d *Daemon) createFindingIssue(ctx context.Context, orderID string, f store
 		}
 	}
 	out.Ref = got.Ref
+	if !unreviewed && got.Ref != "" && slices.ContainsFunc(got.Labels, func(l string) bool { return strings.EqualFold(l, labelUnreviewed) }) {
+		// Before any link error returns: an issue found under the marker
+		// loses the label whatever else is left to do.
+		uctx, cancel := context.WithTimeout(ctx, trackerCallTimeout)
+		uerr := d.tracker.Unlabel(uctx, got.Ref, labelUnreviewed)
+		cancel()
+		if uerr != nil {
+			return out, errors.Join(err, uerr)
+		}
+	}
 	switch {
 	case err == nil:
 	case errors.Is(err, tracker.ErrLabels) && got.Ref != "":
 		out.Note = clip(err.Error(), maxFindingWhy)
 	default:
 		return out, err
-	}
-	if !unreviewed && slices.ContainsFunc(got.Labels, func(l string) bool { return strings.EqualFold(l, labelUnreviewed) }) {
-		uctx, cancel := context.WithTimeout(ctx, trackerCallTimeout)
-		defer cancel()
-		if err := d.tracker.Unlabel(uctx, got.Ref, labelUnreviewed); err != nil {
-			return out, err
-		}
 	}
 	return out, nil
 }
