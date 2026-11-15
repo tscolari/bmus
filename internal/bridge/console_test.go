@@ -21,6 +21,7 @@ import (
 
 	"github.com/tscolari/bmus/internal/comms"
 	"github.com/tscolari/bmus/internal/console"
+	"github.com/tscolari/bmus/internal/regs"
 	"github.com/tscolari/bmus/internal/store"
 )
 
@@ -1267,4 +1268,69 @@ func TestConsoleActionTimeout(t *testing.T) {
 	require.ErrorAs(t, err, &re)
 	require.Equal(t, console.CodeTimeout, re.Code())
 	require.Equal(t, "push timed out after 1ms; it may have taken effect in part: see the captain's log", re.Error())
+}
+
+// The console's answer to a findings review (#157) reaches AnswerHail as
+// the page sent it: a bad decision is a 400 whose message names the refs
+// and keys the review takes, a mismatched option one too, and a good
+// decision is stored in normal form with its option. A triage hail is
+// refused with the plan's message.
+func TestConsoleAnswerReview(t *testing.T) {
+	t.Parallel()
+	home := privateHome(t)
+	cfg := testConfig(home)
+	cfg.NoConsole = false
+	r := startDaemonConfig(t, cfg)
+	defer r.stop(t)
+	d := r.d
+	ctx := t.Context()
+	raw, err := json.Marshal(testReview)
+	require.NoError(t, err)
+	review, err := d.store.InsertBridgeHail(ctx, store.Hail{DeliverTo: "findings/ORD-0001", Category: regs.CategoryTrackerReview,
+		Question: "Review?", Options: reviewOptions, Context: raw}, store.LogEntry{Kind: logHail, Text: "review raised"})
+	require.NoError(t, err)
+	triage, err := d.store.InsertBridgeHail(ctx, store.Hail{DeliverTo: "findings/ORD-0002", Category: categoryFindingsTriage,
+		Question: "Triage?"}, store.LogEntry{Kind: logHail, Text: "triage raised"})
+	require.NoError(t, err)
+
+	cookies, csrf := consoleSession(t, d.consoleAddr, home)
+	answer := func(id, body string) (int, string, HailView) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+d.consoleAddr+"/api/hails/"+id+"/answer", strings.NewReader(body))
+		require.NoError(t, err)
+		req.Header.Set("Origin", "http://"+d.consoleAddr)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-BMUS-CSRF", csrf)
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		var out struct {
+			HailView
+			Error struct{ Code, Message string } `json:"error"`
+		}
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+		return resp.StatusCode, out.Error.Message, out.HailView
+	}
+
+	status, msg, _ := answer(review, `{"decision":"discard #9"}`)
+	require.Equal(t, http.StatusBadRequest, status)
+	require.Equal(t, `hail `+review+`: "#9" is not a ref of the review; answer keep, discard, discard <ref>..., `+
+		`or restore <key>..., the first three optionally followed by "; restore <key>..." (refs: #2, #3, #4; keys: noise, lost)`, msg)
+	status, msg, _ = answer(review, `{"option":0,"decision":"discard #2"}`)
+	require.Equal(t, http.StatusBadRequest, status)
+	require.Equal(t, `hail `+review+`: option 0 (keep) does not match the decision "discard #2"`, msg)
+	status, msg, _ = answer(triage, `{"decision":"{}"}`)
+	require.Equal(t, http.StatusBadRequest, status)
+	require.Equal(t, "hail "+triage+" is Command's advisory triage; review the issues in its tracker_review hail", msg)
+
+	status, msg, v := answer(review, `{"decision":"discard #4 #2; restore lost noise"}`)
+	require.Equal(t, http.StatusOK, status, msg)
+	require.Equal(t, "discard #2 #4; restore noise lost", v.Decision)
+	require.Equal(t, store.HailDecided, v.Status)
+	h, err := d.store.GetHail(ctx, review)
+	require.NoError(t, err)
+	require.Equal(t, "discard #2 #4; restore noise lost", h.Decision)
 }

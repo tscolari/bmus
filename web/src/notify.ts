@@ -6,6 +6,7 @@
 
 import type { HailView } from "./api.js";
 import type { State } from "./store.js";
+import { bridgeHailOrder, hailKind } from "./view.js";
 
 /** The page's notification permission, or "unsupported" without the API. */
 export type Permission = NotificationPermission | "unsupported";
@@ -19,10 +20,26 @@ export interface NotifyEnv {
   readonly watch: (onChange: (p: Permission) => void) => () => void;
 }
 
-/** A notification's title and body for a hail: the crew member and order, then the question. */
+/**
+ * A notification's title and body for a hail: the crew member and order,
+ * then the question. A bridge-raised hail (#152) has no crew member: the
+ * title names the bridge and the order it is about, the findings review
+ * as a review.
+ */
 export function hailNotice(state: State, h: HailView): { title: string; body: string; tag: string } {
+  const kind = hailKind(h);
+  if (kind !== "crew") {
+    const order = bridgeHailOrder(h);
+    const what = kind === "review" ? "Review from the bridge" : "Hail from the bridge";
+    return { title: order ? `${what} · ${order}` : what, body: h.question, tag: h.id };
+  }
   const c = state.crew.get(h.crew_id);
   return { title: `Hail from ${c?.name || h.crew_id} · ${h.order_id}`, body: h.question, tag: h.id };
+}
+
+/** Whether a hail is the captain's to answer, so worth a notification: Command's advisory triage (#155) never is. */
+export function notifies(h: HailView): boolean {
+  return hailKind(h) !== "triage";
 }
 
 /**
@@ -34,7 +51,7 @@ export function announce(env: NotifyEnv, state: State, ids: readonly string[], o
   if (env.permission() !== "granted") return ids;
   for (const id of ids) {
     const h = state.hail.get(id);
-    if (!h || h.status !== "open") continue;
+    if (!h || h.status !== "open" || !notifies(h)) continue;
     const n = hailNotice(state, h);
     env.show(n.title, { body: n.body, tag: n.tag }, () => onClick(id));
   }

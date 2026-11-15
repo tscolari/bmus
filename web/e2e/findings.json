@@ -1,0 +1,24 @@
+{
+  "steps": [
+    { "at_pct": 10, "progress": "surveying the snapshot writer" },
+    {
+      "at_pct": 20,
+      "finding": {
+        "key": "a-leak",
+        "title": "<script>alert(1)</script> **Snapshot** writer leaks a handle",
+        "body": "The writer never closes its temp file.",
+        "severity": "high"
+      }
+    },
+    { "at_pct": 30, "finding": { "key": "b-flaky", "title": "TestSnapshot is flaky", "body": "Fails one run in ten." } },
+    { "at_pct": 40, "finding": { "key": "c-typo", "title": "Typo in a comment", "body": "teh" } },
+    { "at_pct": 50, "finding": { "key": "d-lock", "title": "Compactor holds the lock across fsync", "body": "" } },
+    { "at_pct": 100, "report": { "summary": "snapshot writer surveyed", "artifacts": [] } }
+  ],
+  "consult": {
+    "decision": "answer",
+    "answer": "{\"drop\":[3],\"duplicates\":{\"2\":\"#1\"}}",
+    "rationale": "3 is a typo in a comment; 2 repeats #1",
+    "confidence": 0.9
+  }
+}
