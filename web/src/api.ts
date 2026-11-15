@@ -91,6 +91,8 @@ export interface HailView {
   readonly id: string;
   readonly order_id: string;
   readonly crew_id: string;
+  /** The bridge workflow that raised the hail (#152), whose order_id and crew_id are empty; absent for a hail from a beam. */
+  readonly deliver_to?: string;
   readonly category: string;
   readonly question: string;
   readonly options: readonly string[];

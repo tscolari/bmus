@@ -409,7 +409,7 @@ func TestClassifyHail(t *testing.T) {
 	require.Equal(t, regs.RouteCommand, r.Route)
 	require.Empty(t, r.Why)
 	require.False(t, r.CaptainOnly)
-	require.Equal(t, `captain-only "force push over it": captain_only[5]: option "(?i)delete|destroy|force"`, r.DefaultBlocked)
+	require.Equal(t, `captain-only "force push over it": captain_only[4]: option "(?i)delete|destroy|force"`, r.DefaultBlocked)
 	zero, rebase := 0, *def
 	rebase.Escalation.DefaultOption = &zero
 	d, id = hailStore(t, &rebase, "", store.PriorityRoutine, forceHail())
@@ -459,7 +459,7 @@ func TestApplyTimeoutHolds(t *testing.T) {
 			"hail H-0001 unanswered after 1m: holding for the captain (default_option does not apply to a captain-only hail)"},
 		{"captain-only option", forceHail(), regs.Escalation{OnTimeout: regs.OnTimeoutDefaultOption, DefaultOption: &one},
 			`hail H-0001 unanswered after 1m: holding for the captain (default_option 1: captain-only "force push over it": ` +
-				`captain_only[5]: option "(?i)delete|destroy|force")`},
+				`captain_only[4]: option "(?i)delete|destroy|force")`},
 		{"no default_option", storeHail("make deploy"), regs.Escalation{OnTimeout: regs.OnTimeoutDefaultOption},
 			"hail H-0001 unanswered after 1m: holding for the captain (no default_option)"},
 		{"out of range", storeHail("make deploy"), regs.Escalation{OnTimeout: regs.OnTimeoutDefaultOption, DefaultOption: &five},

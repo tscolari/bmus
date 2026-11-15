@@ -2224,6 +2224,18 @@ describe("sdk consult", () => {
     });
   });
 
+  it("runs a bridge-raised hail's consult, which has no crew, order, spec or log (#152)", async () => {
+    const c = consulter(tempDir(), answering('{"decision":"answer","answer":"{}","rationale":"nothing to drop","confidence":0.9}'));
+    const { crew: _c, order: _o, order_spec: _s, recent_log: _l, options: _opts, ...rest } = consultReq;
+    const orderless: ConsultBody = { ...rest, category: "findings_triage", question: "Triage 3 findings from ORD-0042." };
+    const reply = await c.harness.consult!(orderless, new AbortController().signal);
+    expect(reply).toEqual({ hail_id: "H-0091", decision: "answer", answer: "{}", rationale: "nothing to drop", confidence: 0.9 });
+    const { options: o, prompt } = c.asked[0]!;
+    expect(o.systemPrompt).toContain("no crew member or order behind it");
+    const data = JSON.parse(prompt.slice(prompt.indexOf("{"), prompt.lastIndexOf("}") + 1)) as Record<string, unknown>;
+    expect(data).toEqual({ category: "findings_triage", question: "Triage 3 findings from ORD-0042.", context: { files: 3 } });
+  });
+
   it("passes the consult's model to query, and none without one", async () => {
     const reply = '{"decision":"escalate","rationale":"r","confidence":0}';
     const c = consulter(tempDir(), answering(reply));

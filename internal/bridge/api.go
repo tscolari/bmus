@@ -208,6 +208,8 @@ func (d *Daemon) CreateOrder(ctx context.Context, o store.Order) (string, error)
 // queued. The hail's workflow is woken in the same transaction
 // (notifyHailClosed). It returns once the message is queued for the
 // mission, not once the beam has it; the mission sends the answer command.
+// A bridge-raised hail (#152) has no mission: nothing is sent to one, and
+// notifyHailClosed wakes the workflow that raised it (deliver_to).
 func (d *Daemon) AnswerHail(ctx context.Context, hailID, decision string, option *int) error {
 	h, err := d.store.GetHail(ctx, hailID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -252,6 +254,11 @@ func (d *Daemon) AnswerHail(ctx context.Context, hailID, decision string, option
 		return err
 	}
 	return d.store.DecideOpenHail(ctx, hailID, comms.DecidedByCaptain, decision, "", entry, func(tx *sql.Tx) error {
+		if h.DeliverTo != "" {
+			// A bridge-raised hail (#152) has no mission: notifyHailClosed
+			// wakes its raiser.
+			return d.notifyHailClosed(tx, hailID)
+		}
 		if err := dbos.Send(d.dbos, missionWorkflowID(h.OrderID), msg, fromCrewTopic, dbos.WithSendTransaction(tx)); err != nil {
 			return fmt.Errorf("deliver answer to %s: %w", missionWorkflowID(h.OrderID), err)
 		}
@@ -280,6 +287,13 @@ func (d *Daemon) AnswerHail(ctx context.Context, hailID, decision string, option
 // (wrapped), an open one is a bad request (answer it instead), and a
 // missing one
 // ErrNotFound.
+//
+// A bridge-raised hail (#152) has no order or agent to correct: the row and
+// its log entry are written and nothing is sent, the raiser included. A
+// raiser that acts on a countermandable decision must sleep past
+// countermand_until and re-read the row before acting
+// (spec/campaigns-stage-2-plan-2026-11-14.md section 2); awaitBridgeHail
+// returns at the first decision and does not wait out the window.
 func (d *Daemon) CountermandHail(ctx context.Context, hailID, decision string, option *int, reason string) (ended bool, err error) {
 	h, err := d.store.GetHail(ctx, hailID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -323,6 +337,9 @@ func (d *Daemon) CountermandHail(ctx context.Context, hailID, decision string, o
 	entry, err := logEntry(logHail, h.CrewID, h.OrderID, "hail "+hailID+" countermanded: "+why, payload)
 	if err != nil {
 		return false, err
+	}
+	if h.DeliverTo != "" {
+		return false, d.store.CountermandHailOption(ctx, hailID, decision, option, reason, entry, nil)
 	}
 	mission := missionWorkflowID(h.OrderID)
 	err = d.store.CountermandHailOption(ctx, hailID, decision, option, reason, entry, func(tx *sql.Tx) error {

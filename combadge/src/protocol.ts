@@ -299,8 +299,9 @@ export interface AnswerBody {
 /** A hail plus fleet context for Command. Command lane only (phase 3 plan §5). */
 export interface ConsultBody {
   hail_id: string;
-  crew: string;
-  order: string;
+  /** Who hailed and the order it hailed on; both absent for a hail a bridge workflow raised (#152). */
+  crew?: string;
+  order?: string;
   category: string;
   question: string;
   options?: string[];

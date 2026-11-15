@@ -49,13 +49,19 @@ const CategoryToolApproval = "tool_approval"
 // captain (CaptainFixed).
 const CategoryBudget = "budget"
 
+// CategoryTrackerReview is the bridge's hail in which the captain keeps or
+// discards the issues filed from an order's findings (#152). Discarding
+// closes issues, so it is fixed to the captain (CaptainFixed).
+const CategoryTrackerReview = "tracker_review"
+
 // captainFixed are the categories only the captain answers, whatever
 // regs.yaml says, with why. Classify routes them to the captain before any
 // rule, and CheckAnswer rejects every answer to them; the hail workflow
 // then treats them as captain-only, so on_timeout default_option never
 // decides one.
 var captainFixed = map[string]string{
-	CategoryBudget: "category budget is fixed to the captain",
+	CategoryBudget:        "category budget is fixed to the captain",
+	CategoryTrackerReview: "category tracker_review is fixed to the captain",
 }
 
 // CaptainFixed reports why hails of category are fixed to the captain

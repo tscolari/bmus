@@ -39,17 +39,7 @@ func newHailsCmd(a *app) *cobra.Command {
 			if listJSON {
 				return printJSON(cmd.OutOrStdout(), res)
 			}
-			w := newTable(cmd.OutOrStdout())
-			fmt.Fprintln(w, "ID\tORDER\tCREW\tCATEGORY\tSTATUS\tQUESTION\tOPTIONS\tDECISION")
-			for _, h := range res.Hails {
-				opts := make([]string, len(h.Options))
-				for i, o := range h.Options {
-					opts[i] = fmt.Sprintf("%d=%s", i, o)
-				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", h.ID, h.OrderID, h.CrewID, dash(h.Category),
-					h.Status, oneLine(h.Question), dash(strings.Join(opts, " ")), dash(oneLine(h.Decision)))
-			}
-			return w.Flush()
+			return printHails(cmd.OutOrStdout(), res.Hails)
 		},
 	}
 	list.Flags().StringVar(&status, "status", "open", "open, decided, timed_out or all")
@@ -254,4 +244,20 @@ func deciderRank(d string) int {
 // oneLine keeps a table row on one line.
 func oneLine(s string) string {
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// printHails prints hails as hails list's table. A bridge-raised hail
+// (#152) has no order or crew member: both print as -.
+func printHails(out io.Writer, hails []bridge.HailView) error {
+	w := newTable(out)
+	fmt.Fprintln(w, "ID\tORDER\tCREW\tCATEGORY\tSTATUS\tQUESTION\tOPTIONS\tDECISION")
+	for _, h := range hails {
+		opts := make([]string, len(h.Options))
+		for i, o := range h.Options {
+			opts[i] = fmt.Sprintf("%d=%s", i, o)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", h.ID, dash(h.OrderID), dash(h.CrewID), dash(h.Category),
+			h.Status, oneLine(h.Question), dash(strings.Join(opts, " ")), dash(oneLine(h.Decision)))
+	}
+	return w.Flush()
 }

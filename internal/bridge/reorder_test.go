@@ -530,7 +530,7 @@ func TestReorderOrdersHail(t *testing.T) {
 	parent := hd.createCommandOrder(t)
 
 	e := hd.waitLog(t, "hail H-0001 for the captain")
-	require.Equal(t, `hail H-0001 for the captain: captain_only[8]: category "order_reorder"`, e.Text)
+	require.Equal(t, `hail H-0001 for the captain: captain_only[7]: category "order_reorder"`, e.Text)
 	q := `Reorder 2 orders: 1) ORD-0002 "pool run" (pool): base main -> order:ORD-0003; after none -> ORD-0003; ` +
 		`2) ORD-0001 "pool run" (pool): after none -> ORD-0003. Command's reason: "the API moved"`
 	require.Equal(t, q, hd.hail(t, "H-0001").Question, "the captain reads the bridge's question")

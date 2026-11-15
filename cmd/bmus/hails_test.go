@@ -71,3 +71,18 @@ time-to-answer median  -
 time-to-answer p90     -
 `, b.String())
 }
+
+// A bridge-raised hail (#152) has no order or crew member: hails list
+// prints - for both, beside a beam's hail.
+func TestPrintHailsBridgeHail(t *testing.T) {
+	t.Parallel()
+	var b bytes.Buffer
+	require.NoError(t, printHails(&b, []bridge.HailView{
+		{ID: "H-0001", DeliverTo: "findings/ORD-0001", Category: "tracker_review", Status: "open", Question: "Review 5 issues?",
+			Options: []string{"keep", "discard"}},
+		{ID: "H-0002", OrderID: "ORD-0002", CrewID: "sorell", Category: "clarifying_question", Status: "decided",
+			Question: "Which?", Decision: "a"},
+	}))
+	require.Regexp(t, `(?m)^H-0001\s+-\s+-\s+tracker_review\s+open\s+Review 5 issues\?\s+0=keep 1=discard\s+-$`, b.String())
+	require.Regexp(t, `(?m)^H-0002\s+ORD-0002\s+sorell\s+clarifying_question\s+decided\s+Which\?\s+-\s+a$`, b.String())
+}

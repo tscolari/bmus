@@ -94,6 +94,19 @@ const RoleCommand = "command"
 // row when no reminder or timeout is due sooner.
 const hailRecheckEvery = missionWaitTimeout
 
+// categoryFindingsTriage is the bridge's hail asking Command to triage an
+// order's findings before they are filed (#155). It is advisory
+// (advisoryCategories).
+const categoryFindingsTriage = "findings_triage"
+
+// advisoryCategories are the categories of bridge-raised hails only
+// Command answers (#152): wherever routing would reach the captain (no
+// regs.yaml, a captain_only rule, Command not on deck, a consult timeout, a
+// rejected or escalated reply), skip-advisory closes the hail timed_out
+// with the reason instead, and their raiser goes on without an answer.
+// Their decisions have no countermand window.
+var advisoryCategories = map[string]bool{categoryFindingsTriage: true}
+
 // HailInput is the input of a hail workflow, id hail/<HailID>.
 type HailInput struct {
 	HailID string
@@ -133,7 +146,11 @@ type hailRouting struct {
 	// (checkTrackerRequest), no tracker included: deny-request decides it
 	// by policy at once.
 	InvalidRequest string `json:",omitempty"`
-	Start          time.Time
+	// Advisory: a bridge-raised hail of an advisory category
+	// (advisoryCategories). Where it would go to the captain,
+	// skip-advisory closes it instead.
+	Advisory bool `json:",omitempty"`
+	Start    time.Time
 
 	RemindEvery       time.Duration
 	Timeout           time.Duration
@@ -161,7 +178,8 @@ func (c hailCheck) result() HailResult {
 // hailWorkflow classifies, decides or routes one hail
 // (spec/phase-3-plan-2026-10-29.md §3). The mission starts it right after
 // record-hail and never waits on it; it talks to the mission only through
-// fromCrewTopic.
+// fromCrewTopic. A bridge workflow starts one for each hail it raises
+// (raiseBridgeHail, #152).
 //
 //   - classify reads the hail, its order and its crew member. A malformed
 //     order_split hail (checkSplit) is denied at once by policy
@@ -177,6 +195,10 @@ func (c hailCheck) result() HailResult {
 //     the hail or hands it to the captain.
 //   - A captain-routed hail waits for its hail to close (awaitCaptain),
 //     with reminders and the on_timeout policy.
+//   - A bridge-raised hail (deliver_to set, #152) has no order or crew
+//     member: classify reads neither, and an advisory one
+//     (advisoryCategories) that would go to the captain is closed by
+//     skip-advisory instead.
 //
 // It never decides a captain's answer itself: AnswerHail does, and tells
 // the workflow (notifyHailClosed). A hail closed before or while the
@@ -231,6 +253,15 @@ func hailWorkflow(ctx dbos.Context, in HailInput) (HailResult, error) {
 			return res, err
 		}
 	}
+	if r.Open && r.Advisory {
+		// Nobody but Command answers it: no captain wait.
+		if _, err := dbos.RunAsStep(ctx, func(c context.Context) (bool, error) {
+			return daemonFrom(c).skipAdvisory(c, in.HailID, r.Why)
+		}, append([]dbos.StepOption{dbos.WithStepName("skip-advisory")}, storeRetries...)...); err != nil {
+			return HailResult{}, err
+		}
+		r.Open = false
+	}
 	if r.Open {
 		r.Open, err = dbos.RunAsStep(ctx, func(c context.Context) (bool, error) {
 			return daemonFrom(c).routeCaptain(c, in.HailID, r)
@@ -253,7 +284,7 @@ func (d *Daemon) classifyHail(ctx context.Context, id string) (hailRouting, erro
 		return hailRouting{}, fmt.Errorf("hail %s: %w", id, err)
 	}
 	r := hailRouting{Open: h.Status == store.HailOpen, Route: regs.RouteCaptain, Start: time.Now(),
-		ConsultTimeout: d.consultTimeout}
+		ConsultTimeout: d.consultTimeout, Advisory: h.DeliverTo != "" && advisoryCategories[h.Category]}
 	if !r.Open {
 		return r, nil
 	}
@@ -282,16 +313,21 @@ func (d *Daemon) classifyHail(ctx context.Context, id string) (hailRouting, erro
 	}
 	esc := d.regs.Escalation
 	r.RemindEvery, r.Timeout, r.OnTimeout, r.DefaultOption = esc.CaptainReminderEvery, esc.CaptainTimeout, esc.OnTimeout, esc.DefaultOption
-	if w := d.regs.CommandMayAnswer.CountermandWindow; w != nil {
+	if w := d.regs.CommandMayAnswer.CountermandWindow; w != nil && !r.Advisory {
 		r.CountermandWindow = *w
 	}
-	o, err := d.store.GetOrder(ctx, h.OrderID)
+	o, err := d.hailOrder(ctx, h)
 	if err != nil {
-		return hailRouting{}, fmt.Errorf("order %s: %w", h.OrderID, err)
+		return hailRouting{}, err
 	}
-	c, err := d.store.GetCrew(ctx, h.CrewID)
-	if err != nil {
-		return hailRouting{}, fmt.Errorf("crew %s: %w", h.CrewID, err)
+	// A bridge-raised hail has no crew member, so never one of Command's.
+	fromCommand := false
+	if h.CrewID != "" {
+		c, err := d.store.GetCrew(ctx, h.CrewID)
+		if err != nil {
+			return hailRouting{}, fmt.Errorf("crew %s: %w", h.CrewID, err)
+		}
+		fromCommand = c.Division == DivisionCommand
 	}
 	rh := regsHail(h, o)
 	route, tag, rule := d.regs.Classify(rh)
@@ -305,9 +341,10 @@ func (d *Daemon) classifyHail(ctx context.Context, id string) (hailRouting, erro
 		r.Route, r.Why = regs.RouteAuto, rule
 	case route == regs.RouteCaptain:
 		// A captain_only rule, or a category fixed to the captain
-		// whatever regs.yaml says (regs.CaptainFixed: budget, #119).
+		// whatever regs.yaml says (regs.CaptainFixed: budget, #119, and
+		// tracker_review, #152).
 		r.Why, r.CaptainOnly = rule, true
-	case c.Division == DivisionCommand:
+	case fromCommand:
 		r.Why = "from Command"
 	default:
 		r.Route = regs.RouteCommand
@@ -320,6 +357,36 @@ func (d *Daemon) classifyHail(ctx context.Context, id string) (hailRouting, erro
 		}
 	}
 	return r, nil
+}
+
+// hailOrder is hail h's order, or the zero Order, priority 0, for a
+// bridge-raised hail, which has none (#152).
+func (d *Daemon) hailOrder(ctx context.Context, h store.Hail) (store.Order, error) {
+	if h.OrderID == "" {
+		return store.Order{}, nil
+	}
+	o, err := d.store.GetOrder(ctx, h.OrderID)
+	if err != nil {
+		return store.Order{}, fmt.Errorf("order %s: %w", h.OrderID, err)
+	}
+	return o, nil
+}
+
+// skipAdvisory is the skip-advisory step: it closes advisory hail id
+// timed_out with why as its rationale, logs it and wakes its raiser
+// (notifyRaiser), in one transaction, only while the hail is open. It
+// reports whether it closed the hail.
+func (d *Daemon) skipAdvisory(ctx context.Context, id, why string) (bool, error) {
+	h, err := d.store.GetHail(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	entry, err := logEntry(logHail, h.CrewID, h.OrderID, "hail "+id+" skipped, Command's alone to answer: "+why,
+		map[string]any{"hail_id": id, "why": why})
+	if err != nil {
+		return false, err
+	}
+	return d.store.TimeOutOpenHailWhy(ctx, id, why, entry, func(tx *sql.Tx) error { return d.notifyRaiser(tx, id) })
 }
 
 // regsHail is what the Regulations engine reads of hail h on order o.
@@ -384,6 +451,9 @@ func (d *Daemon) decideByPolicy(ctx context.Context, id string, option int, rati
 // transaction (store.DecideOpenHailAs). A positive window sets
 // countermand_until to the decision's time plus window. It reports false
 // for a hail no longer open.
+//
+// A bridge-raised hail (#152) has no mission: its raiser is woken instead
+// (notifyRaiser), in the same transaction.
 func (d *Daemon) decideOpen(ctx context.Context, h store.Hail, body comms.AnswerBody, dec store.HailDecision, text string,
 	window time.Duration) (bool, error) {
 	msg, err := syntheticMessage(comms.TypeAnswer, body, h.CrewID, h.OrderID)
@@ -404,6 +474,9 @@ func (d *Daemon) decideOpen(ctx context.Context, h store.Hail, body comms.Answer
 		dec.CountermandUntil = &until
 	}
 	err = d.store.DecideOpenHailAs(ctx, h.ID, dec, entry, func(tx *sql.Tx) error {
+		if h.DeliverTo != "" {
+			return d.notifyRaiser(tx, h.ID)
+		}
 		if err := dbos.Send(d.dbos, missionWorkflowID(h.OrderID), msg, fromCrewTopic, dbos.WithSendTransaction(tx)); err != nil {
 			return fmt.Errorf("deliver answer to %s: %w", missionWorkflowID(h.OrderID), err)
 		}
@@ -610,18 +683,11 @@ func (d *Daemon) transmitConsult(ctx context.Context, id, crew string, r hailRou
 // consultBody builds hail id's consult: the hail's fields; its order's
 // title and body (OrderSpec) and latest consultRecentLog log lines; the
 // command_guidance setting; and the regulations that apply (consultRegs).
+// A bridge-raised hail's has no crew member, order, spec or log (#152).
 // open is false, with no body, for a hail no longer open.
 func (d *Daemon) consultBody(ctx context.Context, id string, r hailRouting) (body comms.ConsultBody, open bool, err error) {
 	h, err := d.store.GetHail(ctx, id)
 	if err != nil || h.Status != store.HailOpen {
-		return comms.ConsultBody{}, false, err
-	}
-	o, err := d.store.GetOrder(ctx, h.OrderID)
-	if err != nil {
-		return comms.ConsultBody{}, false, fmt.Errorf("order %s: %w", h.OrderID, err)
-	}
-	entries, err := d.store.ListOrderLogLast(ctx, h.OrderID, consultRecentLog)
-	if err != nil {
 		return comms.ConsultBody{}, false, err
 	}
 	guidance, err := d.CommandGuidance(ctx)
@@ -629,11 +695,23 @@ func (d *Daemon) consultBody(ctx context.Context, id string, r hailRouting) (bod
 		return comms.ConsultBody{}, false, err
 	}
 	body = comms.ConsultBody{HailID: id, Crew: h.CrewID, Order: h.OrderID, Category: h.Category, Question: h.Question,
-		Options: h.Options, OrderSpec: o.Title, Guidance: guidance, Regulations: d.consultRegs(r)}
-	if o.Body != "" {
-		body.OrderSpec += "\n\n" + o.Body
+		Options: h.Options, Guidance: guidance, Regulations: d.consultRegs(r)}
+	var entries []store.LogEntry
+	if h.OrderID != "" {
+		// A bridge-raised hail has no order: no spec or log (#152).
+		o, err := d.store.GetOrder(ctx, h.OrderID)
+		if err != nil {
+			return comms.ConsultBody{}, false, fmt.Errorf("order %s: %w", h.OrderID, err)
+		}
+		if entries, err = d.store.ListOrderLogLast(ctx, h.OrderID, consultRecentLog); err != nil {
+			return comms.ConsultBody{}, false, err
+		}
+		body.OrderSpec = o.Title
+		if o.Body != "" {
+			body.OrderSpec += "\n\n" + o.Body
+		}
+		body.OrderSpec = clip(body.OrderSpec, maxConsultSpec)
 	}
-	body.OrderSpec = clip(body.OrderSpec, maxConsultSpec)
 	switch c := string(h.Context); {
 	case c == "" || c == "null" || c == "{}":
 	case len(c) <= maxConsultContext:
@@ -693,9 +771,9 @@ func (d *Daemon) decideCommand(ctx context.Context, id, crew string, r hailRouti
 	case reply.HailID != id:
 		return commandOutcome{Why: "Command's reply is for hail " + reply.HailID}, nil
 	}
-	o, err := d.store.GetOrder(ctx, h.OrderID)
+	o, err := d.hailOrder(ctx, h)
 	if err != nil {
-		return commandOutcome{}, fmt.Errorf("order %s: %w", h.OrderID, err)
+		return commandOutcome{}, err
 	}
 	ok, why := d.regs.CheckAnswer(regsHail(h, o), regs.Reply{Decision: reply.Decision, Option: reply.Option,
 		Answer: reply.Answer, Confidence: reply.Confidence, RiskFlags: reply.RiskFlags})
@@ -811,7 +889,8 @@ type timeoutOutcome struct {
 
 // applyTimeout is the on-timeout step: the hail, open after waited, gets
 // r.OnTimeout. hold logs that the hail waits on; belay belays its order
-// (BelayOrder), whose mission then closes the hail; default_option decides
+// (BelayOrder), whose mission then closes the hail, and holds for a
+// bridge-raised hail, which has no order; default_option decides
 // it by policy with r.DefaultOption (decideByPolicy), countermandable for
 // r.CountermandWindow. default_option holds instead for a captain-only
 // hail, for a default option CheckAnswer rejects (r.DefaultBlocked), and
@@ -831,6 +910,10 @@ func (d *Daemon) applyTimeout(ctx context.Context, id string, r hailRouting, wai
 	}
 	switch r.OnTimeout {
 	case regs.OnTimeoutBelay:
+		if h.OrderID == "" {
+			// A bridge-raised hail (#152).
+			return hold("holding for the captain (no order to belay)")
+		}
 		err = d.BelayOrder(ctx, h.OrderID, "hail "+id+" "+after)
 		if re := (*rpcError)(nil); errors.As(err, &re) && re.code == CodeBadRequest {
 			// The order moved on (settled, parked): its hail is closing
@@ -884,7 +967,12 @@ func (d *Daemon) noteOpenHail(ctx context.Context, id, text string, payload map[
 // hail closed when it starts: under SQLite's single writer (the store's
 // _txlock=immediate) no workflow can start between the check and the
 // commit.
+//
+// It also wakes the raiser of a bridge-raised hail (notifyRaiser).
 func (d *Daemon) notifyHailClosed(tx *sql.Tx, id string) error {
+	if err := d.notifyRaiser(tx, id); err != nil {
+		return err
+	}
 	wf := hailWorkflowID(id)
 	live, _, err := workflowLive(d, wf)
 	if err != nil || !live {
@@ -904,6 +992,75 @@ func (d *Daemon) notifyHailClosed(tx *sql.Tx, id string) error {
 		return fmt.Errorf("tell %s: %w", wf, err)
 	}
 	return nil
+}
+
+// notifyRaiser sends hail id's id on hailClosedTopic to the bridge
+// workflow that raised it (its deliver_to, #152), in tx, the transaction
+// that closes or decides the hail, if that workflow is live. A hail from a
+// beam has no raiser and is left alone. The raiser reads the hail's row,
+// as awaitCaptain does: the message only wakes it.
+func (d *Daemon) notifyRaiser(tx *sql.Tx, id string) error {
+	to, err := store.HailDeliverTo(context.Background(), tx, id)
+	if err != nil || to == "" {
+		return err
+	}
+	live, _, err := workflowLive(d, to)
+	if err != nil || !live {
+		return err
+	}
+	if err := dbos.Send(d.dbos, to, id, hailClosedTopic, dbos.WithSendTransaction(tx)); err != nil {
+		return fmt.Errorf("tell %s: %w", to, err)
+	}
+	return nil
+}
+
+// raiseBridgeHail raises hail h from the bridge workflow ctx runs (#152):
+// a raise-hail step records it with deliver_to the workflow's id
+// (store.InsertBridgeHail, entry its log entry), then it starts hail/<id>
+// as a child it never awaits, as the mission does. A replay, or a re-run
+// of the step, raises nothing new: one hail per raiser and category. A
+// second raise of the same category returns the first hail's id, which
+// may already be closed; starting its workflow again starts nothing.
+func raiseBridgeHail(ctx dbos.Context, h store.Hail, entry store.LogEntry) (string, error) {
+	wf, err := dbos.GetWorkflowID(ctx)
+	if err != nil {
+		return "", err
+	}
+	h.DeliverTo = wf
+	id, err := dbos.RunAsStep(ctx, func(c context.Context) (string, error) {
+		return daemonFrom(c).store.InsertBridgeHail(c, h, entry)
+	}, append([]dbos.StepOption{dbos.WithStepName("raise-hail")}, storeRetries...)...)
+	if err != nil {
+		return "", err
+	}
+	if _, err := dbos.RunWorkflow(ctx, hailWorkflow, HailInput{HailID: id}, dbos.WithWorkflowID(hailWorkflowID(id))); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// awaitBridgeHail waits, in the bridge workflow that raised hail id
+// (raiseBridgeHail), for the hail to close, and returns its row as the
+// check-raised-hail step read it. It wakes on hailClosedTopic
+// (notifyRaiser) and at least every hailRecheckEvery, and reads the row on
+// every wake. A buffered hail-closed message may belong to an earlier hail
+// the same raiser raised and saw closed (skip-advisory can close one before
+// the raiser's first check, leaving its message unread), so the loop goes
+// by the row alone. Callers must not take a message as proof of which hail
+// closed.
+func awaitBridgeHail(ctx dbos.Context, id string) (store.Hail, error) {
+	for {
+		h, err := dbos.RunAsStep(ctx, func(c context.Context) (store.Hail, error) {
+			return daemonFrom(c).store.GetHail(c, id)
+		}, append([]dbos.StepOption{dbos.WithStepName("check-raised-hail")}, storeRetries...)...)
+		if err != nil || h.Status != store.HailOpen {
+			return h, err
+		}
+		_, err = dbos.Recv[string](ctx, hailClosedTopic, hailRecheckEvery)
+		if err != nil && !errors.Is(err, dbos.ErrTimeout) && (ctx.Err() != nil || !isRecvDecodeError(err)) {
+			return store.Hail{}, err
+		}
+	}
 }
 
 // shortDuration is d to the second, without zero minutes or seconds after
