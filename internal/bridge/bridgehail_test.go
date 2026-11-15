@@ -338,8 +338,8 @@ func TestBridgeHailDecided(t *testing.T) {
 	require.Empty(t, cs[0].OrderSpec)
 	require.Empty(t, cs[0].RecentLog)
 
-	review := raise(t, hd.d, "review", raiserInput{Category: regs.CategoryTrackerReview, Question: "Review 3 issues?",
-		Options: []string{"keep", "discard"}})
+	review := raise(t, hd.d, "review", raiserInput{Category: regs.CategoryTrackerReview, Question: "Review 1 issue?",
+		Options: []string{"keep", "discard"}, Context: json.RawMessage(`{"order":"ORD-0001","issues":[{"ref":"#1","key":"a","title":"A"}]}`)})
 	var id string
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
 		hails, err := hd.d.store.ListHails(t.Context(), store.HailOpen)
@@ -454,7 +454,7 @@ func TestCloseBridgeHailRaiserDone(t *testing.T) {
 
 	for _, category := range []string{regs.CategoryTrackerReview, "campaign_pick"} {
 		id, err := hd.d.store.InsertBridgeHail(ctx, store.Hail{DeliverTo: raiser, Category: category, Question: "?",
-			Options: []string{"a", "b"}}, store.LogEntry{Kind: logHail, Text: "raised"})
+			Options: reviewOptions}, store.LogEntry{Kind: logHail, Text: "raised"})
 		require.NoError(t, err)
 		if category == regs.CategoryTrackerReview {
 			zero := 0

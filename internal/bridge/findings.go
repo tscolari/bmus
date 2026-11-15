@@ -33,7 +33,7 @@ func findingsWorkflowID(orderID string) string { return "findings/" + orderID }
 
 const (
 	// labelUnreviewed marks an issue filed from a finding until the
-	// captain reviews it (#156).
+	// captain keeps it (#156).
 	labelUnreviewed = "bmus:unreviewed"
 	// maxBacklog caps the open issues triage reads (plan, Decisions).
 	maxBacklog = 200
@@ -69,11 +69,16 @@ type FindingsInput struct {
 }
 
 // FindingsResult is how a findings workflow ended: how many findings it
-// filed, how many triage dropped and how many failed to file. NotFiled
-// says why nothing was filed, when nothing was tried.
+// filed, how many triage dropped and how many failed to file, then how
+// many issues the captain's review kept and discarded and how many
+// findings it restored (#156). NotFiled says why nothing was filed, when
+// nothing was tried.
 type FindingsResult struct {
-	Filed, Dropped, Failed int
-	NotFiled               string `json:",omitempty"`
+	Filed, Dropped, Failed    int
+	Kept, Discarded, Restored int `json:",omitempty"`
+	// ReviewFailed counts the review's actions out of retries (#156).
+	ReviewFailed int    `json:",omitempty"`
+	NotFiled     string `json:",omitempty"`
 }
 
 // findingsBegin is the begin step's recorded result.
@@ -153,13 +158,16 @@ func startFindings(ctx dbos.Context, orderID string) error {
 //     dropped, and finding-failed for one out of retries.
 //  5. findings-summary logs "findings of ORD-0001: filed 4, dropped 1,
 //     failed 0".
+//  6. The captain's review (reviewFindings, #156): a tracker_review hail
+//     when anything was filed, dropped or failed, a wait with no
+//     deadline, and the answer acted on.
 //
 // Its notes are written once per order (store.AppendLogOnce), so a step
 // re-run after its transaction committed logs nothing twice.
 //
 // The rows hold the outcome: dropped, filed or failed, with why, ref and
-// duplicate_of. #156 raises the tracker_review hail after filing, from
-// those rows.
+// duplicate_of, then kept, discarded or restored once reviewed. The
+// tracker_review hail is raised from them.
 func findingsWorkflow(ctx dbos.Context, in FindingsInput) (FindingsResult, error) {
 	b, err := dbos.RunAsStep(ctx, func(c context.Context) (findingsBegin, error) {
 		return daemonFrom(c).beginFindings(c, in.OrderID)
@@ -185,6 +193,10 @@ func findingsWorkflow(ctx dbos.Context, in FindingsInput) (FindingsResult, error
 		return d.logOnce(c, in.OrderID, "summary", fmt.Sprintf("findings of %s: filed %d, dropped %d, failed %d",
 			in.OrderID, res.Filed, res.Dropped, res.Failed), map[string]any{"filed": res.Filed, "dropped": res.Dropped, "failed": res.Failed})
 	})
+	if err != nil {
+		return res, err
+	}
+	err = reviewFindings(ctx, in.OrderID, b, &res)
 	return res, err
 }
 
@@ -748,7 +760,7 @@ func (d *Daemon) planFiling(ctx context.Context, orderID string, fs []store.Find
 }
 
 // fileFinding is the file-finding step: it files finding key of order
-// orderID with blockers, under the marker "finding <nonce>
+// orderID with blockers (createFindingIssue), under the marker "finding <nonce>
 // <order>/<key>" since b.Since, so a re-run finds the issue a lost answer
 // created and adds only its missing links. A finding no longer new (a
 // re-run after it settled) returns its row as it is.
@@ -773,39 +785,11 @@ func (d *Daemon) fileFinding(ctx context.Context, orderID, key string, blockers 
 	if f.State != store.FindingNew {
 		return filedFinding{State: f.State, Ref: f.Ref}, nil
 	}
-	sameRepo := func(ref string) bool {
-		_, err := d.tracker.Canon(ref)
-		return err == nil
-	}
-	it := tracker.Item{Title: findingTitle(f.Title, sameRepo), Body: findingBody(f, orderID),
-		Labels: append(slices.Clone(f.Labels), labelUnreviewed), BlockedBy: blockers}
-	m := tracker.Mark{Key: "finding " + b.Nonce + " " + orderID + "/" + key, Since: b.Since}
-	got, err := d.createFinding(ctx, it, m)
-	var notes []store.LogEntry
-	if errors.Is(err, tracker.ErrNotFound) && got.Ref == "" && len(it.BlockedBy) > 0 {
-		var kept []string
-		for _, bl := range it.BlockedBy {
-			gctx, cancel := context.WithTimeout(ctx, trackerCallTimeout)
-			_, gerr := d.tracker.Get(gctx, bl)
-			cancel()
-			if errors.Is(gerr, tracker.ErrNotFound) {
-				notes = append(notes, store.LogEntry{Kind: logOrder, OrderID: orderID,
-					Text: "finding " + key + ": blocker " + bl + " dropped: " + gerr.Error()})
-				continue
-			}
-			kept = append(kept, bl)
-		}
-		if len(notes) > 0 {
-			it.BlockedBy = kept
-			got, err = d.createFinding(ctx, it, m)
-		}
-	}
-	var note string
+	got, err := d.createFindingIssue(ctx, orderID, f, blockers, b, true)
 	switch {
 	case err == nil:
-	case errors.Is(err, tracker.ErrLabels) && got.Ref != "":
-		note = clip(err.Error(), maxFindingWhy)
 	case got.Ref != "":
+		// A link that failed: the retry adds it.
 		if serr := d.store.SetFindingRef(ctx, orderID, key, got.Ref); serr != nil {
 			return filedFinding{}, errors.Join(err, serr)
 		}
@@ -814,19 +798,105 @@ func (d *Daemon) fileFinding(ctx context.Context, orderID, key string, blockers 
 		return filedFinding{}, err
 	}
 	text := "finding " + key + " filed as " + got.Ref
-	if note != "" {
-		text += " (" + note + ")"
+	if got.Note != "" {
+		text += " (" + got.Note + ")"
 	}
 	entry, err := logEntry(logOrder, "", orderID, text, map[string]any{"key": key, "ref": got.Ref})
 	if err != nil {
 		return filedFinding{}, err
 	}
-	settled, err := d.store.SettleFinding(ctx, orderID, key, store.FindingFiled, got.Ref, note, append(notes, entry)...)
+	settled, err := d.store.SettleFinding(ctx, orderID, key, store.FindingFiled, got.Ref, got.Note, append(got.Notes, entry)...)
 	if err != nil || settled {
 		return filedFinding{State: store.FindingFiled, Ref: got.Ref}, err
 	}
 	f, err = d.store.GetFinding(ctx, orderID, key)
 	return filedFinding{State: f.State, Ref: f.Ref}, err
+}
+
+// findingIssue is what createFindingIssue filed: the issue's ref, a note
+// when the tracker dropped its labels, and the notes of blockers dropped
+// because they no longer exist.
+type findingIssue struct {
+	Ref   string
+	Note  string
+	Notes []store.LogEntry
+}
+
+// createFindingIssue files finding f of order orderID as an issue with
+// blockers, under the marker "finding <nonce> <order>/<key>" since
+// b.Since, labelled with the finding's labels, plus bmus:unreviewed when
+// unreviewed (#155's filing; #156's restore files without it). A re-run
+// finds the issue a lost answer created and adds only its missing links.
+//
+//   - Filed without labels the tracker dropped (tracker.ErrLabels): no
+//     error, with the error as Note. Retrying can't add them.
+//   - A ref with any other error (a link that failed): the ref and the
+//     error, so the caller's retry adds the missing links.
+//   - Not found and no ref, with blockers: a blocker that no longer
+//     exists fails Create before it files anything. Each blocker is read
+//     (Get), those not found are dropped with a note, and Create runs
+//     again.
+//   - Without unreviewed, an issue with bmus:unreviewed (one an attempt
+//     whose answer was lost filed under the marker) has it removed, before
+//     a link error returns.
+func (d *Daemon) createFindingIssue(ctx context.Context, orderID string, f store.Finding, blockers []string, b findingsBegin,
+	unreviewed bool) (findingIssue, error) {
+	sameRepo := func(ref string) bool {
+		_, err := d.tracker.Canon(ref)
+		return err == nil
+	}
+	labels := slices.Clone(f.Labels)
+	if unreviewed {
+		labels = append(labels, labelUnreviewed)
+	}
+	it := tracker.Item{Title: findingTitle(f.Title, sameRepo), Body: findingBody(f, orderID), Labels: labels, BlockedBy: blockers}
+	m := findingMark(b, orderID, f.Key)
+	got, err := d.createFinding(ctx, it, m)
+	var out findingIssue
+	if errors.Is(err, tracker.ErrNotFound) && got.Ref == "" && len(it.BlockedBy) > 0 {
+		var kept []string
+		for _, bl := range it.BlockedBy {
+			gctx, cancel := context.WithTimeout(ctx, trackerCallTimeout)
+			_, gerr := d.tracker.Get(gctx, bl)
+			cancel()
+			if errors.Is(gerr, tracker.ErrNotFound) {
+				out.Notes = append(out.Notes, store.LogEntry{Kind: logOrder, OrderID: orderID,
+					Text: "finding " + f.Key + ": blocker " + bl + " dropped: " + gerr.Error()})
+				continue
+			}
+			kept = append(kept, bl)
+		}
+		if len(out.Notes) > 0 {
+			it.BlockedBy = kept
+			got, err = d.createFinding(ctx, it, m)
+		}
+	}
+	out.Ref = got.Ref
+	if !unreviewed && got.Ref != "" && slices.ContainsFunc(got.Labels, func(l string) bool { return strings.EqualFold(l, labelUnreviewed) }) {
+		// Before any link error returns: an issue found under the marker
+		// loses the label whatever else is left to do.
+		uctx, cancel := context.WithTimeout(ctx, trackerCallTimeout)
+		uerr := d.tracker.Unlabel(uctx, got.Ref, labelUnreviewed)
+		cancel()
+		if uerr != nil {
+			return out, errors.Join(err, uerr)
+		}
+	}
+	switch {
+	case err == nil:
+	case errors.Is(err, tracker.ErrLabels) && got.Ref != "":
+		out.Note = clip(err.Error(), maxFindingWhy)
+	default:
+		return out, err
+	}
+	return out, nil
+}
+
+// findingMark is the marker finding key of order orderID is filed under:
+// "finding <nonce> <order>/<key>" since b.Since. A restore (#156) files
+// under the same one.
+func findingMark(b findingsBegin, orderID, key string) tracker.Mark {
+	return tracker.Mark{Key: "finding " + b.Nonce + " " + orderID + "/" + key, Since: b.Since}
 }
 
 // createFinding is one Create, bounded by trackerCallTimeout.

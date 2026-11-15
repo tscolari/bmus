@@ -12,6 +12,7 @@ import (
 	"github.com/dbos-inc/dbos-transact-golang/dbos"
 
 	"github.com/tscolari/bmus/internal/comms"
+	"github.com/tscolari/bmus/internal/regs"
 	"github.com/tscolari/bmus/internal/store"
 )
 
@@ -209,7 +210,12 @@ func (d *Daemon) CreateOrder(ctx context.Context, o store.Order) (string, error)
 // (notifyHailClosed). It returns once the message is queued for the
 // mission, not once the beam has it; the mission sends the answer command.
 // A bridge-raised hail (#152) has no mission: nothing is sent to one, and
-// notifyHailClosed wakes the workflow that raised it (deliver_to).
+// notifyHailClosed wakes the workflow that raised it (deliver_to). A
+// tracker_review hail's decision is checked against its context and
+// stored in normal form, option 1 when it discards anything, else 0
+// (checkReviewAnswer, #156); option 0 alone keeps every issue and option 1
+// discards every one. A findings_triage hail is Command's alone and is
+// refused.
 func (d *Daemon) AnswerHail(ctx context.Context, hailID, decision string, option *int) error {
 	h, err := d.store.GetHail(ctx, hailID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -221,16 +227,27 @@ func (d *Daemon) AnswerHail(ctx context.Context, hailID, decision string, option
 	if h.Status != store.HailOpen {
 		return fmt.Errorf("hail %s is %s: %w", hailID, h.Status, store.ErrHailClosed)
 	}
+	if h.Category == categoryFindingsTriage && h.DeliverTo != "" {
+		return badRequest("hail %s is Command's advisory triage; review the issues in its tracker_review hail", hailID)
+	}
+	written := option
 	if option != nil {
 		if *option < 0 || *option >= len(h.Options) {
 			return badRequest("hail %s: option %d out of range (%d options)", hailID, *option, len(h.Options))
 		}
 		if decision == "" {
-			decision = h.Options[*option]
+			decision, written = h.Options[*option], nil
 		}
 	}
 	if decision == "" {
 		return badRequest("a decision or an option is required")
+	}
+	if h.Category == regs.CategoryTrackerReview && h.DeliverTo != "" {
+		// Checked against the review's context, and stored in normal
+		// form with its option (#156). An option alone is its text.
+		if decision, option, err = d.checkReviewAnswer(h, decision, written); err != nil {
+			return err
+		}
 	}
 	if h.Category == comms.CategoryBudget && option == nil {
 		// The harness acts on the option: extend or stop (#119).

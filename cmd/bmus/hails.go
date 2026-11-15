@@ -2,6 +2,7 @@ package main
 
 import (
 	"cmp"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/tscolari/bmus/internal/bridge"
+	"github.com/tscolari/bmus/internal/regs"
 )
 
 func newHailsCmd(a *app) *cobra.Command {
@@ -157,8 +159,131 @@ belayed, withdrawn) count in the total only.
 	metrics.Flags().StringVar(&since, "since", "7d", `how far back: a duration ("7d", "36h") or an RFC 3339 time`)
 	metrics.Flags().BoolVar(&metricsJSON, "json", false, "print JSON")
 
-	cmd.AddCommand(list, answer, countermand, metrics)
+	var (
+		keep             bool
+		discard, restore []string
+		reviewJSON       bool
+	)
+	review := &cobra.Command{
+		Use:   "review <hail-id> [--keep | --discard <ref>...] [--restore <key>...]",
+		Short: "Show a findings review, or answer it",
+		Long: `Show a tracker_review hail's batch: the issues filed from an order's
+findings, and the findings Command's triage dropped or filing failed.
+
+With flags, answer it: --keep keeps every issue, --discard <ref> closes
+that issue as not planned (repeatable; the others are kept), and
+--restore <key> files a dropped or failed finding (repeatable). The
+answer goes through hails answer, which checks it against the batch.
+hails answer --option 0 keeps every issue and --option 1 discards every
+one.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, pos []string) error {
+			if keep && len(discard) > 0 {
+				return errors.New("pass --keep or --discard, not both")
+			}
+			for _, v := range discard {
+				if strings.Trim(v, " ,\t") == "" {
+					return errors.New("--discard needs a ref; to discard every issue, run bmus hails answer <id> --option 1")
+				}
+			}
+			for _, v := range restore {
+				if strings.Trim(v, " ,\t") == "" {
+					return errors.New("--restore needs a key")
+				}
+			}
+			var res bridge.HailsListResult
+			if err := a.call(cmd.Context(), "hails.list", bridge.HailsListArgs{}, &res); err != nil {
+				return err
+			}
+			i := slices.IndexFunc(res.Hails, func(h bridge.HailView) bool { return h.ID == pos[0] })
+			if i < 0 {
+				return fmt.Errorf("no hail %s", pos[0])
+			}
+			h := res.Hails[i]
+			if h.Category != regs.CategoryTrackerReview {
+				return fmt.Errorf("hail %s is %s, not a findings review (tracker_review)", h.ID, dash(h.Category))
+			}
+			if !keep && len(discard) == 0 && len(restore) == 0 {
+				if reviewJSON {
+					return printJSON(cmd.OutOrStdout(), h)
+				}
+				return printReview(cmd.OutOrStdout(), h)
+			}
+			args := bridge.HailsAnswerArgs{HailID: h.ID, Decision: reviewDecision(discard, restore)}
+			var got bridge.HailView
+			if err := a.call(cmd.Context(), "hails.answer", args, &got); err != nil {
+				return err
+			}
+			if reviewJSON {
+				return printJSON(cmd.OutOrStdout(), got)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "%s %s: %s\n", got.ID, got.Status, got.Decision)
+			return nil
+		},
+	}
+	review.Flags().BoolVar(&keep, "keep", false, "keep every issue")
+	review.Flags().StringArrayVar(&discard, "discard", nil, "an issue to discard (repeatable)")
+	review.Flags().StringArrayVar(&restore, "restore", nil, "a dropped or failed finding's key to restore (repeatable)")
+	review.Flags().BoolVar(&reviewJSON, "json", false, "print the hail as JSON")
+
+	cmd.AddCommand(list, answer, countermand, metrics, review)
 	return cmd
+}
+
+// reviewDecision is the tracker_review answer hails review sends: keep,
+// or discard <ref>..., then "; restore <key>..." when there are any.
+func reviewDecision(discard, restore []string) string {
+	s := "keep"
+	if len(discard) > 0 {
+		s = "discard " + strings.Join(discard, " ")
+	}
+	if len(restore) > 0 {
+		s += "; restore " + strings.Join(restore, " ")
+	}
+	return s
+}
+
+// printReview prints tracker_review hail h: its question, then one row per
+// issue, dropped finding and failed finding (N, REF/KEY, STATE, TITLE,
+// WHY), then its decision once it has one. Titles and reasons are the
+// crew's and Command's text: oneLine strips their control characters.
+func printReview(out io.Writer, h bridge.HailView) error {
+	var rc bridge.ReviewContext
+	if len(h.Context) > 0 {
+		if err := json.Unmarshal(h.Context, &rc); err != nil {
+			return fmt.Errorf("hail %s: review context: %w", h.ID, err)
+		}
+	}
+	fmt.Fprintf(out, "%s %s: %s\n", h.ID, h.Status, oneLine(h.Question))
+	w := newTable(out)
+	fmt.Fprintln(w, "N\tREF/KEY\tSTATE\tTITLE\tWHY")
+	n := 0
+	row := func(id, state, title, why string) {
+		n++
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", n, oneLine(id), state, dash(oneLine(title)), dash(oneLine(why)))
+	}
+	for _, is := range rc.Issues {
+		row(is.Ref, "filed", is.Title, "")
+	}
+	for _, f := range rc.Dropped {
+		why := f.Why
+		if f.DuplicateOf != "" && why != "" {
+			why = "duplicate of " + f.DuplicateOf + "; " + why
+		} else if f.DuplicateOf != "" {
+			why = "duplicate of " + f.DuplicateOf
+		}
+		row(f.Key, "dropped", f.Title, why)
+	}
+	for _, f := range rc.Failed {
+		row(f.Key, "failed", f.Title, f.Error)
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	if h.Decision != "" {
+		fmt.Fprintf(out, "decision: %s\n", oneLine(h.Decision))
+	}
+	return nil
 }
 
 // sinceDays matches a --since with a leading day count: "7d", "1d12h".

@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dbos-inc/dbos-transact-golang/dbos"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -76,17 +75,11 @@ func TestHolodeckFindingsRecorded(t *testing.T) {
 }
 
 // findingsResult waits for order id's findings workflow to end and
-// returns its result.
+// returns its result, answering keep to its review once the review is
+// open.
 func findingsResult(t *testing.T, d *Daemon, id string) FindingsResult {
 	t.Helper()
-	require.EventuallyWithT(t, func(c *assert.CollectT) {
-		require.Len(c, workflows(c, d, findingsWorkflowID(id)), 1)
-	}, 60*time.Second, 20*time.Millisecond)
-	h, err := dbos.RetrieveWorkflow[FindingsResult](d.dbos, findingsWorkflowID(id))
-	require.NoError(t, err)
-	res, err := h.GetResult(dbos.WithHandleTimeout(90 * time.Second))
-	require.NoError(t, err)
-	return res
+	return endFindings(t, d, id, reviewKeep)
 }
 
 // findingStep is a holodeck finding step at pct.
@@ -129,7 +122,7 @@ func TestFindingsTriageByCommand(t *testing.T) {
 		require.Len(c, workflows(c, hd.d, missionWorkflowID(id)), 1)
 	}, 30*time.Second, 20*time.Millisecond)
 	require.Equal(t, MissionDone, missionResult(t, hd.d, id).Status)
-	require.Equal(t, FindingsResult{Filed: 2, Dropped: 2}, findingsResult(t, hd.d, id))
+	waitReview(t, hd.d, id)
 
 	names := stepNames(t, hd.d, missionWorkflowID(id))
 	require.Greater(t, slices.Index(names, "count-findings"), slices.Index(names, "current-tour"), names)
@@ -182,6 +175,7 @@ func TestFindingsTriageByCommand(t *testing.T) {
 	require.Contains(t, texts, `finding d-base: blocker other/repo#9 dropped: tracker: bad ref: "other/repo#9" is not #<n>`)
 	require.Contains(t, texts, "finding c-main filed as #4")
 	require.Contains(t, texts, "findings of "+id+": filed 2, dropped 2, failed 0")
+	require.Equal(t, FindingsResult{Filed: 2, Dropped: 2, Kept: 2}, findingsResult(t, hd.d, id))
 }
 
 // Plan decision 3: a failed order's findings are filed. The order hails,
@@ -209,7 +203,7 @@ func TestFindingsOfFailedOrder(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, MissionFailed, missionResult(t, hd.d, id).Status)
 
-	require.Equal(t, FindingsResult{Filed: 1}, findingsResult(t, hd.d, id))
+	require.Equal(t, FindingsResult{Filed: 1, Kept: 1}, findingsResult(t, hd.d, id))
 	it, err := fake.Get(t.Context(), "#1")
 	require.NoError(t, err)
 	require.Equal(t, "Leak", it.Title)
@@ -249,7 +243,7 @@ func TestFindingsTriageUnused(t *testing.T) {
 			hd.addCommand(t)
 			hd.addCrew(t)
 			id := hd.createOrder(t)
-			require.Equal(t, FindingsResult{Filed: 1}, findingsResult(t, hd.d, id))
+			require.Equal(t, FindingsResult{Filed: 1, Kept: 1}, findingsResult(t, hd.d, id))
 			require.Len(t, consults(t, b.stepLog), 1)
 			texts := orderTexts(hd.logEntries(t), id, "")
 			require.Contains(t, texts, "findings of "+id+" filed without triage: "+tc.why)

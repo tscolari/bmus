@@ -368,14 +368,21 @@ func findingsDaemon(t *testing.T, tr tracker.Tracker, cfg *regs.Config, fs ...st
 	return r.d, id
 }
 
-// runFindings runs order id's findings workflow and returns its result.
+// runFindings runs order id's findings workflow and returns its result,
+// answering keep to its review once the review is open.
 func runFindings(t *testing.T, d *Daemon, id string) FindingsResult {
 	t.Helper()
-	h, err := dbos.RunWorkflow(d.dbos, findingsWorkflow, FindingsInput{OrderID: id}, dbos.WithWorkflowID(findingsWorkflowID(id)))
+	_, err := dbos.RunWorkflow(d.dbos, findingsWorkflow, FindingsInput{OrderID: id}, dbos.WithWorkflowID(findingsWorkflowID(id)))
 	require.NoError(t, err)
-	res, err := h.GetResult(dbos.WithHandleTimeout(60 * time.Second))
+	return endFindings(t, d, id, reviewKeep)
+}
+
+// startFindingsWorkflow runs order id's findings workflow without waiting
+// for it.
+func startFindingsWorkflow(t *testing.T, d *Daemon, id string) {
+	t.Helper()
+	_, err := dbos.RunWorkflow(d.dbos, findingsWorkflow, FindingsInput{OrderID: id}, dbos.WithWorkflowID(findingsWorkflowID(id)))
 	require.NoError(t, err)
-	return res
 }
 
 // Plan Verification 6, skipped: with Command not on deck, and with no
@@ -403,7 +410,8 @@ func TestFindingsTriageSkipped(t *testing.T) {
 				store.Finding{Key: "a-leak", Title: "Leak", Body: "Seen by @alice in other/repo#4.", BlockedBy: []string{"b-flake", existing}},
 				store.Finding{Key: "b-flake", Title: "Flake", Labels: []string{"test"}, Severity: "low"},
 				store.Finding{Key: "c-foreign", Title: "Foreign", BlockedBy: []string{"other/repo#9"}})
-			require.Equal(t, FindingsResult{Filed: 3}, runFindings(t, d, id))
+			startFindingsWorkflow(t, d, id)
+			waitReview(t, d, id)
 
 			items, err := fake.List(t.Context(), tracker.Query{})
 			require.NoError(t, err)
@@ -437,7 +445,9 @@ func TestFindingsTriageSkipped(t *testing.T) {
 			require.Contains(t, texts, "findings of "+id+" filed without triage: "+tc.why)
 			require.Contains(t, texts, `finding c-foreign: blocker other/repo#9 dropped: tracker: bad ref: "other/repo#9" is not #<n>`)
 			require.Contains(t, texts, "finding b-flake filed as #2")
-			require.Equal(t, "findings of "+id+": filed 3, dropped 0, failed 0", texts[len(texts)-1])
+			require.Equal(t, "findings of "+id+": filed 3, dropped 0, failed 0", texts[len(texts)-2])
+			require.Equal(t, "the captain asked to review 3 issues filed from "+id+"'s findings", texts[len(texts)-1])
+			require.Equal(t, FindingsResult{Filed: 3, Kept: 3}, endFindings(t, d, id, reviewKeep))
 		})
 	}
 }
@@ -450,7 +460,8 @@ func TestFindingsTrackerDown(t *testing.T) {
 	fake := &creates{Fake: trackertest.Fake{Err: errors.New("tracker down")}}
 	d, id := findingsDaemon(t, fake, defaultRegs(t),
 		store.Finding{Key: "a", Title: "A"}, store.Finding{Key: "b", Title: "B", BlockedBy: []string{"a"}})
-	require.Equal(t, FindingsResult{Failed: 2}, runFindings(t, d, id))
+	startFindingsWorkflow(t, d, id)
+	waitReview(t, d, id)
 	require.Equal(t, 2*(1+retriesBacklogDown), fake.count(), "fewer retries once the backlog was unreadable")
 	got, err := d.store.OrderFindings(t.Context(), id)
 	require.NoError(t, err)
@@ -461,9 +472,11 @@ func TestFindingsTrackerDown(t *testing.T) {
 	texts := orderLogTexts(t, d, id)
 	require.Contains(t, texts, "findings of "+id+" filed without triage: the backlog could not be read: tracker down")
 	require.Contains(t, texts, "finding a not filed: tracker down")
-	require.Equal(t, "findings of "+id+": filed 0, dropped 0, failed 2", texts[len(texts)-1])
-	_, err = d.store.GetHail(t.Context(), "H-0001")
-	require.Error(t, err, "no triage hail")
+	require.Equal(t, "findings of "+id+": filed 0, dropped 0, failed 2", texts[len(texts)-2])
+	h, err := d.store.GetHail(t.Context(), "H-0001")
+	require.NoError(t, err)
+	require.Equal(t, regs.CategoryTrackerReview, h.Category, "no triage hail; the review lists the failed")
+	require.Equal(t, FindingsResult{Failed: 2}, endFindings(t, d, id, reviewKeep))
 }
 
 // Without a tracker nothing is filed: the rows stay new, and one entry
@@ -488,7 +501,7 @@ func TestFindingsWorkflowRetries(t *testing.T) {
 	a, b := fake.Add(tracker.Item{Title: "a"}), fake.Add(tracker.Item{Title: "b"})
 	fake.FailLinks = 1
 	d, id := findingsDaemon(t, fake, nil, store.Finding{Key: "leak", Title: "Leak", BlockedBy: []string{a, b}})
-	require.Equal(t, FindingsResult{Filed: 1}, runFindings(t, d, id))
+	require.Equal(t, FindingsResult{Filed: 1, Kept: 1}, runFindings(t, d, id))
 	it, err := fake.Get(t.Context(), "#3")
 	require.NoError(t, err)
 	require.Equal(t, []string{a, b}, it.BlockedBy)
@@ -498,7 +511,7 @@ func TestFindingsWorkflowRetries(t *testing.T) {
 
 	dropping := &trackertest.Fake{DropLabels: true}
 	d, id = findingsDaemon(t, dropping, nil, store.Finding{Key: "leak", Title: "Leak"})
-	require.Equal(t, FindingsResult{Filed: 1}, runFindings(t, d, id))
+	require.Equal(t, FindingsResult{Filed: 1, Kept: 1}, runFindings(t, d, id))
 	n := 0
 	for _, s := range stepNames(t, d, findingsWorkflowID(id)) {
 		if s == "file-finding" {
@@ -508,7 +521,7 @@ func TestFindingsWorkflowRetries(t *testing.T) {
 	require.Equal(t, 1, n)
 	f, err := d.store.GetFinding(t.Context(), id, "leak")
 	require.NoError(t, err)
-	require.Equal(t, store.FindingFiled, f.State)
+	require.Equal(t, store.FindingKept, f.State, "filed, then kept by the review")
 	require.Contains(t, f.Why, "created without the labels bmus:unreviewed")
 }
 
@@ -561,7 +574,7 @@ func TestFindingsFailedBlocker(t *testing.T) {
 	fake := &creates{fail: map[string]bool{"A": true}}
 	d, id := findingsDaemon(t, fake, nil,
 		store.Finding{Key: "a", Title: "A"}, store.Finding{Key: "b", Title: "B", BlockedBy: []string{"a"}})
-	require.Equal(t, FindingsResult{Filed: 1, Failed: 1}, runFindings(t, d, id))
+	require.Equal(t, FindingsResult{Filed: 1, Failed: 1, Kept: 1}, runFindings(t, d, id))
 	it, err := fake.Get(t.Context(), "#1")
 	require.NoError(t, err)
 	require.Equal(t, "B", it.Title)
@@ -581,10 +594,10 @@ func TestFindingsLinkOutOfRetries(t *testing.T) {
 	d, id := findingsDaemon(t, fake, nil,
 		store.Finding{Key: "a", Title: "A", BlockedBy: []string{existing}},
 		store.Finding{Key: "b", Title: "B", BlockedBy: []string{"a"}})
-	require.Equal(t, FindingsResult{Filed: 2}, runFindings(t, d, id))
+	require.Equal(t, FindingsResult{Filed: 2, Kept: 2}, runFindings(t, d, id))
 	a, err := d.store.GetFinding(t.Context(), id, "a")
 	require.NoError(t, err)
-	require.Equal(t, store.FindingFiled, a.State)
+	require.Equal(t, store.FindingKept, a.State, "filed, then kept by the review")
 	require.Equal(t, "#2", a.Ref)
 	require.Equal(t, "linking #2 to #1 failed", a.Why)
 	b, err := d.store.GetFinding(t.Context(), id, "b")

@@ -312,9 +312,16 @@ func (s *Store) TriageFindings(ctx context.Context, id string, triage []FindingT
 // still new, leaving its state alone: the issue exists, and the findings
 // workflow is still adding its links (#155).
 func (s *Store) SetFindingRef(ctx context.Context, id, key, ref string) error {
+	return s.SetFindingRefIn(ctx, id, key, ref, FindingNew)
+}
+
+// SetFindingRefIn stores ref as finding key's issue while the finding is
+// in state, leaving its state alone: a restore (#156) stores the issue of
+// a dropped or failed finding while it still adds its links.
+func (s *Store) SetFindingRefIn(ctx context.Context, id, key, ref, state string) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `UPDATE findings SET ref = ? WHERE order_id = ? AND key = ? AND state = ?`,
-			ref, id, key, FindingNew)
+			ref, id, key, state)
 		return err
 	})
 }
@@ -325,18 +332,40 @@ func (s *Store) SetFindingRef(ctx context.Context, id, key, ref string) error {
 // finding was still new; one that wasn't is left alone and nothing is
 // logged.
 func (s *Store) SettleFinding(ctx context.Context, id, key, state, ref, why string, entries ...LogEntry) (bool, error) {
-	var settled bool
+	return s.moveFinding(ctx, id, key, []string{FindingNew}, state, ref, &why, entries)
+}
+
+// ReviewFinding moves finding key of order id from state from to state to
+// (kept, discarded or restored), with, when not empty, ref, and why when
+// not nil, and appends entries to the captain's log, in one transaction
+// (#156). It reports whether the finding was in state from; one that
+// wasn't (a review step re-run after its transaction committed) is left
+// alone and nothing is logged.
+func (s *Store) ReviewFinding(ctx context.Context, id, key, from, to, ref string, why *string, entries ...LogEntry) (bool, error) {
+	return s.moveFinding(ctx, id, key, []string{from}, to, ref, why, entries)
+}
+
+// moveFinding is SettleFinding and ReviewFinding: finding key of order id
+// moves from one of from to state, with ref when not empty and why when
+// not nil, and entries are logged, in one transaction, when it was in
+// one of from.
+func (s *Store) moveFinding(ctx context.Context, id, key string, from []string, state, ref string, why *string, entries []LogEntry) (bool, error) {
+	var moved bool
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `UPDATE findings SET state = ?, why = ?, ref = CASE WHEN ? = '' THEN ref ELSE ? END
-			WHERE order_id = ? AND key = ? AND state = ?`, state, why, ref, ref, id, key, FindingNew)
-		if err != nil {
+		var cur string
+		err := tx.QueryRowContext(ctx, `SELECT state FROM findings WHERE order_id = ? AND key = ?`, id, key).Scan(&cur)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil || !slices.Contains(from, cur) {
 			return err
 		}
-		n, err := res.RowsAffected()
-		if err != nil || n == 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE findings SET state = ?, why = CASE WHEN ? THEN ? ELSE why END,
+			ref = CASE WHEN ? = '' THEN ref ELSE ? END WHERE order_id = ? AND key = ?`,
+			state, why != nil, deref(why), ref, ref, id, key); err != nil {
 			return err
 		}
-		settled = true
+		moved = true
 		for _, e := range entries {
 			if _, err := s.appendLog(ctx, tx, e); err != nil {
 				return err
@@ -344,5 +373,13 @@ func (s *Store) SettleFinding(ctx context.Context, id, key, state, ref, why stri
 		}
 		return nil
 	})
-	return settled, err
+	return moved, err
+}
+
+// deref is *p, or "" for nil.
+func deref(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }

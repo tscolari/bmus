@@ -249,3 +249,57 @@ func TestFindingWorkflowWrites(t *testing.T) {
 	_, err = s.GetFinding(ctx, id, "missing")
 	require.ErrorIs(t, err, sql.ErrNoRows)
 }
+
+// ReviewFinding moves a row only from the state given, keeps why unless
+// one is given, and logs only when it moved it (#156).
+func TestReviewFinding(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := openTest(t)
+	id, err := s.InsertOrder(ctx, Order{Title: "t", Assignee: "a"}, LogEntry{Kind: "order"})
+	require.NoError(t, err)
+	for i, k := range []string{"a", "b"} {
+		_, err := s.RecordInbox(ctx, "a", 0, uint64(i+1), func(tx InboxTx) error {
+			return tx.RecordFinding(id, Finding{Key: k, Title: k}, time.Time{})
+		})
+		require.NoError(t, err)
+	}
+	_, err = s.SettleFinding(ctx, id, "a", FindingFiled, "#1", "labels dropped")
+	require.NoError(t, err)
+	_, err = s.SettleFinding(ctx, id, "b", FindingFailed, "", "tracker down")
+	require.NoError(t, err)
+
+	moved, err := s.ReviewFinding(ctx, id, "a", FindingFiled, FindingKept, "", nil, LogEntry{Kind: "order", OrderID: id, Text: "kept a"})
+	require.NoError(t, err)
+	require.True(t, moved)
+	moved, err = s.ReviewFinding(ctx, id, "a", FindingFiled, FindingDiscarded, "", nil, LogEntry{Kind: "order", OrderID: id, Text: "again"})
+	require.NoError(t, err)
+	require.False(t, moved, "no longer filed")
+	a, err := s.GetFinding(ctx, id, "a")
+	require.NoError(t, err)
+	require.Equal(t, FindingKept, a.State)
+	require.Equal(t, "labels dropped", a.Why)
+	require.Equal(t, "#1", a.Ref)
+
+	none := ""
+	moved, err = s.ReviewFinding(ctx, id, "b", FindingFailed, FindingRestored, "#2", &none)
+	require.NoError(t, err)
+	require.True(t, moved)
+	b, err := s.GetFinding(ctx, id, "b")
+	require.NoError(t, err)
+	require.Equal(t, FindingRestored, b.State)
+	require.Equal(t, "#2", b.Ref)
+	require.Empty(t, b.Why)
+	moved, err = s.ReviewFinding(ctx, id, "missing", FindingFiled, FindingKept, "", nil)
+	require.NoError(t, err)
+	require.False(t, moved)
+
+	entries, err := s.ListLog(ctx, 0)
+	require.NoError(t, err)
+	var texts []string
+	for _, e := range entries {
+		texts = append(texts, e.Text)
+	}
+	require.Contains(t, texts, "kept a")
+	require.NotContains(t, texts, "again")
+}
