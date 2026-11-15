@@ -599,9 +599,10 @@ func (g *GitHub) milestoneNumber(ctx context.Context, title string) (int, error)
 
 // List reads the issues q fits, each with its open blockers. A parent's
 // sub-issues come from the sub-issues API and are filtered here; other
-// queries filter on GitHub's side. Pull requests are left out. With a
-// Limit, paging stops once that many issues fit, and only those have
-// their blockers read.
+// queries filter on GitHub's side, newest first. Pull requests are left
+// out, and an issue a shifted page repeats is read once. With a Limit,
+// paging stops once that many issues fit, and only those have their
+// blockers read.
 func (g *GitHub) List(ctx context.Context, q tracker.Query) ([]tracker.Item, error) {
 	switch q.State {
 	case "", tracker.StateOpen, tracker.StateClosed, tracker.StateAll:
@@ -638,14 +639,21 @@ func (g *GitHub) List(ctx context.Context, q tracker.Query) ([]tracker.Item, err
 			}
 			query.Set("milestone", strconv.Itoa(m))
 		}
+		// Newest first: Limit keeps the newest issues. Paging is by
+		// offset, so an issue filed meanwhile shifts the next page by one
+		// and repeats one already read; seen drops it.
+		query.Set("sort", "created")
+		query.Set("direction", "desc")
 		path = g.repoPath() + "/issues"
 	}
 	var kept []issue
+	seen := map[string]bool{}
 	err := eachPage(ctx, g, path, query, func(page []issue) bool {
 		for _, i := range page {
-			if i.PullRequest != nil && string(i.PullRequest) != "null" {
+			if i.PullRequest != nil && string(i.PullRequest) != "null" || seen[g.refOf(i)] {
 				continue
 			}
+			seen[g.refOf(i)] = true
 			it := g.item(i)
 			it.Parent = parent
 			if !tracker.Fits(it, q) {
@@ -786,7 +794,7 @@ func (g *GitHub) Create(ctx context.Context, it tracker.Item, m tracker.Mark) (t
 		}
 	}
 	if missing := tracker.MissingLabels(it.Labels, out.Labels); len(missing) > 0 {
-		return out, fmt.Errorf("%s created without the labels %s (GitHub drops labels for a token without push access): %w",
+		return out, fmt.Errorf("%s created without the labels %s (GitHub drops labels for a token without push access, or one was removed): %w",
 			out.Ref, strings.Join(missing, ", "), tracker.ErrLabels)
 	}
 	return out, nil
@@ -988,21 +996,54 @@ func (g *GitHub) Comment(ctx context.Context, ref, body string, m tracker.Mark) 
 }
 
 // Unlabel removes label from issue ref. The issue is read first, so a pull
-// request or a missing issue is refused; a 404 from the DELETE after that
-// is GitHub saying the issue lacks the label, which is done.
+// request or a missing issue is refused, and an issue without the label
+// (in any case) is done with no DELETE. The DELETE names the label as the
+// issue spells it, escaped as one path segment. A 404 from it means the
+// label went meanwhile or the issue did: the issue is read again, and the
+// label gone is done. The names "." and ".." are refused, as a path
+// segment of their own would name the directory.
 func (g *GitHub) Unlabel(ctx context.Context, ref, label string) error {
-	if strings.TrimSpace(label) == "" {
+	switch {
+	case strings.TrimSpace(label) == "":
 		return errors.New("unlabel: no label")
+	case label == "." || label == "..":
+		return fmt.Errorf("unlabel: label %q can't be named in a URL path", label)
 	}
-	n, err := g.target(ctx, ref)
+	n, err := g.number(ref)
 	if err != nil {
 		return err
 	}
-	_, err = g.do(ctx, http.MethodDelete, fmt.Sprintf("%s/issues/%d/labels/%s", g.repoPath(), n, url.PathEscape(label)), nil, nil, nil)
-	if errors.Is(err, tracker.ErrNotFound) {
+	i, err := g.getIssue(ctx, n)
+	if err != nil {
+		return err
+	}
+	name, ok := labelOf(i, label)
+	if !ok {
 		return nil
 	}
-	return err
+	_, err = g.do(ctx, http.MethodDelete, fmt.Sprintf("%s/issues/%d/labels/%s", g.repoPath(), n, url.PathEscape(name)), nil, nil, nil)
+	if !errors.Is(err, tracker.ErrNotFound) {
+		return err
+	}
+	again, rerr := g.getIssue(ctx, n)
+	if rerr != nil {
+		return fmt.Errorf("%w (reading %s again: %v)", err, g.ref(n), rerr)
+	}
+	if _, still := labelOf(again, label); still {
+		return err
+	}
+	return nil
+}
+
+// labelOf is i's label named label, compared in any case as GitHub names
+// labels, as i spells it.
+func labelOf(i issue, label string) (string, bool) {
+	for _, l := range i.Labels {
+		if strings.EqualFold(l.Name, label) {
+			return l.Name, true
+		}
+	}
+	return "", false
 }
 
 // Close closes issue ref with GitHub's state_reason. A pull request is

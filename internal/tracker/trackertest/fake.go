@@ -22,8 +22,10 @@ type Comment struct {
 // Fake is an in-memory tracker. Refs are "#<n>", numbered from 1 in
 // creation order. It keeps each item's labels as Create gave them, less
 // those Unlabel removed, and CloseReason reports how each closed item was
-// closed. NoDeps makes it report no dependency data. List takes items in
-// creation order and stops at a Query's Limit.
+// closed. NoDeps makes it report no dependency data, and DropLabels makes
+// Create drop labels as GitHub does for a token without push access. List
+// takes items newest first, as the GitHub adapter does, or in creation
+// order under a Parent (a parent's order), and stops at a Query's Limit.
 // It honours a Mark's key (Since aside): a second Comment on a ref under
 // a key already recorded there posts nothing, and a second Create under
 // a key returns the item filed under it. Its zero value is ready to use;
@@ -36,6 +38,10 @@ type Fake struct {
 	created  map[string]int // Create's key to the item's index
 	// NoDeps makes List and Get report no dependency data (BlockedBy nil).
 	NoDeps bool
+	// DropLabels makes Create store an item without its labels and
+	// return it with tracker.ErrLabels; a retry under the same Mark
+	// returns the same.
+	DropLabels bool
 	// Err, if set, is returned by every call.
 	Err error
 }
@@ -54,10 +60,11 @@ func (f *Fake) Canon(ref string) (string, error) {
 	return ref, nil
 }
 
-// Add files it as Create would and returns its ref.
+// Add files it as Create would and returns its ref. A labels error
+// (DropLabels) is ignored.
 func (f *Fake) Add(it tracker.Item) string {
 	got, err := f.Create(context.Background(), it, tracker.Mark{})
-	if err != nil {
+	if err != nil && !errors.Is(err, tracker.ErrLabels) {
 		panic(err)
 	}
 	return got.Ref
@@ -115,9 +122,13 @@ func (f *Fake) List(_ context.Context, q tracker.Query) ([]tracker.Item, error) 
 		return nil, err
 	}
 	var out []tracker.Item
-	for i := range f.items {
+	for k := range f.items {
 		if q.Limit > 0 && len(out) == q.Limit {
 			break
+		}
+		i := len(f.items) - 1 - k // newest first
+		if q.Parent != "" {
+			i = k
 		}
 		it := f.view(i)
 		if (q.Parent == "" || it.Parent == q.Parent) && tracker.Fits(it, q) {
@@ -137,7 +148,7 @@ func (f *Fake) Create(_ context.Context, it tracker.Item, m tracker.Mark) (track
 		return tracker.Item{}, err
 	}
 	if i, ok := f.created[m.Key]; ok && m.Key != "" {
-		return f.view(i), nil
+		return f.view(i), f.labelsErr(i, it.Labels)
 	}
 	for _, r := range append(slices.Clone(it.BlockedBy), it.Parent) {
 		if r == "" {
@@ -149,7 +160,11 @@ func (f *Fake) Create(_ context.Context, it tracker.Item, m tracker.Mark) (track
 	}
 	it.Ref = "#" + strconv.Itoa(len(f.items)+1)
 	it.State = tracker.StateOpen
+	want := it.Labels
 	it.Labels = slices.Clone(it.Labels)
+	if f.DropLabels {
+		it.Labels = nil
+	}
 	it.BlockedBy = slices.Clone(it.BlockedBy)
 	f.items = append(f.items, it)
 	if m.Key != "" {
@@ -158,7 +173,17 @@ func (f *Fake) Create(_ context.Context, it tracker.Item, m tracker.Mark) (track
 		}
 		f.created[m.Key] = len(f.items) - 1
 	}
-	return f.view(len(f.items) - 1), nil
+	return f.view(len(f.items) - 1), f.labelsErr(len(f.items)-1, want)
+}
+
+// labelsErr is Create's error for items[i] lacking any of want: nil when
+// it has them all.
+func (f *Fake) labelsErr(i int, want []string) error {
+	missing := tracker.MissingLabels(want, f.items[i].Labels)
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s created without the labels %s: %w", f.items[i].Ref, strings.Join(missing, ", "), tracker.ErrLabels)
 }
 
 func (f *Fake) Comment(_ context.Context, ref, body string, m tracker.Mark) error {

@@ -66,8 +66,10 @@ type Item struct {
 
 // Query filters List. Every set field must fit: all of Labels, the
 // Milestone (by title), the Parent ref and the State (StateOpen,
-// StateClosed, or "" for open; "all" for both). Limit is the most items
-// List returns, the first ones in the tracker's order; 0 is no limit.
+// StateClosed, or "" for open; "all" for both). List returns items newest
+// first, or a Parent's in the parent's order. Limit is the most items List
+// returns, the first ones in that order (the newest, without a Parent); 0
+// is no limit.
 type Query struct {
 	Labels    []string
 	Milestone string
