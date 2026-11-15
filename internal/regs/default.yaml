@@ -160,8 +160,9 @@ classify:
     tool: Monitor
     command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+worktree(\s+-\S+)*\s+remove(\s+\S+)*\s+(-[a-zA-Z]*f[a-zA-Z]*|--f\S*)(\s|$)'
   # A write under .git/ (config, hooks, info/attributes), under a bare
-  # repository's x.git/, or to a .git file (a gitfile naming another
-  # repository) can make git run a program later. The rule reads every
+  # repository's x.git/, to a .git file (a gitfile naming another
+  # repository) or to a global git config (~/.gitconfig, ~/.config/git/,
+  # /etc/gitconfig) can make git run a program later. The rule reads every
   # string in the input, not only the path. A question or answer reads
   # every tool's rules, and a Bash hail's question holds its command, so
   # echo x > .git/hooks/pre-commit on Bash fits it too: that is what
@@ -169,16 +170,16 @@ classify:
   # captain as well.
   - tag: external_effect
     tool: Write
-    match: '(?i)\.git/|(^|[\s/\\])\.git(\s|$)'
+    match: '(?i)\.git/|(^|[\s/\\])\.git(\s|$)|\.gitconfig|\.config/git/|(^|[\s/])etc/gitconfig(\s|$)'
   - tag: external_effect
     tool: Edit
-    match: '(?i)\.git/|(^|[\s/\\])\.git(\s|$)'
+    match: '(?i)\.git/|(^|[\s/\\])\.git(\s|$)|\.gitconfig|\.config/git/|(^|[\s/])etc/gitconfig(\s|$)'
   - tag: external_effect
     tool: MultiEdit
-    match: '(?i)\.git/|(^|[\s/\\])\.git(\s|$)'
+    match: '(?i)\.git/|(^|[\s/\\])\.git(\s|$)|\.gitconfig|\.config/git/|(^|[\s/])etc/gitconfig(\s|$)'
   - tag: external_effect
     tool: NotebookEdit
-    match: '(?i)\.git/|(^|[\s/\\])\.git(\s|$)'
+    match: '(?i)\.git/|(^|[\s/\\])\.git(\s|$)|\.gitconfig|\.config/git/|(^|[\s/])etc/gitconfig(\s|$)'
   # Code run inline or from a file, where the rules above can't see it, on
   # the tools that run a command. A script run by another interpreter
   # (python x.py) isn't covered.

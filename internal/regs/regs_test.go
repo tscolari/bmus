@@ -453,6 +453,8 @@ func neverAutoAnswered() []tableCase {
 	}
 	// #131: caught by the .git/ write rule or the Monitor rules alone.
 	captain("Write to .git/config", fromContext(`{"tool": "Write", "input": {"file_path": ".git/config", "content": "[core]\n\tbare = false\n"}}`))
+	captain("Write to ~/.gitconfig", fromContext(`{"tool": "Write", "input": {"file_path": "/home/u/.gitconfig", "content": "[user]\n\tname = x\n"}}`))
+	captain("Edit of /etc/gitconfig", fromContext(`{"tool": "Edit", "input": {"file_path": "/etc/gitconfig", "old_string": "a", "new_string": "b"}}`))
 	captain("Write to a gitfile", fromContext(`{"tool": "Write", "input": {"file_path": "repo/.git", "content": "gitdir: /tmp/x\n"}}`))
 	captain("Monitor git update-ref -d", fromContext(`{"tool": "Monitor", "input": {"command": "git update-ref -d refs/heads/x"}}`))
 	captain("Monitor git --no-pager reflog expire", fromContext(`{"tool": "Monitor", "input": {"command": "git --no-pager reflog expire --all"}}`))
@@ -1114,14 +1116,16 @@ func TestClassifyGitGaps(t *testing.T) {
 		return fromContext(`{"tool": "` + tool + `", "input": {"` + key + `": ` + strconv.Quote(path) + `, "content": "x = 1\n", "new_string": "y"}}`)
 	}
 	for _, path := range []string{".git/config", "/abs/repo/.git/hooks/pre-commit", ".git/info/attributes", "repo/.GIT/config", "srv/x.git/config",
-		".git", "./.git", "/repo/.git", "repo/.GIT", "C:\\repo\\.git"} {
+		".git", "./.git", "/repo/.git", "repo/.GIT", "C:\\repo\\.git",
+		"~/.gitconfig", "/home/u/.gitconfig", "/home/u/.gitconfig.local", "/home/u/.config/git/config", "~/.config/git/attributes", "/etc/gitconfig"} {
 		for _, tool := range []string{"Write", "Edit", "MultiEdit", "NotebookEdit"} {
 			route, tag, rule := c.Classify(write(tool, path))
 			require.Equal(t, RouteCaptain, route, "%s %q", tool, path)
 			require.Equal(t, "external_effect", tag, "%s %q (%s)", tool, path, rule)
 		}
 	}
-	for _, path := range []string{".gitignore", ".github/workflows/x.yml", ".gitattributes", ".gitmodules", "x.git", "docs/git/x.md"} {
+	for _, path := range []string{".gitignore", ".github/workflows/x.yml", ".gitattributes", ".gitmodules", "x.git", "docs/git/x.md",
+		"/home/u/.config/gitx/config", "docs/gitconfig.md", "repo/etc/gitconfigs"} {
 		for _, tool := range []string{"Write", "Edit"} {
 			route, tag, rule := c.Classify(write(tool, path))
 			require.Equal(t, RouteCommand, route, "%s %q (%s)", tool, path, rule)
