@@ -245,7 +245,9 @@ func reviewDecision(discard, restore []string) string {
 
 // printReview prints tracker_review hail h: its question, then one row per
 // issue, dropped finding and failed finding (N, REF/KEY, STATE, TITLE,
-// WHY), then its decision once it has one. Titles and reasons are the
+// WHY), then its decision once it has one. N is the key's number in
+// Command's triage (ReviewContext.Numbers), "-" for an entry without a
+// key. Titles and reasons are the
 // crew's and Command's text: oneLine strips their control characters.
 func printReview(out io.Writer, h bridge.HailView) error {
 	var rc bridge.ReviewContext
@@ -257,13 +259,16 @@ func printReview(out io.Writer, h bridge.HailView) error {
 	fmt.Fprintf(out, "%s %s: %s\n", h.ID, h.Status, oneLine(h.Question))
 	w := newTable(out)
 	fmt.Fprintln(w, "N\tREF/KEY\tSTATE\tTITLE\tWHY")
-	n := 0
-	row := func(id, state, title, why string) {
-		n++
-		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", n, oneLine(id), state, dash(oneLine(title)), dash(oneLine(why)))
+	nums := rc.Numbers()
+	row := func(key, id, state, title, why string) {
+		n := "-"
+		if i, ok := nums[key]; ok {
+			n = strconv.Itoa(i)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", n, oneLine(id), state, dash(oneLine(title)), dash(oneLine(why)))
 	}
 	for _, is := range rc.Issues {
-		row(is.Ref, "filed", is.Title, "")
+		row(is.Key, is.Ref, "filed", is.Title, "")
 	}
 	for _, f := range rc.Dropped {
 		why := f.Why
@@ -272,10 +277,10 @@ func printReview(out io.Writer, h bridge.HailView) error {
 		} else if f.DuplicateOf != "" {
 			why = "duplicate of " + f.DuplicateOf
 		}
-		row(f.Key, "dropped", f.Title, why)
+		row(f.Key, f.Key, "dropped", f.Title, why)
 	}
 	for _, f := range rc.Failed {
-		row(f.Key, "failed", f.Title, f.Error)
+		row(f.Key, f.Key, "failed", f.Title, f.Error)
 	}
 	if err := w.Flush(); err != nil {
 		return err

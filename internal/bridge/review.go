@@ -65,6 +65,31 @@ type ReviewFailed struct {
 	Error string `json:"error"`
 }
 
+// Numbers maps each key of rc's issues, dropped and failed findings to
+// its rank among them, from 1 in key order: the number Command's triage
+// gave the finding (triageContext), so a rationale such as "3 is a typo"
+// names the row numbered 3. An empty key gets no number.
+func (rc ReviewContext) Numbers() map[string]int {
+	var keys []string
+	for _, is := range rc.Issues {
+		keys = append(keys, is.Key)
+	}
+	for _, f := range rc.Dropped {
+		keys = append(keys, f.Key)
+	}
+	for _, f := range rc.Failed {
+		keys = append(keys, f.Key)
+	}
+	keys = slices.DeleteFunc(keys, func(k string) bool { return k == "" })
+	slices.Sort(keys)
+	keys = slices.Compact(keys)
+	n := make(map[string]int, len(keys))
+	for i, k := range keys {
+		n[k] = i + 1
+	}
+	return n
+}
+
 // reviewBatch is the raise-review step's recorded result: the review's
 // context, empty when there is nothing to review.
 type reviewBatch struct {

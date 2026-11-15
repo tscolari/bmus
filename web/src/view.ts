@@ -2,7 +2,18 @@
 // functions, no DOM. Tones name the design's palette; app.css maps each
 // to its colour (tone-<name> for text, bg-<name> for fills).
 
-import type { BridgeStatus, CrewView, HailView, LogEntryView, OrderRouteArgs, OrderView } from "./api.js";
+import type {
+  BridgeStatus,
+  CrewView,
+  HailView,
+  LogEntryView,
+  OrderRouteArgs,
+  OrderView,
+  ReviewContext,
+  ReviewDropped,
+  ReviewFailed,
+  ReviewIssue,
+} from "./api.js";
 import type { State } from "./store.js";
 
 export type Tone = "green" | "gold" | "blue" | "red" | "cream" | "grey" | "slate";
@@ -534,6 +545,14 @@ const githubName = /^[A-Za-z0-9_.-]+$/;
  * by segment, keeping its slashes.
  */
 export function githubCompareURL(url: string, branch: string): string | undefined {
+  const repo = githubRepo(url);
+  if (repo === undefined) return undefined;
+  const ref = branch.split("/").map(encodeURIComponent).join("/");
+  return `https://github.com/${repo.owner}/${repo.name}/compare/${ref}?expand=1`;
+}
+
+/** The owner and name of a github.com repo URL, in the forms githubCompareURL takes; undefined for any other URL. */
+function githubRepo(url: string): { owner: string; name: string } | undefined {
   let path: string | undefined;
   const scp = /^(?:[^@/:]+@)?github\.com:(.*)$/i.exec(url);
   if (scp && !url.includes("://")) {
@@ -552,10 +571,10 @@ export function githubCompareURL(url: string, branch: string): string | undefine
   const parts = (path ?? "").replace(/\/$/, "").split("/");
   if (parts.length !== 2) return undefined;
   const owner = parts[0] ?? "";
-  const repo = (parts[1] ?? "").replace(/\.git$/, "");
-  if (!githubName.test(owner) || !githubName.test(repo) || repo === "." || repo === "..") return undefined;
-  const ref = branch.split("/").map(encodeURIComponent).join("/");
-  return `https://github.com/${owner}/${repo}/compare/${ref}?expand=1`;
+  const name = (parts[1] ?? "").replace(/\.git$/, "");
+  const dots = (v: string) => v === "." || v === "..";
+  if (!githubName.test(owner) || !githubName.test(name) || dots(owner) || dots(name)) return undefined;
+  return { owner, name };
 }
 
 /** The mission report's path for order id (#104): /report/<order>, which the console serves as itself. */
@@ -572,4 +591,145 @@ export function pushedTo(state: State, id: string): string | undefined {
     if (m) return m[1];
   }
   return undefined;
+}
+
+/* Bridge hails and the findings review (#152, #156, #157) -------------------- */
+
+/** The hail categories a bridge workflow raises for an order's findings. */
+export const categoryTrackerReview = "tracker_review";
+export const categoryFindingsTriage = "findings_triage";
+
+/** The findings workflow's id prefix: a findings hail's deliver_to is findings/<order>. */
+const findingsWorkflow = "findings/";
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+const str = (v: unknown): string => (typeof v === "string" ? v : "");
+
+/**
+ * The order a bridge-raised hail is about: its context's order, else the
+ * order of a findings/<order> deliver_to, else "". A hail from a beam
+ * names its order itself (order_id).
+ */
+export function bridgeHailOrder(h: HailView): string {
+  const fromContext = isRecord(h.context) ? str(h.context["order"]) : "";
+  if (fromContext !== "") return fromContext;
+  const to = h.deliver_to ?? "";
+  return to.startsWith(findingsWorkflow) ? to.slice(findingsWorkflow.length) : "";
+}
+
+/** How a hail shows on the hails panel: a beam's hail, a bridge hail, the findings review or Command's triage. */
+export function hailKind(h: HailView): "crew" | "bridge" | "review" | "triage" {
+  if (!h.deliver_to) return "crew";
+  if (h.category === categoryTrackerReview) return "review";
+  if (h.category === categoryFindingsTriage) return "triage";
+  return "bridge";
+}
+
+/**
+ * A tracker_review hail's context, read leniently: missing lists are
+ * empty, and an entry without its ref or key is left out, since an answer
+ * can't name it.
+ */
+export function reviewContext(h: HailView): ReviewContext {
+  const c = isRecord(h.context) ? h.context : {};
+  const list = (v: unknown) => (Array.isArray(v) ? v.filter(isRecord) : []);
+  const issues: ReviewIssue[] = list(c["issues"])
+    .map((e) => ({ ref: str(e["ref"]), key: str(e["key"]), title: str(e["title"]) }))
+    .filter((e) => e.ref !== "");
+  const dropped: ReviewDropped[] = list(c["dropped"])
+    .map((e) => ({ key: str(e["key"]), title: str(e["title"]), why: str(e["why"]), ...(str(e["duplicate_of"]) !== "" && { duplicate_of: str(e["duplicate_of"]) }) }))
+    .filter((e) => e.key !== "");
+  const failed: ReviewFailed[] = list(c["failed"])
+    .map((e) => ({ key: str(e["key"]), title: str(e["title"]), error: str(e["error"]) }))
+    .filter((e) => e.key !== "");
+  return { order: bridgeHailOrder(h), issues, dropped, failed };
+}
+
+/**
+ * The review's answer for the boxes ticked, in the bridge's normal form
+ * (#156) except for one thing: discards always name their refs, in the
+ * context's order, even when every issue is ticked, so an answer never
+ * reaches an issue the card didn't show. Then "; restore <key>..." in the
+ * context's order (dropped, then failed). Nothing to discard is keep, and
+ * restores alone are "keep; restore <key>...".
+ */
+export function reviewDecision(rc: ReviewContext, discard: ReadonlySet<string>, restore: ReadonlySet<string>): string {
+  const refs = rc.issues.map((i) => i.ref).filter((r) => discard.has(r));
+  return withRestores(rc, refs.length > 0 ? `discard ${refs.join(" ")}` : "keep", restore);
+}
+
+/**
+ * Keep all's or Discard all's answer with the restores ticked:
+ * "keep; restore <key>..." or "discard; restore <key>...", or undefined
+ * with none, when the option alone says it (option 0 or 1).
+ */
+export function reviewAllDecision(rc: ReviewContext, verb: "keep" | "discard", restore: ReadonlySet<string>): string | undefined {
+  const s = withRestores(rc, verb, restore);
+  return s === verb ? undefined : s;
+}
+
+/** The keys ticked to restore, in the context's order: dropped, then failed. */
+export function restoreKeys(rc: ReviewContext, restore: ReadonlySet<string>): string[] {
+  return [...rc.dropped, ...rc.failed].map((f) => f.key).filter((k) => restore.has(k));
+}
+
+function withRestores(rc: ReviewContext, head: string, restore: ReadonlySet<string>): string {
+  const keys = restoreKeys(rc, restore);
+  return keys.length > 0 ? `${head}; restore ${keys.join(" ")}` : head;
+}
+
+/**
+ * Each key of the review's issues, dropped and failed findings mapped to
+ * its rank among them, from 1 in key order: the number Command's triage
+ * gave the finding (#155), so a rationale such as "3 is a typo" names the
+ * row numbered 3. Keys are ASCII, so code-unit order is the bridge's byte
+ * order. An empty key gets no number.
+ */
+export function reviewNumbers(rc: ReviewContext): Map<string, number> {
+  const keys = [...new Set([...rc.issues, ...rc.dropped, ...rc.failed].map((e) => e.key).filter((k) => k !== ""))];
+  keys.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return new Map(keys.map((k, i) => [k, i + 1]));
+}
+
+/** What Apply does with the boxes ticked: "Apply keeps 2, discards 1, restores 1". */
+export function reviewSummary(rc: ReviewContext, discard: ReadonlySet<string>, restore: ReadonlySet<string>): string {
+  const discards = rc.issues.filter((i) => discard.has(i.ref)).length;
+  return `Apply keeps ${rc.issues.length - discards}, discards ${discards}, restores ${restoreKeys(rc, restore).length}`;
+}
+
+/**
+ * Command's triage rationale for the dropped findings, each distinct text
+ * once: the bridge stores Command's one rationale on every row it drops.
+ */
+export function triageRationale(rc: ReviewContext): string[] {
+  return [...new Set(rc.dropped.map((f) => f.why).filter((w) => w !== ""))];
+}
+
+/** The plural of a count of issues: "1 issue", "3 issues". */
+export function issuesText(n: number): string {
+  return `${n} issue${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * The web page of a tracker ref, or undefined. Only a GitHub adapter ref,
+ * owner/name#N, gets one, and only when a registered repo's URL is that
+ * github.com repo (githubRepo): the console knows no tracker's address,
+ * and a guessed host could point anywhere. "#12", another tracker's ref
+ * or a repo that isn't registered stays text.
+ */
+export function issueURL(ref: string, repoUrls: Readonly<Record<string, string>>): string | undefined {
+  const m = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]{0,9})$/.exec(ref);
+  if (!m) return undefined;
+  const [, owner = "", name = ""] = m;
+  const registered = Object.values(repoUrls).some((url) => {
+    const r = githubRepo(url);
+    return r !== undefined && r.owner.toLowerCase() === owner.toLowerCase() && r.name.toLowerCase() === name.toLowerCase();
+  });
+  return registered ? `https://github.com/${owner}/${name}/issues/${m[3]}` : undefined;
+}
+
+/** The confirm prompt for discarding every issue: "Close all 3 issues as not planned and restore c-typo?". */
+export function discardAllPrompt(rc: ReviewContext, restore: ReadonlySet<string>): string {
+  const keys = restoreKeys(rc, restore);
+  return `Close all ${issuesText(rc.issues.length)} as not planned${keys.length > 0 ? ` and restore ${keys.join(", ")}` : ""}?`;
 }

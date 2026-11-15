@@ -118,6 +118,40 @@ export interface HailView {
   readonly countermanded_at?: string;
 }
 
+/** An issue filed from a finding, in a tracker_review hail's context: bridge.ReviewIssue. */
+export interface ReviewIssue {
+  /** The tracker's own ref, e.g. owner/name#12 on GitHub. */
+  readonly ref: string;
+  readonly key: string;
+  readonly title: string;
+}
+
+/** A finding Command's triage dropped: bridge.ReviewDropped. */
+export interface ReviewDropped {
+  readonly key: string;
+  readonly title: string;
+  /** Command's rationale. */
+  readonly why: string;
+  /** The issue it repeats; absent when it repeats none. */
+  readonly duplicate_of?: string;
+}
+
+/** A finding filing gave up on: bridge.ReviewFailed. */
+export interface ReviewFailed {
+  readonly key: string;
+  readonly title: string;
+  readonly error: string;
+}
+
+/** A tracker_review hail's context (#156): bridge.ReviewContext. */
+export interface ReviewContext {
+  /** The order whose findings it reviews. */
+  readonly order: string;
+  readonly issues: readonly ReviewIssue[];
+  readonly dropped: readonly ReviewDropped[];
+  readonly failed: readonly ReviewFailed[];
+}
+
 /** A captain's log entry: bridge.LogEntryView. */
 export interface LogEntryView {
   readonly id: number;
