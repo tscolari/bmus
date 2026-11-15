@@ -370,6 +370,7 @@ Exit: a security review of the console and Regulations; a chaos run in holodeck 
 | **Rank** | Tie-break in the single dispatcher (seniority, then time on deck); no distributed locking needed |
 | **Shore leave** | Idle crew past a threshold have their beam removed; return is a fresh beam from the custom image plus restore. Without snapshotting, "image stays ready" means the custom image, not a frozen VM |
 | **Always-on bridge + subspace hails** | Move the bridge daemon to an always-on machine and switch DBOS from SQLite to Postgres (a configuration change, not a rewrite); the laptop becomes a console client, and hails can reach the captain by push/Slack with replies that unblock directly. To verify: how that machine acts as the captain for beams (beams are single-user), and how a new bridge process takes over unfinished workflows |
+| **Local transporters** | Run crew without a Beams tenant (added 2026-11-15, epic #164). Step 1 is a container provider over Docker or Podman, which also works on macOS (#165); step 2 is a Firecracker provider on Linux with KVM, for VM isolation (#166). Both sit behind `transporter.Provider`, share one crew image, and reach inference through a host-side proxy that adds the captain's API key, so no key enters the crew. Egress is enforced per container network or tap, from the same `CreateSpec.Egress` as Beams. TTL is the bridge's own timer, and the tsh login gate stays dormant |
 
 ---
 
