@@ -69,8 +69,10 @@ classify:
   # naming them is no match: checkout of paths (--, ., a glob, or a second
   # word) or with -f/-B, switch -f/-C/--discard-changes, restore of the
   # worktree (anything but --staged alone), branch -D/-f/-M/-C, stash drop
-  # and clear. git checkout main, git checkout -b x origin/main, git
-  # restore --staged x and git branch -d x keep their routes.
+  # and clear, reflog expire and delete, any update-ref (it can delete or
+  # move any ref) and worktree remove -f. git checkout main, git checkout
+  # -b x origin/main, git restore --staged x, git branch -d x and git
+  # worktree remove x keep their routes.
   - tag: destructive
     tool: Bash
     command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+checkout((\s+\S+)*\s+(--|-[a-zA-Z]*[fB][a-zA-Z]*|--f\S*|[.:*?\[]\S*|\S*[*?:\[]\S*)(\s|$)|(\s+(-[bB]\s+\S+|-[^bB\s-]\S*|-[bB]\S+|--\S*))*\s+[^-\s]\S*(\s+(-[bB]\s+\S+|-[^bB\s-]\S*|-[bB]\S+|--\S*))*\s+[^-\s]\S*)'
@@ -87,6 +89,15 @@ classify:
     tool: Bash
     command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+stash(\s+-\S+)*\s+(drop|clear)(\s|$)'
   - tag: destructive
+    tool: Bash
+    command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+reflog(\s+-\S+)*\s+(expire|delete)(\s|$)'
+  - tag: destructive
+    tool: Bash
+    command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+update-ref(\s|$)'
+  - tag: destructive
+    tool: Bash
+    command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+worktree(\s+-\S+)*\s+remove(\s+\S+)*\s+(-[a-zA-Z]*f[a-zA-Z]*|--f\S*)(\s|$)'
+  - tag: destructive
     tool: Monitor
     command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+checkout((\s+\S+)*\s+(--|-[a-zA-Z]*[fB][a-zA-Z]*|--f\S*|[.:*?\[]\S*|\S*[*?:\[]\S*)(\s|$)|(\s+(-[bB]\s+\S+|-[^bB\s-]\S*|-[bB]\S+|--\S*))*\s+[^-\s]\S*(\s+(-[bB]\s+\S+|-[^bB\s-]\S*|-[bB]\S+|--\S*))*\s+[^-\s]\S*)'
   - tag: destructive
@@ -101,6 +112,36 @@ classify:
   - tag: destructive
     tool: Monitor
     command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+stash(\s+-\S+)*\s+(drop|clear)(\s|$)'
+  - tag: destructive
+    tool: Monitor
+    command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+reflog(\s+-\S+)*\s+(expire|delete)(\s|$)'
+  - tag: destructive
+    tool: Monitor
+    command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+update-ref(\s|$)'
+  - tag: destructive
+    tool: Monitor
+    command: '^(?i:git)(\s+(-[cC]\s+\S+|--(git-dir|work-tree|namespace|exec-path|super-prefix|config-env)\s+\S+|-[^-cC\s]\S*|-[cC]\S+|--\S+))*\s+worktree(\s+-\S+)*\s+remove(\s+\S+)*\s+(-[a-zA-Z]*f[a-zA-Z]*|--f\S*)(\s|$)'
+  # A write under .git/ (config, hooks, info/attributes), under a bare
+  # repository's x.git/, to a .git file (a gitfile naming another
+  # repository) or to a global git config (~/.gitconfig, ~/.config/git/,
+  # /etc/gitconfig) can make git run a program later. The rule reads every
+  # string in the input, not only the path. A question or answer reads
+  # every tool's rules, and a Bash hail's question holds its command, so
+  # echo x > .git/hooks/pre-commit on Bash fits it too: that is what
+  # catches Bash writes into .git/. A read like cat .git/HEAD goes to the
+  # captain as well.
+  - tag: external_effect
+    tool: Write
+    match: '(?i)\.git/|(^|[\s/\\])\.git(\s|$)|\.gitconfig|\.config/git/|(^|[\s/])etc/gitconfig(\s|$)'
+  - tag: external_effect
+    tool: Edit
+    match: '(?i)\.git/|(^|[\s/\\])\.git(\s|$)|\.gitconfig|\.config/git/|(^|[\s/])etc/gitconfig(\s|$)'
+  - tag: external_effect
+    tool: MultiEdit
+    match: '(?i)\.git/|(^|[\s/\\])\.git(\s|$)|\.gitconfig|\.config/git/|(^|[\s/])etc/gitconfig(\s|$)'
+  - tag: external_effect
+    tool: NotebookEdit
+    match: '(?i)\.git/|(^|[\s/\\])\.git(\s|$)|\.gitconfig|\.config/git/|(^|[\s/])etc/gitconfig(\s|$)'
   # Code run inline or from a file, where the rules above can't see it, on
   # the tools that run a command. A script run by another interpreter
   # (python x.py) isn't covered.

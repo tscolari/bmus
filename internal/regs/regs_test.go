@@ -429,6 +429,36 @@ func neverAutoAnswered() []tableCase {
 		{"git stash drop", "git stash drop"},
 		{"git stash clear", "git stash clear"},
 		{"git stash drop after &&", "git stash && git stash drop stash@{0}"},
+		{"git reflog expire", "git reflog expire --expire=now --all"},
+		{"git reflog expire unreachable", "git reflog expire --expire-unreachable=now --all"},
+		{"bare git reflog expire", "git reflog expire"},
+		{"git -C reflog expire", "git -C repo reflog expire --expire=now --all"},
+		{"git --no-pager reflog expire", "git --no-pager reflog expire --expire=now --all"},
+		{"git reflog delete", "git reflog delete HEAD@{1}"},
+		{"git update-ref -d", "git update-ref -d refs/heads/x"},
+		{"git update-ref -m -d", "git update-ref -m gone -d refs/heads/x abc123"},
+		{"git update-ref --no-deref -d", "git update-ref --no-deref -d HEAD"},
+		{"git -C update-ref -d", "git -C repo update-ref -d refs/heads/x"},
+		{"git update-ref --stdin", "printf 'delete refs/heads/x\\n' | git update-ref --stdin"},
+		{"git update-ref zero oid", "git update-ref refs/heads/x 0000000000000000000000000000000000000000"},
+		{"git update-ref move", "git update-ref refs/heads/main HEAD~5"},
+		{"git worktree remove --force", "git worktree remove --force x"},
+		{"git worktree remove -f", "git worktree remove -f x"},
+		{"git worktree remove -f -f", "git worktree remove -f -f x"},
+		{"git worktree remove x --force", "git worktree remove x --force"},
+		{"git -C worktree remove --force", "git -C repo worktree remove --force ../x"},
+		{"git --git-dir worktree remove -f", "git --git-dir .git worktree remove -f x"},
+	} {
+		captain(c[0], bash(c[1]))
+	}
+	// #131: caught by the .git/ write rule or the Monitor rules alone.
+	captain("Write to .git/config", fromContext(`{"tool": "Write", "input": {"file_path": ".git/config", "content": "[core]\n\tbare = false\n"}}`))
+	captain("Write to ~/.gitconfig", fromContext(`{"tool": "Write", "input": {"file_path": "/home/u/.gitconfig", "content": "[user]\n\tname = x\n"}}`))
+	captain("Edit of /etc/gitconfig", fromContext(`{"tool": "Edit", "input": {"file_path": "/etc/gitconfig", "old_string": "a", "new_string": "b"}}`))
+	captain("Write to a gitfile", fromContext(`{"tool": "Write", "input": {"file_path": "repo/.git", "content": "gitdir: /tmp/x\n"}}`))
+	captain("Monitor git update-ref -d", fromContext(`{"tool": "Monitor", "input": {"command": "git update-ref -d refs/heads/x"}}`))
+	captain("Monitor git --no-pager reflog expire", fromContext(`{"tool": "Monitor", "input": {"command": "git --no-pager reflog expire --all"}}`))
+	for _, c := range [][2]string{
 
 		// external_effect: shells, eval and inline interpreters.
 		{"bash -c", `bash -c "git push"`},
@@ -776,6 +806,11 @@ func TestDefaultCaptainOnly(t *testing.T) {
 		{"destructive", `\s+restore`},
 		{"destructive", `\s+branch`},
 		{"destructive", `\s+stash`},
+		// #131's.
+		{"destructive", `\s+reflog`},
+		{"destructive", `\s+update-ref`},
+		{"destructive", `\s+worktree`},
+		{"external_effect", `\.git/`},
 	} {
 		require.True(t, tagged(want[0], want[1]), "no %s rule matching %s", want[0], want[1])
 	}
@@ -932,6 +967,15 @@ func TestClassifyDefault(t *testing.T) {
 		"git stash":                                            RouteCommand,
 		"git stash pop":                                        RouteCommand,
 		"git stash list":                                       RouteCommand,
+		"git reflog":                                           RouteCommand,
+		"git reflog show":                                      RouteCommand,
+		"git reflog show --all":                                RouteCommand,
+		"git worktree remove x":                                RouteCommand,
+		"git worktree list":                                    RouteCommand,
+		"git worktree add ../x -b y":                           RouteCommand,
+		"git worktree prune":                                   RouteCommand,
+		"git commit -m \"git reflog expire\"":                  RouteCommand,
+		"git commit -m \"git worktree remove --force x\"":      RouteCommand,
 		"git log --oneline -- x.go":                            RouteCommand,
 		"git diff -- .":                                        RouteCommand,
 		"git commit -m \"checkout -- . then git branch -D x\"": RouteCommand,
@@ -1011,6 +1055,107 @@ func TestClassifyDefault(t *testing.T) {
 	// Opaque rules don't read prose: a question ending in ? is no glob.
 	route, _, _ = c.Classify(Hail{Category: "clarifying_question", Question: "Proceed?", Options: []string{"Yes", "No"}})
 	require.Equal(t, RouteCommand, route)
+}
+
+// #131: reflog expire, update-ref -d and worktree remove --force are
+// destructive on Bash and Monitor, and a write under .git/ is an external
+// effect. Neighbours of each keep their route.
+func TestClassifyGitGaps(t *testing.T) {
+	t.Parallel()
+	c := load(t, writeRegs(t, string(Default)))
+	monitor := func(cmd string) Hail {
+		return fromContext(`{"tool": "Monitor", "input": {"command": ` + strconv.Quote(cmd) + `}}`)
+	}
+	for _, cmd := range []string{
+		"git reflog expire --expire=now --all",
+		"git reflog expire --expire-unreachable=now --all",
+		"git reflog expire",
+		"git -C repo reflog expire --expire=now --all",
+		"git reflog delete HEAD@{1}",
+		"git update-ref -d refs/heads/x",
+		"git update-ref -m gone -d refs/heads/x abc123",
+		"git -C repo update-ref -d refs/heads/x",
+		"git update-ref --stdin < cmds",
+		"git update-ref refs/heads/x HEAD",
+		"git update-ref refs/heads/x 0000000000000000000000000000000000000000",
+		"git update-ref refs/heads/main HEAD~5",
+		"git --no-pager reflog expire --expire=now --all",
+		"git worktree remove --force x",
+		"git worktree remove -f x",
+		"git worktree remove x --force",
+		"git -C repo worktree remove --force ../x",
+		"git -c core.x=y worktree remove -f x",
+	} {
+		for _, h := range []Hail{bash(cmd), monitor(cmd)} {
+			route, tag, rule := c.Classify(h)
+			require.Equal(t, RouteCaptain, route, "%s %q", h.Tool, cmd)
+			require.Equal(t, "destructive", tag, "%s %q (%s)", h.Tool, cmd, rule)
+		}
+	}
+	for _, cmd := range []string{
+		"git reflog",
+		"git reflog show",
+		"git worktree remove x",
+		"git worktree list",
+		`git commit -m "git reflog expire"`,
+		`git commit -m "git update-ref -d x and git worktree remove --force y"`,
+		"git log --grep update-ref",
+	} {
+		for _, h := range []Hail{bash(cmd), monitor(cmd)} {
+			route, tag, rule := c.Classify(h)
+			require.Equal(t, RouteCommand, route, "%s %q (%s)", h.Tool, cmd, rule)
+			require.Empty(t, tag, "%s %q", h.Tool, cmd)
+		}
+	}
+
+	write := func(tool, path string) Hail {
+		key := "file_path"
+		if tool == "NotebookEdit" {
+			key = "notebook_path"
+		}
+		return fromContext(`{"tool": "` + tool + `", "input": {"` + key + `": ` + strconv.Quote(path) + `, "content": "x = 1\n", "new_string": "y"}}`)
+	}
+	for _, path := range []string{".git/config", "/abs/repo/.git/hooks/pre-commit", ".git/info/attributes", "repo/.GIT/config", "srv/x.git/config",
+		".git", "./.git", "/repo/.git", "repo/.GIT", "C:\\repo\\.git",
+		"~/.gitconfig", "/home/u/.gitconfig", "/home/u/.gitconfig.local", "/home/u/.config/git/config", "~/.config/git/attributes", "/etc/gitconfig"} {
+		for _, tool := range []string{"Write", "Edit", "MultiEdit", "NotebookEdit"} {
+			route, tag, rule := c.Classify(write(tool, path))
+			require.Equal(t, RouteCaptain, route, "%s %q", tool, path)
+			require.Equal(t, "external_effect", tag, "%s %q (%s)", tool, path, rule)
+		}
+	}
+	for _, path := range []string{".gitignore", ".github/workflows/x.yml", ".gitattributes", ".gitmodules", "x.git", "docs/git/x.md",
+		"/home/u/.config/gitx/config", "docs/gitconfig.md", "repo/etc/gitconfigs"} {
+		for _, tool := range []string{"Write", "Edit"} {
+			route, tag, rule := c.Classify(write(tool, path))
+			require.Equal(t, RouteCommand, route, "%s %q (%s)", tool, path, rule)
+			require.Empty(t, tag, "%s %q", tool, path)
+		}
+	}
+	// A .git URL mid-text is no .git path.
+	route, tag, _ := c.Classify(fromContext(`{"tool": "Write", "input": {"file_path": "README.md", "content": "git clone https://example.com/x/y.git here"}}`))
+	require.Equal(t, RouteCommand, route)
+	require.Empty(t, tag)
+	// The rule reads the whole input: content naming .git/ fits too.
+	route, tag, _ = c.Classify(fromContext(`{"tool": "Write", "input": {"file_path": "README.md", "content": "see .git/config"}}`))
+	require.Equal(t, RouteCaptain, route)
+	require.Equal(t, "external_effect", tag)
+	// Read is no write.
+	route, _, _ = c.Classify(fromContext(`{"tool": "Read", "input": {"file_path": ".git/config"}}`))
+	require.Equal(t, RouteCommand, route)
+	// A question reads every tool's rules, and a Bash hail's question
+	// holds its command: that is what catches a Bash write into .git/.
+	h := bash("echo x > .git/hooks/pre-commit")
+	h.Question = "Run `echo x > .git/hooks/pre-commit`?"
+	route, tag, _ = c.Classify(h)
+	require.Equal(t, RouteCaptain, route)
+	require.Empty(t, tag, "no Bash rule tags the command itself")
+	h = bash("cat .git/HEAD")
+	route, _, _ = c.Classify(h)
+	require.Equal(t, RouteCommand, route)
+	h.Question = "Run `cat .git/HEAD`?"
+	route, _, _ = c.Classify(h)
+	require.Equal(t, RouteCaptain, route)
 }
 
 // auto_allow fails closed: even a rule allowing any Bash command refuses
