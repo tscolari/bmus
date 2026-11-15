@@ -615,7 +615,7 @@ describe("sdk harness", () => {
     const ok = (key: string) => ({ content: [{ type: "text", text: `Finding ${key} recorded: the bridge files it as an issue when the order ends.` }] });
     const run = start(async function* (agent) {
       yield init;
-      expect(await agent.callTool("file_finding", { key: "snapshot-leak", title: "  Snapshot writer leaks a handle  ", body: "Short writes skip the close." })).toEqual(ok("snapshot-leak"));
+      expect(await agent.callTool("file_finding", { key: "snapshot-leak", title: "  Snapshot writer leaks a handle  ", body: "Short writes skip the close.", labels: [" bug "] })).toEqual(ok("snapshot-leak"));
       const full = { key: "flaky-test", title: "TestSnapshot is flaky", body: "", labels: ["bug", "tests"], severity: "high", blocked_by: ["snapshot-leak", "#12", "example/app#40"] };
       expect(await agent.callTool("file_finding", full)).toEqual(ok("flaky-test"));
       // The same key replaces: it is sent again and doesn't count twice.
@@ -635,6 +635,11 @@ describe("sdk harness", () => {
         { key: "k", title: "t", body: "", labels: ["a,b"] },
         { key: "k", title: "t", body: "", labels: [long(51)] },
         { key: "k", title: "t", body: "", labels: [""] },
+        { key: "k", title: "t", body: "", labels: [" "] },
+        { key: "k", title: "t", body: "", labels: ["a\tb"] },
+        { key: "k", title: "t", body: "", labels: ["bmus:unreviewed"] },
+        { key: "k", title: "t", body: "", labels: ["BMUS:kept"] },
+        { key: "k", title: "t\u001b[2J", body: "" },
         { key: "k", title: "t", body: "", severity: "critical" },
         { key: "k", title: "t", body: "", blocked_by: ["Not A Key"] },
         { key: "k", title: "t", body: "", blocked_by: ["owner/repo"] },
@@ -658,7 +663,7 @@ describe("sdk harness", () => {
     expect(run.emitted).toHaveLength(findings.length); // no hail
     expect(findings).toHaveLength(22);
     expect(findings.slice(0, 3)).toEqual([
-      { key: "snapshot-leak", title: "Snapshot writer leaks a handle", body: "Short writes skip the close." },
+      { key: "snapshot-leak", title: "Snapshot writer leaks a handle", body: "Short writes skip the close.", labels: ["bug"] },
       { key: "flaky-test", title: "TestSnapshot is flaky", body: "", labels: ["bug", "tests"], severity: "high", blocked_by: ["snapshot-leak", "#12", "example/app#40"] },
       { key: "snapshot-leak", title: "Snapshot writer leaks two handles", body: "Both temp files." },
     ]);

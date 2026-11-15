@@ -86,3 +86,20 @@ func TestPrintHailsBridgeHail(t *testing.T) {
 	require.Regexp(t, `(?m)^H-0001\s+-\s+-\s+tracker_review\s+open\s+Review 5 issues\?\s+0=keep 1=discard\s+-$`, b.String())
 	require.Regexp(t, `(?m)^H-0002\s+ORD-0002\s+sorell\s+clarifying_question\s+decided\s+Which\?\s+-\s+a$`, b.String())
 }
+
+// oneLine collapses whitespace and turns control characters into spaces, so
+// crew text in the log (a finding's title, say) can't move the terminal
+// (#153).
+func TestOneLine(t *testing.T) {
+	t.Parallel()
+	for in, want := range map[string]string{
+		"plain":                     "plain",
+		"  two\n lines\r\n":         "two lines",
+		"tab\there":                 "tab here",
+		"clear \x1b[2Jscreen":       "clear [2Jscreen",
+		"bell\x07 del\x7f c1\u009b": "bell del c1",
+		"nul\x00byte":               "nul byte",
+	} {
+		require.Equal(t, want, oneLine(in), "%q", in)
+	}
+}

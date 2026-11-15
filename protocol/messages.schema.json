@@ -150,9 +150,9 @@
       "required": ["key", "title", "body"],
       "properties": {
         "key": {"description": "The finding's key within its order, which fits a tracker marker key. Reusing it replaces the earlier finding.", "$ref": "#/$defs/finding_key"},
-        "title": {"description": "The issue's title: one line.", "type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\r\\n]*\\S[^\\r\\n]*$"},
+        "title": {"description": "The issue's title: one line, without control characters.", "type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\x00-\\x1f\\x7f]*[^\\s\\x00-\\x1f\\x7f][^\\x00-\\x1f\\x7f]*$"},
         "body": {"description": "The issue's body (markdown). At most 32 KiB of UTF-8.", "type": "string", "maxLength": 32768},
-        "labels": {"description": "Labels for the issue, beside the bridge's own.", "type": "array", "maxItems": 5, "items": {"type": "string", "minLength": 1, "maxLength": 50, "pattern": "^[^,\\r\\n]+$"}},
+        "labels": {"description": "Labels for the issue, beside the bridge's own: no commas, control characters or surrounding spaces, and none starting with bmus: in any letter case, which the bridge reserves.", "type": "array", "maxItems": 5, "items": {"type": "string", "minLength": 1, "maxLength": 50, "pattern": "^[^\\s,\\x00-\\x1f\\x7f]([^,\\x00-\\x1f\\x7f]*[^\\s,\\x00-\\x1f\\x7f])?$", "not": {"pattern": "^[Bb][Mm][Uu][Ss]:"}}},
         "severity": {"enum": ["low", "medium", "high"]},
         "blocked_by": {
           "description": "What the finding waits on: the key of another finding of the same order, or a tracker ref (#12 or owner/name#12).",

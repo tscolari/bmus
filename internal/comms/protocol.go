@@ -323,6 +323,22 @@ var (
 	findingRefRe = regexp.MustCompile(`^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]{1,10}$`)
 )
 
+// ReservedLabelPrefix starts the labels the bridge sets itself (such as
+// bmus:unreviewed); a finding may not carry one, in any letter case.
+const ReservedLabelPrefix = "bmus:"
+
+// ReservedLabel reports whether label starts with ReservedLabelPrefix, in
+// any letter case.
+func ReservedLabel(label string) bool {
+	return len(label) >= len(ReservedLabelPrefix) && strings.EqualFold(label[:len(ReservedLabelPrefix)], ReservedLabelPrefix)
+}
+
+// hasControl reports whether s holds a C0 control character or DEL, as
+// combadge's ONE_LINE refuses.
+func hasControl(s string) bool {
+	return strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f })
+}
+
 // FindingKey reports whether key is a valid finding key.
 func FindingKey(key string) bool { return findingKeyRe.MatchString(key) }
 
@@ -332,8 +348,8 @@ func (b FindingBody) Check() error {
 	switch {
 	case !FindingKey(b.Key):
 		return fmt.Errorf("key %q is not lowercase letters, digits and dashes, 1-40 long, starting with a letter or digit", b.Key)
-	case strings.TrimSpace(b.Title) == "" || strings.ContainsAny(b.Title, "\r\n"):
-		return errors.New("title must be one non-blank line")
+	case strings.TrimSpace(b.Title) == "" || hasControl(b.Title):
+		return errors.New("title must be one non-blank line, without control characters")
 	case utf8.RuneCountInString(b.Title) > MaxFindingTitle:
 		return fmt.Errorf("title is over %d characters", MaxFindingTitle)
 	case len(b.Body) > MaxFindingBody:
@@ -344,8 +360,12 @@ func (b FindingBody) Check() error {
 		return fmt.Errorf("%d blocked_by entries, over %d", len(b.BlockedBy), MaxFindingBlockedBy)
 	}
 	for _, l := range b.Labels {
-		if l == "" || utf8.RuneCountInString(l) > MaxFindingLabel || strings.ContainsAny(l, ",\r\n") {
-			return fmt.Errorf("label %q must be 1-%d characters, without commas or line breaks", l, MaxFindingLabel)
+		switch {
+		case l == "" || utf8.RuneCountInString(l) > MaxFindingLabel || strings.TrimSpace(l) != l ||
+			strings.Contains(l, ",") || hasControl(l):
+			return fmt.Errorf("label %q must be 1-%d characters, without commas, control characters or surrounding spaces", l, MaxFindingLabel)
+		case ReservedLabel(l):
+			return fmt.Errorf("label %q is the bridge's: labels starting with %s are reserved", l, ReservedLabelPrefix)
 		}
 	}
 	switch b.Severity {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -20,12 +21,11 @@ func TestRecordFinding(t *testing.T) {
 	id, err := s.InsertOrder(ctx, Order{Title: "t", Assignee: "a"}, LogEntry{Kind: "order"})
 	require.NoError(t, err)
 	seq := uint64(0)
-	record := func(crew, order string, f Finding) error {
+	recordAt := func(crew string, tour int, seq uint64, order string, f Finding) error {
 		t.Helper()
-		seq++
 		var dropped error
-		recorded, err := s.RecordInbox(ctx, crew, 0, seq, func(tx InboxTx) error {
-			dropped = tx.RecordFinding(order, f)
+		recorded, err := s.RecordInbox(ctx, crew, tour, seq, func(tx InboxTx) error {
+			dropped = tx.RecordFinding(order, f, time.Time{})
 			if errors.Is(dropped, ErrFindingDropped) {
 				return nil
 			}
@@ -34,6 +34,11 @@ func TestRecordFinding(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, recorded)
 		return dropped
+	}
+	record := func(crew, order string, f Finding) error {
+		t.Helper()
+		seq++
+		return recordAt(crew, 0, seq, order, f)
 	}
 	findings := func(order string) []Finding {
 		t.Helper()
@@ -68,6 +73,52 @@ func TestRecordFinding(t *testing.T) {
 	require.Empty(t, got[1].Severity)
 	require.Empty(t, got[1].BlockedBy)
 	require.False(t, got[1].ReceivedAt.Before(first))
+
+	// Each kept finding logged, with its tour and seq.
+	logged := func() []string {
+		t.Helper()
+		entries, err := s.ListLog(ctx, 0)
+		require.NoError(t, err)
+		var out []string
+		for _, e := range entries {
+			if e.Kind == FindingLogKind {
+				require.Equal(t, id, e.OrderID)
+				out = append(out, e.CrewID+" "+e.Text+" "+string(e.Payload))
+			}
+		}
+		return out
+	}
+	require.Equal(t, []string{
+		`a finding leak: Leak {"tour":0,"seq":1,"key":"leak"}`,
+		`a finding flaky: Flaky {"tour":0,"seq":2,"key":"flaky"}`,
+		`a finding leak: Two leaks {"tour":0,"seq":3,"key":"leak"}`,
+	}, logged())
+
+	// Recorded out of seq order after a reconnect: seq 10 then seq 9 of the
+	// same key, and the older one is dropped. A later tour wins over a
+	// higher seq of an earlier one.
+	require.NoError(t, recordAt("a", 0, 10, id, Finding{Key: "leak", Title: "Newer"}))
+	err = recordAt("a", 0, 9, id, Finding{Key: "leak", Title: "Older"})
+	require.ErrorIs(t, err, ErrFindingDropped)
+	require.ErrorContains(t, err, "already has a later version than tour 0 seq 9")
+	require.NoError(t, recordAt("a", 1, 2, id, Finding{Key: "leak", Title: "Next tour"}))
+	err = recordAt("a", 0, 11, id, Finding{Key: "leak", Title: "Earlier tour"})
+	require.ErrorIs(t, err, ErrFindingDropped)
+	require.Equal(t, "Next tour", findings(id)[1].Title)
+	require.Len(t, logged(), 5)
+	seq = 11
+
+	// Reassigned, the order takes the next crew member's findings: its tour
+	// numbers are its own.
+	assign := func(crew string) {
+		t.Helper()
+		_, err := s.db.ExecContext(ctx, `UPDATE orders SET assignee = ? WHERE id = ?`, crew, id)
+		require.NoError(t, err)
+	}
+	assign("b")
+	require.NoError(t, recordAt("b", 0, 1, id, Finding{Key: "leak", Title: "From b"}))
+	require.Equal(t, "b", findings(id)[1].CrewID)
+	assign("a")
 
 	// Fill the order to MaxFindings: the next new key is dropped, a known
 	// one still replaces.

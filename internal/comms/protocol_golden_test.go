@@ -497,6 +497,7 @@ func TestSchemaBudget(t *testing.T) {
 // FindingBody.Check, which the pump runs since nothing validates against
 // the schema at runtime, agrees with the schema on every case.
 func TestSchemaFinding(t *testing.T) {
+	t.Parallel()
 	sch := compileSchema(t)
 	long := func(n int) string { return strings.Repeat("x", n) }
 	keys := func(n int) []string {
@@ -528,6 +529,18 @@ func TestSchemaFinding(t *testing.T) {
 		{"empty label", FindingBody{Key: "k", Title: "t", Labels: []string{""}}, false},
 		{"label with a comma", FindingBody{Key: "k", Title: "t", Labels: []string{"a,b"}}, false},
 		{"label over 50", FindingBody{Key: "k", Title: "t", Labels: []string{long(51)}}, false},
+		{"title with an escape", FindingBody{Key: "k", Title: "t\x1b[2J"}, false},
+		{"title with a tab", FindingBody{Key: "k", Title: "a\tb"}, false},
+		{"title with DEL", FindingBody{Key: "k", Title: "a\x7f"}, false},
+		{"title with a NUL", FindingBody{Key: "k", Title: "a\x00"}, false},
+		{"blank label", FindingBody{Key: "k", Title: "t", Labels: []string{"  "}}, false},
+		{"label with a leading space", FindingBody{Key: "k", Title: "t", Labels: []string{" bug"}}, false},
+		{"label with a trailing space", FindingBody{Key: "k", Title: "t", Labels: []string{"bug "}}, false},
+		{"label with a control character", FindingBody{Key: "k", Title: "t", Labels: []string{"a\x1bb"}}, false},
+		{"reserved label", FindingBody{Key: "k", Title: "t", Labels: []string{"bmus:unreviewed"}}, false},
+		{"reserved label in capitals", FindingBody{Key: "k", Title: "t", Labels: []string{"BMUS:Kept"}}, false},
+		{"label with spaces inside", FindingBody{Key: "k", Title: "t", Labels: []string{"good first issue", "x", "bmus"}}, true},
+		{"label naming bmus later", FindingBody{Key: "k", Title: "t", Labels: []string{"area:bmus:x"}}, true},
 		{"unknown severity", FindingBody{Key: "k", Title: "t", Severity: "critical"}, false},
 		{"eleven blockers", FindingBody{Key: "k", Title: "t", BlockedBy: keys(11)}, false},
 		{"blocker neither key nor ref", FindingBody{Key: "k", Title: "t", BlockedBy: []string{"owner/repo"}}, false},
@@ -535,6 +548,7 @@ func TestSchemaFinding(t *testing.T) {
 		{"blocker ref with a long repo", FindingBody{Key: "k", Title: "t", BlockedBy: []string{long(150) + "/" + long(50) + "#1"}}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			m, err := NewMessage(TypeFinding, tc.body)
 			require.NoError(t, err)
 			m.Seq, m.Crew, m.Order = 1, "sorell", "ORD-0001"

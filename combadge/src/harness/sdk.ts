@@ -209,6 +209,7 @@ import {
   MAX_FINDING_REF,
   MAX_FINDING_TITLE,
   MAX_FINDINGS,
+  RESERVED_LABEL_PREFIX,
   type FindingBody,
   MAX_REORDER_CHANGES,
   MAX_REORDER_IDS,
@@ -1269,7 +1270,9 @@ export const fileFindingInput = {
         .trim()
         .min(1)
         .refine((s) => chars(s) <= MAX_FINDING_LABEL, `a label is at most ${MAX_FINDING_LABEL} characters`)
-        .refine((s) => !/[,\r\n]/.test(s), "a label has no commas or line breaks"),
+        .regex(ONE_LINE, "a label has no control characters")
+        .refine((s) => !s.includes(","), "a label has no commas")
+        .refine((s) => !s.toLowerCase().startsWith(RESERVED_LABEL_PREFIX), `labels starting with ${RESERVED_LABEL_PREFIX} are the bridge's`),
     )
     .max(MAX_FINDING_LABELS)
     .optional(),

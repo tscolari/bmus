@@ -180,8 +180,9 @@ const (
 	// finished (ErrGone). The
 	// payload holds the message (or the raw line) for the operator.
 	UndeliverableLogKind = "undeliverable"
-	// FindingLogKind is for a finding the pump kept on its order (#153).
-	FindingLogKind = "finding"
+	// FindingLogKind is for a finding the pump kept on its order (#153);
+	// store.RecordFinding writes the entry.
+	FindingLogKind = store.FindingLogKind
 )
 
 // Pump is one crew member's comms pump. Start it with StartPump and end it
@@ -809,7 +810,7 @@ func (p *Pump) dispatch(ctx context.Context, tx store.InboxTx, msg Message) erro
 }
 
 // recordFinding keeps a finding on its order, straight to the store in the
-// inbox transaction like usage (#153), and logs it there. One the store
+// inbox transaction like usage (#153); the store logs it there. One the store
 // won't keep (an ended order or another crew member's, a key past the
 // order's cap, a key the findings workflow already took up), one without
 // an order and one with a bad body are dropped with a warning, like a bad
@@ -829,25 +830,11 @@ func (p *Pump) recordFinding(tx store.InboxTx, msg Message) error {
 		return nil
 	}
 	err := tx.RecordFinding(msg.Order, store.Finding{Key: b.Key, Title: b.Title, Body: b.Body,
-		Labels: b.Labels, Severity: b.Severity, BlockedBy: b.BlockedBy})
+		Labels: b.Labels, Severity: b.Severity, BlockedBy: b.BlockedBy}, msg.TS)
 	if errors.Is(err, store.ErrFindingDropped) {
 		p.log.Warn("comms: dropping finding", "seq", msg.Seq, "order", msg.Order, "key", b.Key, "err", err)
 		return nil
 	}
-	if err != nil {
-		return err
-	}
-	payload, err := json.Marshal(struct {
-		Seq uint64 `json:"seq"`
-		Key string `json:"key"`
-	}{msg.Seq, b.Key})
-	if err != nil {
-		return err
-	}
-	_, err = tx.AppendLog(store.LogEntry{
-		TS: msg.TS, Kind: FindingLogKind, CrewID: p.cfg.CrewID, OrderID: msg.Order,
-		Text: fmt.Sprintf("finding %s: %s", b.Key, b.Title), Payload: payload,
-	})
 	return err
 }
 

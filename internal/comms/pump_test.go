@@ -652,7 +652,7 @@ func TestPumpFindingRecorded(t *testing.T) {
 	s.emit(t, beamMsg(t, 1, TypeFinding, id, FindingBody{Key: "leak", Title: "Snapshot leaks", Body: "b",
 		Labels: []string{"bug"}, Severity: "high", BlockedBy: []string{"flaky", "#12"}}))
 	s.emit(t, beamMsg(t, 2, TypeFinding, id, FindingBody{Key: "flaky", Title: "Flaky test"}))
-	s.emit(t, beamMsg(t, 3, TypeFinding, id, FindingBody{Key: "leak", Title: "Snapshot leaks twice"}))
+	s.emit(t, beamMsg(t, 3, TypeFinding, id, FindingBody{Key: "leak", Title: "Snapshot leaks again"}))
 	bad := []Message{
 		beamMsg(t, 4, TypeFinding, id, FindingBody{Key: "Not A Key", Title: "t"}),
 		beamMsg(t, 5, TypeFinding, id, FindingBody{Key: "k", Title: "two\nlines"}),
@@ -670,6 +670,11 @@ func TestPumpFindingRecorded(t *testing.T) {
 	for seq := uint64(1); seq <= 11; seq++ {
 		require.Equal(t, seq, s.nextAck(t))
 	}
+	// Seq 13 before seq 12, as after a reconnect: the older replacement is dropped.
+	s.emit(t, beamMsg(t, 13, TypeFinding, id, FindingBody{Key: "leak", Title: "Snapshot leaks twice"}))
+	s.noCmd(t)
+	s.emit(t, beamMsg(t, 12, TypeFinding, id, FindingBody{Key: "leak", Title: "Stale"}))
+	require.Equal(t, uint64(13), s.nextAck(t))
 
 	got, err := st.OrderFindings(ctx, id)
 	require.NoError(t, err)
@@ -692,7 +697,8 @@ func TestPumpFindingRecorded(t *testing.T) {
 			logged = append(logged, e.Text)
 		}
 	}
-	require.Equal(t, []string{"finding leak: Snapshot leaks", "finding flaky: Flaky test", "finding leak: Snapshot leaks twice"}, logged)
+	require.Equal(t, []string{"finding leak: Snapshot leaks", "finding flaky: Flaky test", "finding leak: Snapshot leaks again",
+		"finding leak: Snapshot leaks twice"}, logged)
 
 	var warned []uint64
 	for _, r := range records() {
@@ -707,7 +713,7 @@ func TestPumpFindingRecorded(t *testing.T) {
 			return true
 		})
 	}
-	require.Equal(t, []uint64{4, 5, 6, 7, 8, 9, 10, 11}, warned)
+	require.Equal(t, []uint64{4, 5, 6, 7, 8, 9, 10, 11, 12}, warned)
 	require.Empty(t, sink.missions(), "a finding never reaches a mission")
 }
 

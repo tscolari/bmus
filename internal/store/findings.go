@@ -47,6 +47,9 @@ type Finding struct {
 	Ref string
 }
 
+// FindingLogKind is the log kind of a kept finding's entry.
+const FindingLogKind = "finding"
+
 // ErrFindingDropped is returned (wrapped, with the reason) by
 // RecordFinding for a finding it kept nothing of. The transaction is
 // untouched and may commit.
@@ -62,8 +65,17 @@ var ErrFindingDropped = errors.New("finding dropped")
 // dropped once the order holds MaxFindings. A finding it doesn't keep
 // returns ErrFindingDropped, wrapped with the reason, having written
 // nothing. f.OrderID, CrewID, ReceivedAt and the workflow's fields are
-// ignored. The caller logs a kept one.
-func (t InboxTx) RecordFinding(id string, f Finding) error {
+// ignored.
+//
+// A kept finding logs "finding <key>: <title>" (FindingLogKind) on the
+// order at ts, the message's time, with payload {tour, seq, key}. Those
+// entries order a key's findings: the pump can record a beam's messages
+// out of seq order after a reconnect, so a replacement older than the
+// last one this crew member filed under the key (an entry with a later
+// tour, or a later seq of the same tour) is dropped. Another crew
+// member's entries don't count: tour numbers are per crew member, and a
+// reassigned order's runs follow each other.
+func (t InboxTx) RecordFinding(id string, f Finding, ts time.Time) error {
 	o, err := t.Order(id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: no order %s", ErrFindingDropped, id)
@@ -92,6 +104,19 @@ func (t InboxTx) RecordFinding(id string, f Finding) error {
 		return err
 	case state != FindingNew:
 		return fmt.Errorf("%w: finding %s of order %s is already %s", ErrFindingDropped, f.Key, id, state)
+	default:
+		var later int
+		err := t.tx.QueryRowContext(t.ctx, `SELECT EXISTS (SELECT 1 FROM log
+			WHERE order_id = ? AND kind = ? AND crew_id = ? AND json_valid(payload) AND json_extract(payload, '$.key') = ?
+			AND (json_extract(payload, '$.tour') > ? OR (json_extract(payload, '$.tour') = ? AND json_extract(payload, '$.seq') > ?)))`,
+			id, FindingLogKind, t.crewID, f.Key, t.tourNo, t.tourNo, int64(t.seq)).Scan(&later)
+		if err != nil {
+			return err
+		}
+		if later == 1 {
+			return fmt.Errorf("%w: finding %s of order %s already has a later version than tour %d seq %d",
+				ErrFindingDropped, f.Key, id, t.tourNo, t.seq)
+		}
 	}
 	labels, err := jsonList(f.Labels)
 	if err != nil {
@@ -106,6 +131,19 @@ func (t InboxTx) RecordFinding(id string, f Finding) error {
 		ON CONFLICT (order_id, key) DO UPDATE SET crew_id = excluded.crew_id, title = excluded.title, body = excluded.body,
 			labels = excluded.labels, severity = excluded.severity, blocked_by = excluded.blocked_by, received_at = excluded.received_at`,
 		id, f.Key, t.crewID, f.Title, f.Body, labels, f.Severity, blocked, time.Now().UTC(), FindingNew)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(struct {
+		Tour int    `json:"tour"`
+		Seq  uint64 `json:"seq"`
+		Key  string `json:"key"`
+	}{t.tourNo, t.seq, f.Key})
+	if err != nil {
+		return err
+	}
+	_, err = t.AppendLog(LogEntry{TS: ts, Kind: FindingLogKind, CrewID: t.crewID, OrderID: id,
+		Text: fmt.Sprintf("finding %s: %s", f.Key, f.Title), Payload: payload})
 	return err
 }
 

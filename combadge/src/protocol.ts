@@ -245,6 +245,8 @@ export const MAX_FINDING_LABELS = 5;
 export const MAX_FINDING_LABEL = 50;
 export const MAX_FINDING_BLOCKED_BY = 10;
 export const MAX_FINDING_REF = 200;
+/** Starts the labels the bridge sets itself (bmus:unreviewed); a finding may not carry one, in any letter case. */
+export const RESERVED_LABEL_PREFIX = "bmus:";
 
 /** Final result of an order. */
 export interface ReportBody {
