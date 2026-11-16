@@ -19,6 +19,8 @@ export interface RepoCheckout {
   base_commit: string;
   /** The order's work in progress checkoutRepos found (#145), if any; see Wip. */
   wip?: Wip;
+  /** More lines for the handover note about kept work in progress (#145). */
+  wipNotes?: string[];
 }
 
 /**
@@ -126,18 +128,27 @@ export async function checkoutRepos(workDir: string, orderId: string, repos: rea
         await fetchWip(target, r.bundle_path, keptWipRef(orderId), keptWipRef(orderId), true);
       }
       const tip = await git(target, "rev-parse", "--verify", `refs/heads/${branch}^{commit}`);
-      // Nothing newer from the bridge: the beam's own work stands.
+      // Nothing newer from the bridge: the beam's own work stands, a WIP or
+      // none (the agent dropped its changes). Otherwise the shipped WIP
+      // does, and a beam's own work that differs is kept on the side.
       const fresh = emitted.tip === tip && emitted.wip === shipped;
-      if (!fresh) local = undefined;
-      else if (local !== undefined && source !== target) local = await fetchWip(target, source!, ref, "refs/bmus/checkout-wip");
+      if (local !== undefined && source !== target) local = await fetchWip(target, source!, ref, "refs/bmus/checkout-wip");
       if (!existing) {
         fs.renameSync(target, dir);
         fs.rmSync(r.bundle_path, { force: true }); // the checkout holds it all; a full-history bundle can be large
       }
       fs.rmSync(prev, { recursive: true, force: true });
       const base_commit = await git(dir, "rev-parse", "--verify", `refs/remotes/origin/${branch}^{commit}`);
-      const wip = await placeWip(dir, orderId, local, shipped, existing);
-      out.push({ name: r.name, dir, base_ref: r.base_ref, base_commit, ...(wip && { wip }) });
+      const notes: string[] = [];
+      const kept = new KeptWip(dir, orderId, notes);
+      await kept.load();
+      const wip = fresh ? await placeWip(dir, orderId, local, "checkout", existing, kept) : await placeWip(dir, orderId, shipped, "bundle", existing, kept);
+      if (!fresh && local !== undefined && (shipped === undefined || (await treeOf(dir, local)) !== (await treeOf(dir, shipped)))) {
+        // The bridge shipped older work than this beam last had (#145).
+        await kept.set(local, `this beam's own uncommitted work (${short(local)}) differs from the shipped checkpoint's, which the bridge has as the newest`);
+      }
+      kept.noteEarlier();
+      out.push({ name: r.name, dir, base_ref: r.base_ref, base_commit, ...(wip && { wip }), ...(notes.length > 0 && { wipNotes: notes }) });
     } catch (err) {
       fs.rmSync(prev, { recursive: true, force: true });
       throw new Error(`checking out repo ${r.name}: ${err instanceof Error ? err.message.trim() : String(err)}`);
@@ -205,14 +216,12 @@ async function fetchWip(repo: string, source: string, ref: string, as: string, k
  * with changes of its own) moves to `refs/bmus/kept-wip/<order>`, which no
  * snapshot overwrites and later checkpoints carry.
  */
-async function placeWip(dir: string, orderId: string, local: string | undefined, shipped: string | undefined, existing: boolean): Promise<Wip | undefined> {
+async function placeWip(dir: string, orderId: string, commit: string | undefined, from: Wip["from"], existing: boolean, kept: KeptWip): Promise<Wip | undefined> {
   const tip = await git(dir, "rev-parse", "--verify", `refs/heads/bmus/${orderId}^{commit}`);
-  const commit = local ?? shipped;
   if (commit === undefined) {
     await git(dir, "update-ref", "-d", wipRef(orderId));
     return undefined;
   }
-  const from: Wip["from"] = local !== undefined ? "checkout" : "bundle";
   const parent = await git(dir, "rev-parse", "--verify", "--quiet", `${commit}^1`).catch(() => "");
   const files = parent === "" ? [] : (await git(dir, "diff", "--no-renames", "--name-only", parent, commit)).split("\n").filter(Boolean);
   const wip: Wip = { commit, parent, from, restored: false, files };
@@ -227,10 +236,54 @@ async function placeWip(dir: string, orderId: string, local: string | undefined,
     await git(dir, "restore", `--source=${commit}`, "--worktree", "--", ".");
     return { ...wip, restored: true };
   }
-  await git(dir, "update-ref", keptWipRef(orderId), commit);
   await git(dir, "update-ref", "-d", wipRef(orderId));
-  const kept = parent !== tip ? `it was snapshotted on ${short(parent)}, not on bmus/${orderId}'s tip ${short(tip)}` : "the work tree already had uncommitted changes";
-  return { ...wip, kept };
+  const why = parent !== tip ? `it was snapshotted on ${short(parent)}, not on bmus/${orderId}'s tip ${short(tip)}` : "the work tree already had uncommitted changes";
+  await kept.set(commit);
+  return { ...wip, kept: why };
+}
+
+/** A commit's tree, "" when it can't be read. */
+const treeOf = (dir: string, commit: string) => git(dir, "rev-parse", "--verify", "--quiet", `${commit}^{tree}`).catch(() => "");
+
+/**
+ * `refs/bmus/kept-wip/<order>` in a checkout as a start places it (#145):
+ * one ref, so a new kept WIP replaces an earlier one, and the note names
+ * the one replaced. An earlier one left in place is named too, on every
+ * start while it exists.
+ */
+class KeptWip {
+  private earlier: string | undefined;
+  private changed = false;
+
+  constructor(
+    private readonly dir: string,
+    private readonly orderId: string,
+    private readonly notes: string[],
+  ) {}
+
+  async load(): Promise<void> {
+    this.earlier = await git(this.dir, "rev-parse", "--verify", "--quiet", `${keptWipRef(this.orderId)}^{commit}`).catch(() => undefined);
+  }
+
+  /** Keeps commit on the ref; line, if given, is the note's line for it. */
+  async set(commit: string, line?: string): Promise<void> {
+    const ref = keptWipRef(this.orderId);
+    const current = await git(this.dir, "rev-parse", "--verify", "--quiet", `${ref}^{commit}`).catch(() => undefined);
+    if (current === commit) return;
+    if (current !== undefined) {
+      this.notes.push(`${ref} in ${this.dir} held ${short(current)}, uncommitted work kept from earlier; it now holds ${short(commit)}, and ${short(current)} is reachable only by its id: see it with git show ${current} while it lasts.`);
+    }
+    await git(this.dir, "update-ref", ref, commit);
+    this.changed = true;
+    if (line !== undefined) this.notes.push(`${line}; it is kept as ${ref} in ${this.dir}: see it with git diff ${short(commit)}^ ${ref}.`);
+  }
+
+  /** Names an earlier kept WIP that this start left in place. */
+  noteEarlier(): void {
+    if (this.earlier === undefined || this.changed) return;
+    const ref = keptWipRef(this.orderId);
+    this.notes.push(`${ref} in ${this.dir} (${short(this.earlier)}) holds uncommitted work kept from an earlier run; see it with git diff ${short(this.earlier)}^ ${ref}.`);
+  }
 }
 
 const short = (commit: string) => (commit === "" ? "no commit" : commit.slice(0, 12));
@@ -254,6 +307,7 @@ export function wipNote(orderId: string, repos: readonly RepoCheckout[]): string
       lines.push(`${keptWipRef(orderId)} in ${r.dir} (${short(w.commit)}, from ${where}) holds uncommitted work that was not restored: ${w.kept}. Files: ${files}. See it with git diff ${short(w.parent)} ${keptWipRef(orderId)}.`);
     }
   }
+  for (const r of repos) lines.push(...(r.wipNotes ?? []));
   return lines;
 }
 

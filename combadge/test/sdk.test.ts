@@ -3062,6 +3062,41 @@ describe("sdk harness automatic checkpoints (#145)", () => {
     await run.result;
   });
 
+  it("holds the park's abort for a call let through while its checkpoint was written, until RESULT_GRACE_MS after its PostToolUse", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = tempDir();
+    const repo = gitRepo(dir);
+    const TEST = { command: "make test", timeout: 1000, description: "Test" };
+    let agent!: Agent;
+    const run = start(async function* (a) {
+      if (a.options.resume !== undefined) {
+        await a.nextInput();
+        return yield success;
+      }
+      agent = a;
+      await a.nextInput();
+      yield init;
+      void a.hold("Bash", DEPLOY, "u-deploy");
+      await a.aborted();
+      throw new Error("Claude Code process aborted by user");
+    }, { dir, repo, claudePath: fakeClaude(dir), hailParkAfterMs: PARK, body: { grants: [{ tool: "Bash", input: TEST }] } });
+    await run.nth(0);
+    await vi.advanceTimersByTimeAsync(PARK); // the park starts writing its checkpoint
+    // A call the order's grant lets through meanwhile is running.
+    expect(await agent.hold("Bash", TEST, "u-test")).toEqual({ behavior: "allow", updatedInput: TEST });
+    expect(await run.nth(1)).toMatchObject({ type: "checkpoint_ready", body: { held: [`sdk-${ORDER}-1`] } });
+    await new Promise((r) => setImmediate(r));
+    expect(agent.options.abortController!.signal.aborted).toBe(false);
+    await agent.postToolUse("Bash", TEST, "u-test");
+    await vi.advanceTimersByTimeAsync(RESULT_GRACE_MS - 1);
+    expect(agent.options.abortController!.signal.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(agent.options.abortController!.signal.aborted).toBe(true);
+    run.answer(`sdk-${ORDER}-1`, "allow", 0);
+    await run.result;
+  });
+
   it("lets a resumed run re-issue a carried tool_approval the captain allowed, once and without a hail; unanswered, it hails", async () => {
     const dir = tempDir();
     let first: PermissionResult | null | undefined;

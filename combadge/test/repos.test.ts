@@ -332,6 +332,50 @@ describe("work in progress (#145)", () => {
     const [got] = await checkoutRepos(path.join(dir, "work"), ORDER, [{ name: "app", base_ref: "main", bundle_path: shipped }]);
     expect(got!.wip).toMatchObject({ commit: wip2, from: "bundle", restored: true, files: ["elsewhere.txt"] });
     expect(fs.existsSync(path.join(got!.dir, "new.txt"))).toBe(false);
+    // This beam's own differing work is kept on the side, and named.
+    const kept = git(got!.dir, "rev-parse", KEPT);
+    expect(git(got!.dir, "show", `${kept}:new.txt`)).toBe("untracked");
+    const note = wipNote(ORDER, [got!]).join("\n");
+    expect(note).toContain(`this beam's own uncommitted work (${kept.slice(0, 12)}) differs from the shipped checkpoint's`);
+    expect(note).toContain(`it is kept as ${KEPT} in ${got!.dir}`);
+  });
+
+  it("restores nothing when this beam's agent dropped the change the shipped checkpoint holds", async () => {
+    const dir = tempDir();
+    const c = await dirty(dir);
+    await bundleCheckpoint(path.join(dir, "cp"), order([c])); // emitted with a WIP
+    const shipped = path.join(dir, "work", ORDER, "in", "app.bundle");
+    fs.mkdirSync(path.dirname(shipped), { recursive: true });
+    git(c.dir, "bundle", "create", "--quiet", shipped, `refs/heads/bmus/${ORDER}`, WIP);
+    git(c.dir, "checkout", "-q", "--", ".");
+    git(c.dir, "reset", "-q", "--hard");
+    git(c.dir, "clean", "-qfd");
+    fs.renameSync(c.dir, previousCheckout(c.dir));
+    const [got] = await checkoutRepos(path.join(dir, "work"), ORDER, [{ name: "app", base_ref: "main", bundle_path: shipped }]);
+    expect(got!.wip).toBeUndefined();
+    expect(git(got!.dir, "status", "--porcelain")).toBe("");
+    expect(refExists(got!.dir, WIP)).toBe(false);
+  });
+
+  it("names a kept WIP on every start, and names one a newer kept WIP replaces", async () => {
+    const dir = tempDir();
+    const c = await dirty(dir);
+    await snapshotWip(c, ORDER);
+    const first = git(c.dir, "rev-parse", WIP);
+    git(c.dir, "commit", "-q", "-m", "moved on");
+    const [a] = await checkoutRepos(path.join(dir, "a"), ORDER, [ship(c.dir, path.join(dir, "a", "in", "app.bundle"))]);
+    expect(git(a!.dir, "rev-parse", KEPT)).toBe(first);
+    // The next start, with nothing new: the kept WIP is named again.
+    const [b] = await checkoutRepos(path.join(dir, "b"), ORDER, [ship(a!.dir, path.join(dir, "b", "in", "app.bundle"), [WIP, KEPT])]);
+    expect(wipNote(ORDER, [b!])).toEqual([`${KEPT} in ${b!.dir} (${first.slice(0, 12)}) holds uncommitted work kept from an earlier run; see it with git diff ${first.slice(0, 12)}^ ${KEPT}.`]);
+    // A newer WIP that can't be restored replaces it, and the note says so.
+    fs.writeFileSync(path.join(b!.dir, "second.txt"), "second\n");
+    await snapshotWip(b!, ORDER);
+    const second = git(b!.dir, "rev-parse", WIP);
+    git(b!.dir, "commit", "-q", "--allow-empty", "-m", "moved on again");
+    const [d] = await checkoutRepos(path.join(dir, "d"), ORDER, [ship(b!.dir, path.join(dir, "d", "in", "app.bundle"), [WIP, KEPT])]);
+    expect(git(d!.dir, "rev-parse", KEPT)).toBe(second);
+    expect(wipNote(ORDER, [d!]).join("\n")).toContain(`held ${first.slice(0, 12)}, uncommitted work kept from earlier; it now holds ${second.slice(0, 12)}`);
   });
 
   it("removes a set-aside checkout when the checkout fails", async () => {
