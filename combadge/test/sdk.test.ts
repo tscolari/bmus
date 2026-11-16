@@ -3080,6 +3080,30 @@ describe("sdk harness automatic checkpoints (#145)", () => {
     run.answer(`sdk-${ORDER}-1`, "allow", 0);
     await run.result;
 
+    // An order's grant outlives GRANT_TTL_MS and a park: unused, the resumed query still takes it.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let late: PermissionResult | null | undefined;
+    const parked = start(async function* (agent) {
+      if (agent.options.resume !== undefined) {
+        await agent.nextInput();
+        late = await agent.canUseTool("Bash", DEPLOY);
+        return yield success;
+      }
+      await agent.nextInput();
+      yield init;
+      void agent.hold("Bash", { command: "make test", timeout: 1000, description: "test" });
+      await agent.aborted();
+      throw new Error("Claude Code process aborted by user");
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), hailParkAfterMs: 60_000, body: { grants: [{ tool: "Bash", input: DEPLOY }] } });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await parked.nth(0);
+    await vi.advanceTimersByTimeAsync(GRANT_TTL_MS + 60_000);
+    await parked.queries[0]!.aborted();
+    parked.answer(`sdk-${ORDER}-1`, "allow", 0);
+    await parked.result;
+    expect(late).toEqual({ behavior: "allow", updatedInput: DEPLOY });
+    vi.useRealTimers();
+
     // Without the grant (the carried hail unanswered), the re-issue hails.
     const plain = start(async function* (agent) {
       await agent.nextInput();

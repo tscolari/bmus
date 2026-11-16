@@ -2,7 +2,9 @@ package bridge
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dbos-inc/dbos-transact-golang/dbos"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -404,48 +407,65 @@ func TestStoppedOrderRestoresWipFromCheckout(t *testing.T) {
 	require.Equal(t, res.Report.Repos[0].Commit+" refs/heads/bmus/"+id, bundleHeads(t, filepath.Join(b.home, "cargo", id, "final", "app.bundle")))
 }
 
-// #145: a checkpoint's WIP bundle over the size cap stays on the beam and
-// is logged; the checkpoint's commits are pulled without it. One under
-// the cap lands beside the checkpoint's bundle.
-func TestPullWipOverCap(t *testing.T) {
+// #145: pulling a checkpoint's WIP bundle is best effort. One over the
+// size cap, or one the beam can't give, stays behind and comes back as
+// skipped, with no partial copy and no log entry yet (the mission logs it
+// once); the checkpoint's commits are pulled without it. One under the cap
+// lands beside the checkpoint's bundle.
+func TestPullWipBestEffort(t *testing.T) {
 	t.Parallel()
 	d := testDaemon(t, nil)
-	st, err := store.Open(t.Context(), filepath.Join(d.home, store.DBFile))
-	require.NoError(t, err)
-	t.Cleanup(func() { st.Close() })
-	d.store = st
+	d.logger = slog.New(slog.DiscardHandler)
 	root := t.TempDir()
 	d.transporter = &fakeProvider{copyRoot: root}
 	d.maxBundleBytes = 10
 	require.NoError(t, os.WriteFile(filepath.Join(root, "app.wip.bundle"), []byte("0123456789abc"), 0o600))
 	local := filepath.Join(t.TempDir(), "app.bundle")
-	in := MissionInput{OrderID: "ORD-0001", CrewID: "sorell"}
 	r := comms.WorkRepo{Name: "app", WipBundlePath: "/app.wip.bundle"}
 	beam := transporter.Beam{Alias: "beam-1"}
-	require.NoError(t, d.pullWip(t.Context(), beam, in, 3, r, local))
-	require.NoFileExists(t, wipBundleOf(local))
-	entries, err := st.ListLog(t.Context(), 0)
+	skipped, err := d.pullWip(t.Context(), beam, 3, r, local)
 	require.NoError(t, err)
-	require.Equal(t, map[string]int{CodeBundleTooLarge: 1}, codes(t, entries))
-	require.Equal(t, "checkpoint 3: repo app's uncommitted work is 13 bytes, over the 10 byte cap; its commits are pulled without it", entries[len(entries)-1].Text)
+	require.Equal(t, &wipSkipped{Code: CodeBundleTooLarge,
+		Text: "checkpoint 3: repo app's uncommitted work was not pulled (13 bytes, over the 10 byte cap); its commits are pulled without it"}, skipped)
+	require.NoFileExists(t, wipBundleOf(local))
+
+	for _, bad := range []comms.WorkRepo{{Name: "app", WipBundlePath: "/gone.wip.bundle"}, {Name: "app", WipBundlePath: "relative.wip.bundle"}} {
+		skipped, err := d.pullWip(t.Context(), beam, 4, bad, local)
+		require.NoError(t, err)
+		require.Equal(t, CodeCheckpointFailed, skipped.Code, skipped.Text)
+		require.NoFileExists(t, wipBundleOf(local))
+	}
 
 	d.maxBundleBytes = 100
-	require.NoError(t, d.pullWip(t.Context(), beam, in, 4, r, local))
+	skipped, err = d.pullWip(t.Context(), beam, 5, r, local)
+	require.NoError(t, err)
+	require.Nil(t, skipped)
 	require.FileExists(t, wipBundleOf(local))
 	// A later checkpoint without WIP leaves no stale copy.
-	require.NoError(t, d.pullWip(t.Context(), beam, in, 4, comms.WorkRepo{Name: "app"}, local))
+	skipped, err = d.pullWip(t.Context(), beam, 6, comms.WorkRepo{Name: "app"}, local)
+	require.NoError(t, err)
+	require.Nil(t, skipped)
 	require.NoFileExists(t, wipBundleOf(local))
 }
 
 // parkedWithCarried starts a holodeck bridge on script, waits for H-0001
 // and the park checkpoint holding it, then kills sorell's beam: the order
 // parks with H-0001 carried (#145).
-func parkedWithCarried(t *testing.T, script string) (*holodeckBridge, *hdaemon, string) {
+func parkedWithCarried(t *testing.T, script, division string) (*holodeckBridge, *hdaemon, string) {
 	t.Helper()
 	b := newHolodeckBridge(t, script)
 	hd := b.start(t)
-	c := hd.addCrew(t)
-	id := hd.createOrder(t)
+	var (
+		c  store.Crew
+		id string
+	)
+	if division != "" {
+		c = hd.addCrewWith(t, store.Crew{ID: "sorell", Name: "Sorell", Division: division})
+		id = hd.createDivisionOrder(t, "sorell", division)
+	} else {
+		c = hd.addCrew(t)
+		id = hd.createOrder(t)
+	}
 	hd.waitHail(t, "H-0001")
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
 		cps, err := hd.d.store.ListCheckpoints(t.Context(), id)
@@ -477,7 +497,7 @@ func TestCarriedHailSupersededByResumedRun(t *testing.T) {
 		{"at_pct": 30, "hail": {"category": "clarifying_question", "question": "Which way?", "options": ["left", "right"]}, "park_after_ms": 200},
 		{"at_pct": 40, "hail": {"category": "clarifying_question", "question": "Which way?", "options": ["left", "right"]}},
 		{"at_pct": 100, "report": {"summary": "asked again"}}]`), 0o600))
-	_, hd, id := parkedWithCarried(t, script)
+	_, hd, id := parkedWithCarried(t, script, "")
 	requireOutcome(t, OutcomeRequested)(hd.d.ReenergizeCrew(t.Context(), "sorell"))
 	hd.waitHail(t, "H-0002")
 	e := hd.waitLog(t, "hail H-0001 closed unanswered")
@@ -493,7 +513,7 @@ func TestCarriedHailSupersededByResumedRun(t *testing.T) {
 // #145: a carried hail still open when the mission ends is closed with it.
 func TestCarriedHailClosedWhenOrderEnds(t *testing.T) {
 	t.Parallel()
-	_, hd, id := parkedWithCarried(t, parkScript(t))
+	_, hd, id := parkedWithCarried(t, parkScript(t), "")
 	require.NoError(t, hd.d.BelayOrder(t.Context(), id, "scrapped"))
 	require.Equal(t, MissionBelayed, missionResult(t, hd.d, id).Status)
 	e := hd.waitLog(t, "hail H-0001 closed unanswered")
@@ -529,7 +549,7 @@ func TestCarriedToolApprovalBecomesGrant(t *testing.T) {
 			"context": {"tool": "Bash", "input": {"command": "make deploy"}}}, "park_after_ms": 200},
 		{"at_pct": 40, "progress": "resumed"},
 		{"at_pct": 100, "report": {"summary": "deployed"}}]`), 0o600))
-	b, hd, id := parkedWithCarried(t, script)
+	b, hd, id := parkedWithCarried(t, script, "")
 	allow := 0
 	require.NoError(t, hd.d.AnswerHail(t.Context(), "H-0001", "", &allow))
 	requireOutcome(t, OutcomeRequested)(hd.d.ReenergizeCrew(t.Context(), "sorell"))
@@ -538,4 +558,145 @@ func TestCarriedToolApprovalBecomesGrant(t *testing.T) {
 	require.NotEmpty(t, steps)
 	require.Equal(t, []any{map[string]any{"tool": "Bash", "input": map[string]any{"command": "make deploy"}}}, steps[0]["grants"])
 	require.Contains(t, steps[0]["handover"], `the captain answered hail H-0001, which the earlier session asked: "Run `+"`make deploy`"+`?". The answer: "allow".`)
+}
+
+// answeredLine is the handover line for H-0001 of parkScript answered left.
+const answeredLine = `While the order was parked, the captain answered hail H-0001, which the earlier session asked: "Which way?". The answer: "left".`
+
+// #145 (N1): a carried hail answered after its order was recalled still
+// reaches the next run, on another crew member: the answer names the
+// crew member that hailed, whom the recall replaced.
+func TestCarriedAnswerAfterRecall(t *testing.T) {
+	t.Parallel()
+	b, hd, id := parkedWithCarried(t, parkScript(t), "ops")
+	require.NoError(t, hd.d.RecallOrder(t.Context(), id, "reassign"))
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		require.Equal(ct, store.OrderPool, hd.order(ct, id).State)
+	}, 30*time.Second, 20*time.Millisecond)
+	require.NoError(t, hd.d.AnswerHail(t.Context(), "H-0001", "left", nil))
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		require.Equal(ct, 1, countSteps(t, hd.d, missionWorkflowID(id), "carried-answer"))
+	}, 30*time.Second, 20*time.Millisecond)
+	hd.addCrewWith(t, store.Crew{ID: "tuvok", Name: "Tuvok", Division: "ops"})
+	require.NoError(t, hd.d.SetStandingOrders(t.Context(), true))
+	res := missionResult(t, hd.d, id)
+	require.Equal(t, MissionDone, res.Status, "%+v", res)
+	require.Equal(t, "tuvok", hd.order(t, id).Assignee)
+	steps := resumedSteps(t, b.stepLog, id)
+	require.NotEmpty(t, steps)
+	require.Contains(t, steps[0]["handover"], answeredLine)
+}
+
+// #145 (N2, item 7): the carried answer stays with the order until the
+// new run checkpoints. A resume whose send finds the tour ended holds an
+// answer for the next send; the beam lost before the new run's first
+// checkpoint still leaves the answer for the run after.
+func TestCarriedAnswerUntilNewRunCheckpoints(t *testing.T) {
+	t.Parallel()
+	b, hd, id := parkedWithCarried(t, parkScript(t), "")
+	mission := missionWorkflowID(id)
+	// A resume on a tour that has ended: ship-repos sends nothing.
+	body, err := json.Marshal(resumeBody{CrewID: "sorell", TourID: tourWorkflowID("sorell", 0)})
+	require.NoError(t, err)
+	msg := comms.Message{Type: typeResume, Crew: "sorell", Order: id, Body: body}
+	require.NoError(t, dbos.Send(hd.d.dbos, mission, msg, fromCrewTopic))
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		require.Equal(ct, 2, countSteps(t, hd.d, mission, "ship-repos"))
+	}, 30*time.Second, 20*time.Millisecond)
+	require.Equal(t, 1, countSteps(t, hd.d, mission, "send-order"), "the ended tour got no order")
+	// Answered with no order on any beam: held for the next send.
+	require.NoError(t, hd.d.AnswerHail(t.Context(), "H-0001", "left", nil))
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		require.Equal(ct, 1, countSteps(t, hd.d, mission, "carried-answer"))
+	}, 30*time.Second, 20*time.Millisecond)
+	require.Zero(t, countSteps(t, hd.d, mission, "send-correction"))
+	injectCrew(t, hd.d, id, comms.TypeError, 900, comms.ErrorBody{Reason: "beam lost", Code: CodeBeamLost})
+
+	// The next run gets the note, and its beam goes before it checkpoints.
+	requireOutcome(t, OutcomeRequested)(hd.d.ReenergizeCrew(t.Context(), "sorell"))
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		steps := resumedSteps(ct, b.stepLog, id)
+		require.NotEmpty(ct, steps)
+		require.Contains(ct, steps[0]["handover"], answeredLine)
+	}, 60*time.Second, 20*time.Millisecond)
+	before := len(resumedSteps(t, b.stepLog, id))
+	require.NoError(t, b.h.Kill(hd.crew(t, "sorell").CurrentBeam))
+	require.Equal(t, CrewTourResult{Ended: store.CrewSickbay}, tourResult(t, hd.d, tourWorkflowID("sorell", 1)))
+	requireOutcome(t, OutcomeRequested)(hd.d.ReenergizeCrew(t.Context(), "sorell"))
+	require.Equal(t, MissionDone, missionResult(t, hd.d, id).Status)
+	later := resumedSteps(t, b.stepLog, id)[before:]
+	require.NotEmpty(t, later)
+	require.Contains(t, later[0]["handover"], answeredLine)
+}
+
+// #145 (item 6): two hails held by one park checkpoint, the second queued
+// behind the first, are both carried when the beam is lost.
+func TestBeamLossCarriesQueuedHeldHail(t *testing.T) {
+	t.Parallel()
+	r, id := fakeMission(t)
+	injectCrew(t, r.d, id, comms.TypeHail, 2, comms.HailBody{Ref: "r1", Category: comms.CategoryClarifyingQuestion,
+		Question: "Which way?", Options: []string{"left", "right"}})
+	injectCrew(t, r.d, id, comms.TypeHail, 3, comms.HailBody{Ref: "r2", Category: comms.CategoryToolApproval,
+		Question: "Run `make deploy`?", Options: []string{"allow", "deny"}, Context: json.RawMessage(`{"tool": "Bash", "input": {"command": "make deploy"}}`)})
+	// The park checkpoint, its files on this machine (the fake beam copies local paths).
+	dir := t.TempDir()
+	files := map[string]string{"app.bundle": "not a bundle\n", "transcript.jsonl": "{}\n", "handover.md": "parked\n"}
+	for name, content := range files {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600))
+	}
+	injectCrew(t, r.d, id, comms.TypeCheckpointReady, 4, comms.CheckpointReadyBody{
+		Repos:          []comms.WorkRepo{{Name: "app", Branch: orderBranch(id), Commit: "0123456789abcdef0123456789abcdef01234567", BundlePath: filepath.Join(dir, "app.bundle")}},
+		TranscriptPath: filepath.Join(dir, "transcript.jsonl"), HandoverPath: filepath.Join(dir, "handover.md"),
+		Held: []string{"r1", "r2"},
+	})
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		cps, err := r.d.store.ListCheckpoints(context.Background(), id)
+		require.NoError(c, err)
+		require.Len(c, cps, 1)
+	}, 20*time.Second, 20*time.Millisecond)
+	injectCrew(t, r.d, id, comms.TypeError, 5, comms.ErrorBody{Reason: "beam lost", Code: CodeBeamLost})
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		for _, hid := range []string{"H-0001", "H-0002"} {
+			h, err := r.d.store.GetHail(context.Background(), hid)
+			require.NoError(c, err)
+			require.Equal(c, store.HailOpen, h.Status, hid)
+			require.True(c, h.Carried, hid)
+		}
+	}, 20*time.Second, 20*time.Millisecond)
+	h, err := r.d.store.GetHail(t.Context(), "H-0002")
+	require.NoError(t, err)
+	require.Equal(t, "Run `make deploy`?", h.Question)
+}
+
+// #145 (N6): the tour's backstop closes an order's carried hails once it
+// has failed the order, and leaves a parked order's alone.
+func TestBackstopClosesCarriedHails(t *testing.T) {
+	t.Parallel()
+	home := privateHome(t)
+	insertCrew(t, home, store.Crew{ID: "sorell", Name: "Sorell"})
+	r := startDaemonWith(t, home, &fakeProvider{blockProvision: true})
+	defer r.stop(t)
+	ctx := t.Context()
+	carriedOn := func(state string, parked bool) (string, string) {
+		id, err := r.d.store.InsertOrder(ctx, store.Order{Title: "t", Assignee: "sorell", State: state}, testEntry)
+		require.NoError(t, err)
+		hid, err := r.d.store.InsertHail(ctx, store.Hail{OrderID: id, CrewID: "sorell", Question: "?", Carried: true}, testEntry)
+		require.NoError(t, err)
+		if parked {
+			_, err := r.d.store.ParkOrder(ctx, id, testEntry)
+			require.NoError(t, err)
+		}
+		return id, hid
+	}
+	status := func(hid string) string {
+		h, err := r.d.store.GetHail(ctx, hid)
+		require.NoError(t, err)
+		return h.Status
+	}
+	id, hid := carriedOn(store.OrderAway, false)
+	require.NoError(t, r.d.backstop(ctx, "sorell", id, false))
+	require.Equal(t, store.HailTimedOut, status(hid))
+	id, hid = carriedOn(store.OrderAway, true)
+	require.NoError(t, r.d.backstop(ctx, "sorell", id, false))
+	require.Equal(t, store.HailOpen, status(hid))
 }

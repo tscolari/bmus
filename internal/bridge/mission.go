@@ -608,7 +608,9 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections, carrie
 					return failMission(ctx, cur, nil, "could not send the order to the beam: "+err.Error(), CodeSendFailed)
 				}
 				if id != orderNotSent {
-					onBeam, beam, carried = true, ship.Beam, nil
+					// carried stays until the new run's first checkpoint is
+					// pulled: a beam lost before it sends them again.
+					onBeam, beam = true, ship.Beam
 					if err := deliverHeld(ctx, cur, held); err != nil {
 						return MissionResult{}, cur.CrewID, err
 					}
@@ -781,6 +783,44 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections, carrie
 			continue
 		}
 
+		if msg.Type == comms.TypeAnswer {
+			// An answer to a carried hail (#145), whoever runs the order
+			// now: the hail names the crew member that raised it, which a
+			// recall or a resume elsewhere may have replaced.
+			var body comms.AnswerBody
+			if err := json.Unmarshal(msg.Body, &body); err == nil {
+				if _, ok := carriedOpen.take(body.HailID); ok {
+					if parked || !onBeam {
+						// No run has the order (parked, recalled, or the
+						// resume's send-order found the tour ended): the
+						// next send carries it.
+						a, err := takeCarriedAnswer(ctx, cur, body)
+						if err != nil {
+							return MissionResult{}, cur.CrewID, err
+						}
+						carried = append(carried, a)
+						continue
+					}
+					// The run that asked is gone: the answer goes to the
+					// resumed run as a correction naming the question, as a
+					// held correction does (#167, #190).
+					if err := storeStep(ctx, "decide-hail", func(c context.Context, d *Daemon) error {
+						return decideHail(c, d, cur, body)
+					}); err != nil {
+						return MissionResult{}, cur.CrewID, err
+					}
+					if err := sendCorrection(ctx, cur, comms.CorrectionBody{HailID: body.HailID, Ref: in.OrderID, Note: body.Decision}); err != nil {
+						if ctx.Err() != nil {
+							return MissionResult{}, cur.CrewID, err
+						}
+						if err := logCorrectionDropped(ctx, cur.CrewID, in.OrderID, body.HailID, fmt.Sprintf("could not send it to %s: %v", cur.CrewID, err)); err != nil {
+							return MissionResult{}, cur.CrewID, err
+						}
+					}
+					continue
+				}
+			}
+		}
 		if msg.Crew != cur.CrewID {
 			d.logger.Info("mission: dropping a message for another crew member", "order", in.OrderID, "type", msg.Type,
 				"msg_crew", msg.Crew, "crew", cur.CrewID)
@@ -790,19 +830,6 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections, carrie
 			if msg.Type == comms.TypeError {
 				if body := errorBody(msg); body.Code == CodeDismissed {
 					return failMission(ctx, cur, nil, body.Reason, body.Code)
-				}
-			}
-			if msg.Type == comms.TypeAnswer {
-				var body comms.AnswerBody
-				if err := json.Unmarshal(msg.Body, &body); err == nil {
-					if _, ok := carriedOpen.take(body.HailID); ok {
-						a, err := takeCarriedAnswer(ctx, cur, body)
-						if err != nil {
-							return MissionResult{}, cur.CrewID, err
-						}
-						carried = append(carried, a)
-						continue
-					}
 				}
 			}
 			d.logger.Info("mission: parked; dropping message", "order", in.OrderID, "type", msg.Type, "seq", msg.Seq)
@@ -867,37 +894,6 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections, carrie
 		case comms.TypeAnswer:
 			var body comms.AnswerBody
 			uerr := json.Unmarshal(msg.Body, &body)
-			if uerr == nil {
-				if _, ok := carriedOpen.take(body.HailID); ok {
-					// The run that asked is gone (#145). With no order on
-					// the beam (the resume's send-order found the tour
-					// ended), the next send carries it; otherwise it goes
-					// to the resumed run as a correction naming the
-					// question, as a held correction does (#167, #190).
-					if !onBeam {
-						a, err := takeCarriedAnswer(ctx, cur, body)
-						if err != nil {
-							return MissionResult{}, cur.CrewID, err
-						}
-						carried = append(carried, a)
-						continue
-					}
-					if err := storeStep(ctx, "decide-hail", func(c context.Context, d *Daemon) error {
-						return decideHail(c, d, cur, body)
-					}); err != nil {
-						return MissionResult{}, cur.CrewID, err
-					}
-					if err := sendCorrection(ctx, cur, comms.CorrectionBody{HailID: body.HailID, Ref: in.OrderID, Note: body.Decision}); err != nil {
-						if ctx.Err() != nil {
-							return MissionResult{}, cur.CrewID, err
-						}
-						if err := logCorrectionDropped(ctx, cur.CrewID, in.OrderID, body.HailID, fmt.Sprintf("could not send it to %s: %v", cur.CrewID, err)); err != nil {
-							return MissionResult{}, cur.CrewID, err
-						}
-					}
-					continue
-				}
-			}
 			if uerr != nil || hail == nil || body.HailID != hail.ID {
 				d.logger.Warn("mission: ignoring answer for a hail it isn't waiting on", "order", in.OrderID, "hail", body.HailID, "err", uerr)
 				continue
@@ -1031,13 +1027,14 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections, carrie
 				hail, queued, parking, recalling = nil, nil, false, false
 			}
 			var (
-				err error
-				lw  loginWaiter
+				err    error
+				lw     loginWaiter
+				pulled pulledCheckpoint
 			)
 			for {
 				lw.mark()
-				_, err = dbos.RunAsStep(ctx, func(c context.Context) (struct{}, error) {
-					return struct{}{}, pullCheckpoint(c, daemonFrom(c), cur, beam, seq, body)
+				pulled, err = dbos.RunAsStep(ctx, func(c context.Context) (pulledCheckpoint, error) {
+					return pullCheckpoint(c, daemonFrom(c), cur, beam, seq, body)
 				}, append([]dbos.StepOption{dbos.WithStepName("pull-checkpoint"),
 					// A conflicting checkpoint row or a checkpoint that doesn't
 					// match the order's repos won't go away by retrying.
@@ -1058,6 +1055,22 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections, carrie
 			}
 			if err == nil {
 				heldRefs = body.Held
+				// The new run's checkpoint holds its note and its state:
+				// the carried answers have reached it (#145).
+				carried = nil
+				if len(pulled.WipSkipped) > 0 {
+					if err := storeStep(ctx, "log-wip-skipped", func(c context.Context, d *Daemon) error {
+						for _, w := range pulled.WipSkipped {
+							if err := d.appendLog(c, logOrder, cur.CrewID, in.OrderID, w.Text,
+								map[string]any{"seq": seq, "reason": w.Text, "code": w.Code}); err != nil {
+								return err
+							}
+						}
+						return nil
+					}); err != nil {
+						return MissionResult{}, cur.CrewID, err
+					}
+				}
 			}
 			if err != nil {
 				if ctx.Err() != nil {
@@ -2036,8 +2049,11 @@ func takeCarriedAnswer(ctx dbos.Context, in MissionInput, body comms.AnswerBody)
 		}
 		a := carriedAnswer{HailID: body.HailID, Question: h.Question, Decision: body.Decision}
 		if h.Category == comms.CategoryToolApproval && body.Option != nil && *body.Option == 0 {
+			// Only an option answer grants, and only a call whose input is
+			// a JSON object, as the sdk harness's tool_approval names it.
 			var call comms.OrderGrant
-			if json.Unmarshal(h.Context, &call) == nil && call.Tool != "" && len(call.Input) > 0 {
+			var input map[string]any
+			if json.Unmarshal(h.Context, &call) == nil && call.Tool != "" && json.Unmarshal(call.Input, &input) == nil && input != nil {
 				a.Grant = &call
 			}
 		}
@@ -2094,23 +2110,24 @@ func (d *Daemon) cargoDir(orderID, beam string, seq uint64) string {
 // (<name>.bundle, matched as a report's are) plus the transcript and the
 // note, and records it. A re-run overwrites the files (the copies replace
 // atomically) and InsertCheckpoint accepts the identical row again.
-func pullCheckpoint(ctx context.Context, d *Daemon, in MissionInput, beamAlias string, seq uint64, body comms.CheckpointReadyBody) error {
+func pullCheckpoint(ctx context.Context, d *Daemon, in MissionInput, beamAlias string, seq uint64, body comms.CheckpointReadyBody) (pulledCheckpoint, error) {
+	var out pulledCheckpoint
 	o, err := d.store.GetOrder(ctx, in.OrderID)
 	if err != nil {
-		return fmt.Errorf("order %s: %w", in.OrderID, err)
+		return out, fmt.Errorf("order %s: %w", in.OrderID, err)
 	}
 	repos, err := matchWork(in.OrderID, o.Repos, body.Repos)
 	if err != nil {
-		return err
+		return out, err
 	}
 	beam, err := d.missionBeam(ctx, in.CrewID, beamAlias)
 	if err != nil {
-		return err
+		return out, err
 	}
 	dir := d.cargoDir(in.OrderID, beam.Alias, seq)
 	// tsh's CopyFrom needs the local directory to exist.
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+		return out, err
 	}
 	cp := store.Checkpoint{
 		OrderID: in.OrderID, Beam: beam.Alias, Seq: int(seq),
@@ -2122,10 +2139,10 @@ func pullCheckpoint(ctx context.Context, d *Daemon, in MissionInput, beamAlias s
 	for _, r := range repos {
 		size, err := d.transporter.Size(ctx, beam, r.BundlePath)
 		if err != nil {
-			return fmt.Errorf("size repo %s's bundle %s on %s: %w", r.Name, r.BundlePath, beam.Alias, err)
+			return out, fmt.Errorf("size repo %s's bundle %s on %s: %w", r.Name, r.BundlePath, beam.Alias, err)
 		}
 		if size > d.maxBundleBytes {
-			return fmt.Errorf("repo %s: bundle %s is %d bytes, over the %d byte cap: %w",
+			return out, fmt.Errorf("repo %s: bundle %s is %d bytes, over the %d byte cap: %w",
 				r.Name, r.BundlePath, size, d.maxBundleBytes, errBundleTooLarge)
 		}
 		local := filepath.Join(dir, r.Name+".bundle")
@@ -2135,27 +2152,44 @@ func pullCheckpoint(ctx context.Context, d *Daemon, in MissionInput, beamAlias s
 	}
 	for _, f := range files {
 		if err := d.transporter.CopyFrom(ctx, beam, f[0], f[1]); err != nil {
-			return fmt.Errorf("copy %s from %s: %w", f[0], beam.Alias, err)
+			return out, fmt.Errorf("copy %s from %s: %w", f[0], beam.Alias, err)
 		}
 	}
 	for _, r := range cp.Repos {
 		if err := d.checkCopiedBundle(r.Name, r.BundlePath); err != nil {
-			return err
+			return out, err
 		}
 	}
 	for i, r := range repos {
 		if err := d.landCheckpoint(ctx, beam, in.OrderID, r, cp.Repos[i].BundlePath); err != nil {
-			return err
+			return out, err
 		}
-		if err := d.pullWip(ctx, beam, in, seq, r, cp.Repos[i].BundlePath); err != nil {
-			return err
+		skipped, err := d.pullWip(ctx, beam, seq, r, cp.Repos[i].BundlePath)
+		if err != nil {
+			return out, err
+		}
+		if skipped != nil {
+			out.WipSkipped = append(out.WipSkipped, *skipped)
 		}
 	}
 	if err := d.store.InsertCheckpoint(ctx, cp); err != nil {
-		return err
+		return out, err
 	}
-	return d.appendLog(ctx, logOrder, in.CrewID, in.OrderID, fmt.Sprintf("checkpoint %d pulled into the cargo bay", seq),
+	return out, d.appendLog(ctx, logOrder, in.CrewID, in.OrderID, fmt.Sprintf("checkpoint %d pulled into the cargo bay", seq),
 		map[string]any{"beam": beam.Alias, "seq": seq, "commits": commits, "dir": dir, "stopping": body.Stopping})
+}
+
+// pulledCheckpoint is the pull-checkpoint step's recorded result: the WIP
+// bundles it left behind (#145), which the mission logs in a step of its
+// own (log-wip-skipped), once. A result recorded before it decodes empty.
+type pulledCheckpoint struct {
+	WipSkipped []wipSkipped `json:",omitempty"`
+}
+
+// wipSkipped is a WIP bundle pull-checkpoint didn't pull, and why.
+type wipSkipped struct {
+	Text string
+	Code string
 }
 
 // landCheckpoint fetches a pulled checkpoint bundle, local, into the
@@ -2212,44 +2246,51 @@ func (d *Daemon) landCheckpoint(ctx context.Context, beam transporter.Beam, orde
 }
 
 // pullWip copies a checkpoint's WIP bundle (#145), when it has one, into
-// the cargo bay beside its bundle (wipBundleOf). One over
-// Config.MaxBundleBytes is left on the beam and logged
-// (bundle_too_large): the checkpoint's commits land without it. An older
-// copy from an earlier attempt is removed first.
-func (d *Daemon) pullWip(ctx context.Context, beam transporter.Beam, in MissionInput, seq uint64, r comms.WorkRepo, local string) error {
+// the cargo bay beside its bundle (wipBundleOf), best effort: the
+// checkpoint's commits land without it. One over Config.MaxBundleBytes is
+// left on the beam (bundle_too_large); any other failure (a bad path, the
+// size or the copy) is logged as checkpoint_failed and its partial copy
+// removed. Either comes back as skipped for the mission to log once. Only
+// ctx ending is returned as an error. An older copy from an earlier
+// attempt is removed first.
+func (d *Daemon) pullWip(ctx context.Context, beam transporter.Beam, seq uint64, r comms.WorkRepo, local string) (*wipSkipped, error) {
 	dst := wipBundleOf(local)
 	if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+		return nil, err
 	}
 	if r.WipBundlePath == "" {
-		return nil
+		return nil, nil
+	}
+	skip := func(code, why string) (*wipSkipped, error) {
+		os.Remove(dst)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		text := fmt.Sprintf("checkpoint %d: repo %s's uncommitted work was not pulled (%s); its commits are pulled without it", seq, r.Name, why)
+		d.logger.Warn("mission: "+text, "beam", beam.Alias)
+		return &wipSkipped{Text: text, Code: code}, nil
 	}
 	if !path.IsAbs(r.WipBundlePath) {
-		return fmt.Errorf("repo %s: WIP bundle path %q is not absolute: %w", r.Name, r.WipBundlePath, errWorkPermanent)
+		return skip(CodeCheckpointFailed, fmt.Sprintf("its bundle path %q is not absolute", r.WipBundlePath))
 	}
 	size, err := d.transporter.Size(ctx, beam, r.WipBundlePath)
 	if err != nil {
-		return fmt.Errorf("size repo %s's WIP bundle %s on %s: %w", r.Name, r.WipBundlePath, beam.Alias, err)
+		return skip(CodeCheckpointFailed, "size: "+firstLine(err.Error()))
 	}
-	tooLarge := func(size int64) error {
-		text := fmt.Sprintf("checkpoint %d: repo %s's uncommitted work is %d bytes, over the %d byte cap; its commits are pulled without it",
-			seq, r.Name, size, d.maxBundleBytes)
-		return d.appendLog(ctx, logOrder, in.CrewID, in.OrderID, text, map[string]any{"seq": seq, "reason": text, "code": CodeBundleTooLarge})
-	}
+	tooLarge := fmt.Sprintf("%d bytes, over the %d byte cap", size, d.maxBundleBytes)
 	if size > d.maxBundleBytes {
-		return tooLarge(size)
+		return skip(CodeBundleTooLarge, tooLarge)
 	}
 	if err := d.transporter.CopyFrom(ctx, beam, r.WipBundlePath, dst); err != nil {
-		return fmt.Errorf("copy %s from %s: %w", r.WipBundlePath, beam.Alias, err)
+		return skip(CodeCheckpointFailed, "copy: "+firstLine(err.Error()))
 	}
 	if err := d.checkCopiedBundle(r.Name, dst); err != nil {
-		if !errors.Is(err, errBundleTooLarge) {
-			return err
+		if errors.Is(err, errBundleTooLarge) {
+			return skip(CodeBundleTooLarge, "the copy is over the size cap")
 		}
-		// checkCopiedBundle removed it; the beam's own size was under the cap.
-		return tooLarge(size)
+		return skip(CodeCheckpointFailed, firstLine(err.Error()))
 	}
-	return nil
+	return nil, nil
 }
 
 // logEntry builds a captain's log entry with payload marshalled to JSON
