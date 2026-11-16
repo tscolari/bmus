@@ -125,7 +125,11 @@ CREATE TABLE IF NOT EXISTS hails (
     original_decided_by TEXT NOT NULL DEFAULT '',
     -- The option the captain's last countermand picked, NULL for a
     -- free-text one or none (#54).
-    countermand_option  INTEGER
+    countermand_option  INTEGER,
+    -- 1 for a hail carried across a park on beam loss (#145): it stays open
+    -- while other hails of its order come and go, and its order isn't
+    -- hailing on its account.
+    carried             INTEGER NOT NULL DEFAULT 0
 );
 
 -- The budget extensions the captain granted (#119), one per budget hail

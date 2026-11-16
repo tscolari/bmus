@@ -298,7 +298,8 @@
         },
         "transcript_path": {"description": "Agent session transcript.", "type": "string", "minLength": 1},
         "handover_path": {"description": "Handover note written by the agent.", "type": "string", "minLength": 1},
-        "stopping": {"description": "True on the checkpoint that answers a stand_down or recall: the harness stops after it and the order ends with no report or error. Absent means the order runs on.", "type": "boolean"}
+        "stopping": {"description": "True on the checkpoint that answers a stand_down or recall: the harness stops after it and the order ends with no report or error. Absent means the order runs on.", "type": "boolean"},
+        "held": {"description": "The refs of the hails a park checkpoint holds (#145): the run parked on them, and the bridge keeps them open if the order parks before they are answered. Absent on any other checkpoint.", "type": "array", "items": {"type": "string", "minLength": 1}}
       }
     },
     "report": {
@@ -326,7 +327,9 @@
         "name": {"description": "The order repo's name.", "$ref": "#/$defs/repo_name"},
         "bundle_path": {"description": "Absolute path on the beam of a git bundle of `branch` minus the order's base commit, or of its whole history when the branch has no commits past it (git refuses an empty bundle).", "type": "string", "minLength": 1},
         "commit": {"description": "The commit `branch` points at in the bundle.", "type": "string", "minLength": 1},
-        "branch": {"description": "The branch the bundle carries, `bmus/<order>`.", "type": "string", "minLength": 1}
+        "branch": {"description": "The branch the bundle carries, `bmus/<order>`.", "type": "string", "minLength": 1},
+        "full_bundle_path": {"description": "A checkpoint's full bundle (#145), when bundle_path holds only what came after the previous checkpoint's commit: the bridge takes it when the incremental one doesn't verify. Absent when bundle_path is the full one.", "type": "string", "minLength": 1},
+        "wip_bundle_path": {"description": "A checkpoint's WIP bundle (#145): refs/bmus/wip/<order> and refs/bmus/kept-wip/<order>, those that exist, minus `branch` at `commit`. A file of its own, so the commits land even when the WIP can't. Absent when there is no WIP.", "type": "string", "minLength": 1}
       }
     },
     "repo_name": {
@@ -397,7 +400,8 @@
         "used_turns": {"description": "Main-loop turns the bridge recorded for the order on its other beams, as used_tokens. Absent means 0.", "type": "integer", "minimum": 0},
         "dossier": {"description": "Crew dossier of learned conventions (markdown).", "type": "string"},
         "model": {"description": "Model to run the order on: the order's own, else the crew member's, else its division's default. Opaque to the bridge; the harness checks it when the order starts and fails the order if it is unknown. Absent means the harness's default.", "type": "string", "minLength": 1},
-        "handover": {"description": "Handover note of the checkpoint the order resumes from; each repo's bundle then carries that checkpoint's commits. Absent on a fresh order.", "type": "string"}
+        "handover": {"description": "Handover note of the checkpoint the order resumes from; each repo's bundle then carries that checkpoint's commits. Absent on a fresh order.", "type": "string"},
+        "grants": {"description": "Tool calls the captain allowed on a hail carried across a park (#145), which the order's earlier run never got to make: the harness lets the same call through once, without a hail. Absent when there are none.", "type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["tool", "input"], "properties": {"tool": {"type": "string", "minLength": 1}, "input": {"type": "object"}}}}
       }
     },
     "order_repo": {

@@ -11,7 +11,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, beforeEach, describe, expect, inject, it, vi } from "vitest";
 import { BudgetExceeded, Stopped } from "../src/harness/common.js";
-import { checkFailReason, classifyGitPush, gitPushPolicy, GRANT_TTL_MS, RESULT_GRACE_MS, sdkHarness, WIND_DOWN_MS, type PushKind, type QueryFn } from "../src/harness/sdk.js";
+import { type CadenceEvent, checkFailReason, classifyGitPush, gitPushPolicy, GRANT_TTL_MS, RESULT_GRACE_MS, sdkHarness, WIND_DOWN_MS, type PushKind, type QueryFn } from "../src/harness/sdk.js";
 import type { HarnessReport, Inbound, Outbound, Role } from "../src/harness/types.js";
 import { onLines } from "../src/lines.js";
 import type { AnswerBody, BeamToBridgeMessage, ConsultBody, OrderBody, UsageBody } from "../src/protocol.js";
@@ -284,6 +284,10 @@ function start(
     stopTimeoutMs?: number;
     role?: Role;
     hailParkAfterMs?: number;
+    /** The checkpoint cadence (#145); both triggers are off unless given. */
+    checkpointEveryMs?: number;
+    checkpointTurns?: number;
+    onCadence?: (e: CadenceEvent) => void;
   },
 ) {
   const emitted: Outbound[] = [];
@@ -305,8 +309,15 @@ function start(
       ...(opts.claudePath !== undefined && { claudePath: opts.claudePath }),
       ...(opts.role !== undefined && { role: opts.role }),
       ...(opts.hailParkAfterMs !== undefined && { hailParkAfterMs: opts.hailParkAfterMs }),
+      checkpointEveryMs: opts.checkpointEveryMs ?? 0,
+      checkpointTurns: opts.checkpointTurns ?? 0,
     },
-    { query, ...(opts.env && { env: opts.env }), ...(opts.stopTimeoutMs !== undefined && { stopTimeoutMs: opts.stopTimeoutMs }) },
+    {
+      query,
+      ...(opts.env && { env: opts.env }),
+      ...(opts.stopTimeoutMs !== undefined && { stopTimeoutMs: opts.stopTimeoutMs }),
+      ...(opts.onCadence && { onCadence: opts.onCadence }),
+    },
   );
   const repos = opts.repos ?? (opts.repo === undefined ? [] : [{ name: "app", dir: opts.repo, base_ref: "main", base_commit: "main" }]);
   const result = harness.run(
@@ -1642,11 +1653,15 @@ describe("sdk harness parking", () => {
     }, { dir, repo: dir, claudePath: fakeClaude(dir), hailParkAfterMs: PARK, ...(opts.role && { role: opts.role }) });
   }
 
-  /** Waits for n hails, then moves time to the threshold: the run parks. */
+  /**
+   * Waits for n hails, then moves time to the threshold: the run parks. The
+   * abort follows the park's checkpoint (#145), here a failed one: the repo
+   * isn't a git repo.
+   */
   async function park(run: ReturnType<typeof start>, n = 1): Promise<void> {
     await run.nth(n - 1);
     await vi.advanceTimersByTimeAsync(PARK);
-    expect(run.queries[0]!.options.abortController!.signal.aborted).toBe(true);
+    await run.queries[0]!.aborted();
   }
 
   it("parks a hail held past the threshold, keeps the run open, and resumes the same session once it is answered", async () => {
@@ -1666,7 +1681,7 @@ describe("sdk harness parking", () => {
       await vi.advanceTimersByTimeAsync(PARK - 1);
       expect(run.queries[0]!.options.abortController!.signal.aborted).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
-      expect(run.queries[0]!.options.abortController!.signal.aborted).toBe(true);
+      await run.queries[0]!.aborted();
       await vi.advanceTimersByTimeAsync(60 * 60_000);
       expect(settled).toBe(false);
       expect(run.queries).toHaveLength(1);
@@ -1745,7 +1760,8 @@ describe("sdk harness parking", () => {
     run.send({ type: "stand_down", body: { reason: "watch change" } });
     await expect(run.result).rejects.toBeInstanceOf(Stopped);
     expect(run.emitted.at(-1)).toMatchObject({ type: "checkpoint_ready", body: { stopping: true } });
-    expect(run.usages).toEqual([{ input_tokens: 300, output_tokens: 30, turns: 2 }]);
+    // The park's checkpoint (#145) reports the parked query's turn first.
+    expect(run.usages).toEqual([{ input_tokens: 100, output_tokens: 10, turns: 1 }, { input_tokens: 300, output_tokens: 30, turns: 2 }]);
   });
 
   it("hails a re-issue whose command or timeout differs from the allowed call's", async () => {
@@ -1966,7 +1982,7 @@ describe("sdk harness parking", () => {
     await vi.advanceTimersByTimeAsync(RESULT_GRACE_MS - 1); // for the CLI to record the result
     expect(agent.options.abortController!.signal.aborted).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
-    expect(agent.options.abortController!.signal.aborted).toBe(true);
+    await agent.aborted();
     run.answer(`sdk-${ORDER}-2`, "allow", 0);
     await run.result;
     expect(first).toBe(allowed("make deploy"));
@@ -2108,7 +2124,8 @@ describe("sdk harness parking", () => {
     run.send({ type: "stand_down", body: {} });
     release();
     await expect(run.result).rejects.toThrow(Stopped);
-    expect(run.emitted.map((m) => m.type === "checkpoint_ready" && m.body.stopping)).toEqual([false, true]);
+    // The hail, the park's checkpoint (#145) and the stop's.
+    expect(run.emitted.map((m) => m.type === "checkpoint_ready" && m.body.stopping)).toEqual([false, undefined, true]);
   });
 
   it("rejects the run on a belay during the resume's startup", async () => {
@@ -2150,7 +2167,8 @@ describe("sdk harness parking", () => {
     run.send({ type: "recall", body: {} }); // same tick: the resume hasn't started
     await expect(run.result).rejects.toThrow(Stopped);
     expect(first).toMatch(/^The captain is recalling this order\. .*request_handover.*\n\nThe captain allowed `make deploy`\. /s);
-    expect(run.emitted.map((m) => m.type)).toEqual(["hail", "checkpoint_ready"]);
+    // The park's checkpoint (#145), then the stop's.
+    expect(run.emitted.map((m) => m.type)).toEqual(["hail", "checkpoint_ready", "checkpoint_ready"]);
   });
 
   it("resumes with the stop request on a stand_down while parked, and the checkpoint still lands", async () => {
@@ -2177,7 +2195,8 @@ describe("sdk harness parking", () => {
     expect(first).toContain(`\n\nYour request to run \`make deploy\` was never answered. ${PAUSED}; the captain never refused it.`);
     expect(first).not.toContain("The captain allowed");
     expect(run.queries[1]!.options.resume).toBe("sess-1");
-    expect(run.emitted.map((m) => m.type === "checkpoint_ready" && m.body.stopping)).toEqual([false, true]);
+    // The hail, the park's checkpoint (#145) and the stop's.
+    expect(run.emitted.map((m) => m.type === "checkpoint_ready" && m.body.stopping)).toEqual([false, undefined, true]);
   });
 
   it("rejects the run on a belay while parked", async () => {
@@ -2889,6 +2908,21 @@ describe("serve --harness sdk", () => {
     expect(overCap.stderr).toContain("is too long (at most 596h)");
     const checkModel = await serveFails(dir, undefined, ["--harness", "holodeck", "--check-model", "x"]);
     expect(checkModel.stderr).toContain("--check-model is only for --harness sdk");
+    // The checkpoint cadence (#145).
+    const every = await serveFails(dir, undefined, ["--harness", "holodeck", "--checkpoint-every", "1h"]);
+    expect(every.stderr).toContain("--checkpoint-every is only for --harness sdk");
+    const turns = await serveFails(dir, undefined, ["--harness", "echo", "--checkpoint-turns", "5"]);
+    expect(turns.stderr).toContain("--checkpoint-turns is only for --harness sdk");
+    const often = await serveFails(dir, undefined, ["--harness", "sdk", "--checkpoint-every", "often"]);
+    expect(often.stderr).toContain("--checkpoint-every often is not a duration (e.g. 15m, 1h; 0 turns it off)");
+    const short = await serveFails(dir, undefined, ["--harness", "sdk", "--checkpoint-every", "30s"]);
+    expect(short.stderr).toContain("--checkpoint-every 30s is too short (at least 1m; 0 turns it off)");
+    const longEvery = await serveFails(dir, undefined, ["--harness", "sdk", "--checkpoint-every", "597h"]);
+    expect(longEvery.stderr).toContain("--checkpoint-every 597h is too long (at most 596h)");
+    for (const bad of ["ten", "1.5", "1e3"]) {
+      const t = await serveFails(dir, undefined, ["--harness", "sdk", "--checkpoint-turns", bad]);
+      expect(t.stderr).toContain(`--checkpoint-turns ${bad} is not a whole number of turns (0 turns it off)`);
+    }
   });
 
   it("parses --hail-park-after's durations", () => {
@@ -2960,3 +2994,317 @@ function accepts(socket: string): Promise<boolean> {
     c.once("error", () => resolve(false));
   });
 }
+
+describe("sdk harness automatic checkpoints (#145)", () => {
+  const PARK = 60_000;
+  const DEPLOY = { command: "make deploy", timeout: 30_000, description: "Deploy the app" };
+  const sh = (repo: string, ...args: string[]) => git(repo, ...args);
+  const checkpoints = (run: ReturnType<typeof start>) => run.emitted.filter((m) => m.type === "checkpoint_ready");
+  /** Lets ms of real time pass, fake timers or not (they fake setTimeout only): git runs meanwhile. */
+  async function sleepReal(ms: number): Promise<void> {
+    const end = Date.now() + ms;
+    while (Date.now() < end) await new Promise<void>((r) => setImmediate(r));
+  }
+  /** Waits (real time) until cond holds, or fails after 10s. */
+  async function until(cond: () => boolean, what: string): Promise<void> {
+    const end = Date.now() + 10_000;
+    while (!cond() && Date.now() < end) await sleepReal(5);
+    if (!cond()) expect.fail(`timed out waiting for ${what}`);
+  }
+
+  afterEach(() => vi.useRealTimers());
+
+  it("writes a checkpoint at a park, before the abort, with the work in progress and a note naming the held hail", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = tempDir();
+    const repo = gitRepo(dir);
+    fs.writeFileSync(path.join(repo, "a.txt"), "edited\n");
+    fs.writeFileSync(path.join(repo, "new.txt"), "new\n");
+    sh(repo, "add", "new.txt");
+    fs.writeFileSync(path.join(repo, "new.txt"), "newer\n");
+    fs.writeFileSync(path.join(repo, "untracked.txt"), "u\n");
+    const state = () => [sh(repo, "status", "--porcelain"), sh(repo, "ls-files", "--stage"), sh(repo, "diff"), fs.readFileSync(path.join(repo, "new.txt"), "utf8")];
+    const was = state();
+    let before: number | undefined;
+    const run = start(async function* (agent) {
+      if (agent.options.resume !== undefined) return yield success;
+      await agent.nextInput();
+      yield init;
+      agent.options.abortController!.signal.addEventListener("abort", () => (before = checkpoints(run).length), { once: true });
+      void agent.hold("Bash", DEPLOY);
+      await agent.aborted();
+      throw new Error("Claude Code process aborted by user");
+    }, { dir, repo, claudePath: fakeClaude(dir), hailParkAfterMs: PARK });
+    await run.nth(0);
+    await vi.advanceTimersByTimeAsync(PARK);
+    await run.queries[0]!.aborted();
+    expect(before).toBe(1);
+    const cp = checkpoints(run)[0]!;
+    if (cp.type !== "checkpoint_ready") throw new Error("unreachable");
+    expect(cp.body.held).toEqual([`sdk-${ORDER}-1`]);
+    expect(cp.body.stopping).toBeUndefined();
+    const note = fs.readFileSync(cp.body.handover_path, "utf8");
+    expect(note).toContain("the session parked on 1 hail(s)");
+    expect(note).toContain("- Run `make deploy`?");
+    expect(fs.existsSync(cp.body.transcript_path)).toBe(true);
+    expect(sh(repo, "bundle", "list-heads", cp.body.repos[0]!.bundle_path)).toContain(`refs/heads/bmus/${ORDER}`);
+    expect(sh(repo, "bundle", "list-heads", cp.body.repos[0]!.wip_bundle_path!)).toContain(`refs/bmus/wip/${ORDER}`);
+    const wip = sh(repo, "rev-parse", `refs/bmus/wip/${ORDER}`);
+    expect(sh(repo, "rev-parse", `${wip}^`)).toBe(sh(repo, "rev-parse", `bmus/${ORDER}`));
+    // The work tree as it is, staged or not, untracked included.
+    expect(sh(repo, "show", `${wip}:new.txt`)).toBe("newer");
+    expect(sh(repo, "show", `${wip}:untracked.txt`)).toBe("u");
+    expect(sh(repo, "show", `${wip}:a.txt`)).toBe("edited");
+    // The agent's work tree and index are as they were.
+    expect(state()).toEqual(was);
+    run.answer(`sdk-${ORDER}-1`, "allow", 0);
+    await run.result;
+  });
+
+  it("holds the park's abort for a call let through while its checkpoint was written, until RESULT_GRACE_MS after its PostToolUse", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = tempDir();
+    const repo = gitRepo(dir);
+    const TEST = { command: "make test", timeout: 1000, description: "Test" };
+    let agent!: Agent;
+    const run = start(async function* (a) {
+      if (a.options.resume !== undefined) {
+        await a.nextInput();
+        return yield success;
+      }
+      agent = a;
+      await a.nextInput();
+      yield init;
+      void a.hold("Bash", DEPLOY, "u-deploy");
+      await a.aborted();
+      throw new Error("Claude Code process aborted by user");
+    }, { dir, repo, claudePath: fakeClaude(dir), hailParkAfterMs: PARK, body: { grants: [{ tool: "Bash", input: TEST }] } });
+    await run.nth(0);
+    await vi.advanceTimersByTimeAsync(PARK); // the park starts writing its checkpoint
+    // A call the order's grant lets through meanwhile is running.
+    expect(await agent.hold("Bash", TEST, "u-test")).toEqual({ behavior: "allow", updatedInput: TEST });
+    expect(await run.nth(1)).toMatchObject({ type: "checkpoint_ready", body: { held: [`sdk-${ORDER}-1`] } });
+    await new Promise((r) => setImmediate(r));
+    expect(agent.options.abortController!.signal.aborted).toBe(false);
+    await agent.postToolUse("Bash", TEST, "u-test");
+    await vi.advanceTimersByTimeAsync(RESULT_GRACE_MS - 1);
+    expect(agent.options.abortController!.signal.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(agent.options.abortController!.signal.aborted).toBe(true);
+    run.answer(`sdk-${ORDER}-1`, "allow", 0);
+    await run.result;
+  });
+
+  it("lets a resumed run re-issue a carried tool_approval the captain allowed, once and without a hail; unanswered, it hails", async () => {
+    const dir = tempDir();
+    let first: PermissionResult | null | undefined;
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      // The model rewords the description; the grant matches all the same.
+      first = await agent.canUseTool("Bash", { ...DEPLOY, description: "Ship it" });
+      await agent.canUseTool("Bash", DEPLOY);
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { grants: [{ tool: "Bash", input: DEPLOY }] } });
+    const hail = await run.nth(0);
+    expect(first).toEqual({ behavior: "allow", updatedInput: { ...DEPLOY, description: "Ship it" } });
+    // Single use: the second call is a hail of its own.
+    expect(hail).toMatchObject({ type: "hail", body: { category: "tool_approval", question: "Run `make deploy`?" } });
+    run.answer(`sdk-${ORDER}-1`, "allow", 0);
+    await run.result;
+
+    // An order's grant outlives GRANT_TTL_MS and a park: unused, the resumed query still takes it.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let late: PermissionResult | null | undefined;
+    const parked = start(async function* (agent) {
+      if (agent.options.resume !== undefined) {
+        await agent.nextInput();
+        late = await agent.canUseTool("Bash", DEPLOY);
+        return yield success;
+      }
+      await agent.nextInput();
+      yield init;
+      void agent.hold("Bash", { command: "make test", timeout: 1000, description: "test" });
+      await agent.aborted();
+      throw new Error("Claude Code process aborted by user");
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), hailParkAfterMs: 60_000, body: { grants: [{ tool: "Bash", input: DEPLOY }] } });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await parked.nth(0);
+    await vi.advanceTimersByTimeAsync(GRANT_TTL_MS + 60_000);
+    await parked.queries[0]!.aborted();
+    parked.answer(`sdk-${ORDER}-1`, "allow", 0);
+    await parked.result;
+    expect(late).toEqual({ behavior: "allow", updatedInput: DEPLOY });
+    vi.useRealTimers();
+
+    // Without the grant (the carried hail unanswered), the re-issue hails.
+    const plain = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      await agent.canUseTool("Bash", DEPLOY);
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir) });
+    expect(await plain.nth(0)).toMatchObject({ type: "hail", body: { category: "tool_approval", question: "Run `make deploy`?" } });
+    plain.answer(`sdk-${ORDER}-1`, "allow", 0);
+    await plain.result;
+  });
+
+  /**
+   * A run whose agent takes a turn each time the test calls turn(), after
+   * the turn's change to the repo. events are the cadence's (SdkDeps.onCadence).
+   */
+  function turns(dir: string, repo: string, opts: { checkpointTurns?: number; checkpointEveryMs?: number }) {
+    const queue: (() => void)[] = [];
+    const events: CadenceEvent[] = [];
+    let wake: (() => void) | undefined;
+    let done = false;
+    let waiting = false;
+    let n = 0;
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      for (;;) {
+        while (queue.length === 0 && !done) {
+          waiting = true;
+          await new Promise<void>((r) => (wake = r));
+          waiting = false;
+        }
+        if (queue.length === 0) break;
+        queue.shift()!();
+        yield assistant(`t${++n}`, { input: 1, output: 1 });
+      }
+      yield success;
+    }, { dir, repo, claudePath: fakeClaude(dir), onCadence: (e) => events.push(e), ...opts });
+    const outcomes = () => events.filter((e) => e !== "check");
+    return {
+      run,
+      events,
+      turn: (change?: () => void) => {
+        queue.push(() => change?.());
+        wake?.();
+      },
+      /** Waits until the harness has taken k turns (the agent waits for the next one). */
+      async taken(k: number) {
+        await until(() => queue.length === 0 && n >= k && waiting, `${k} turns`);
+      },
+      /** Waits for the cadence's kth outcome (1-based) and returns it. */
+      async outcome(k: number): Promise<CadenceEvent> {
+        await until(() => outcomes().length >= k, `cadence outcome ${k}`);
+        return outcomes()[k - 1]!;
+      },
+      end: async () => {
+        done = true;
+        wake?.();
+        await run.result;
+      },
+    };
+  }
+
+  it("fires on its turns only when something changed since the latest checkpoint", async () => {
+    const dir = tempDir();
+    const repo = gitRepo(dir);
+    const t = turns(dir, repo, { checkpointTurns: 3 });
+    for (let i = 0; i < 3; i++) t.turn();
+    await t.taken(3);
+    expect(await t.outcome(1)).toBe("unchanged");
+    t.turn(() => fs.writeFileSync(path.join(repo, "wip.txt"), "wip\n"));
+    t.turn();
+    await t.taken(5);
+    expect(t.events).toEqual(["check", "unchanged"]); // 2 turns since the last check
+    t.turn();
+    await t.taken(6);
+    expect(await t.outcome(2)).toBe("written");
+    const cp = checkpoints(t.run)[0]!;
+    if (cp.type !== "checkpoint_ready") throw new Error("unreachable");
+    expect(cp.body.held).toBeUndefined();
+    expect(fs.readFileSync(cp.body.handover_path, "utf8")).toContain("a cadence checkpoint the harness wrote while the agent worked (every 3 turns");
+    expect(sh(repo, "bundle", "list-heads", cp.body.repos[0]!.wip_bundle_path!)).toContain(`refs/bmus/wip/${ORDER}`);
+    // Nothing changed since: three more turns write nothing.
+    for (let i = 0; i < 3; i++) t.turn();
+    await t.taken(9);
+    expect(await t.outcome(3)).toBe("unchanged");
+    expect(checkpoints(t.run)).toHaveLength(1);
+    // A commit is a change too.
+    t.turn(() => {
+      sh(repo, "add", "wip.txt");
+      sh(repo, "commit", "-q", "-m", "wip");
+    });
+    t.turn();
+    t.turn();
+    await t.taken(12);
+    expect(await t.outcome(4)).toBe("written");
+    const second = checkpoints(t.run)[1]!;
+    if (second.type !== "checkpoint_ready") throw new Error("unreachable");
+    // From the first one's commit, with the full bundle beside it; nothing uncommitted is left.
+    expect(second.body.repos[0]!.full_bundle_path).toMatch(/app\.full\.bundle$/);
+    expect(second.body.repos[0]!.wip_bundle_path).toBeUndefined();
+    await t.end();
+    expect(t.events.filter((e) => e === "check")).toHaveLength(4);
+  });
+
+  it("fires on its interval only when something changed", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const EVERY = 15 * 60_000;
+    const dir = tempDir();
+    const repo = gitRepo(dir);
+    const t = turns(dir, repo, { checkpointEveryMs: EVERY });
+    t.turn();
+    await t.taken(1);
+    await vi.advanceTimersByTimeAsync(EVERY);
+    expect(await t.outcome(1)).toBe("unchanged");
+    fs.writeFileSync(path.join(repo, "wip.txt"), "wip\n");
+    await vi.advanceTimersByTimeAsync(EVERY - 1);
+    expect(t.events).toEqual(["check", "unchanged"]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await t.outcome(2)).toBe("written");
+    expect(checkpoints(t.run)).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(EVERY);
+    expect(await t.outcome(3)).toBe("unchanged");
+    expect(checkpoints(t.run)).toHaveLength(1);
+    await t.end();
+  });
+
+  it("chains a harness note with the agent's latest note and the handover the run started from", async () => {
+    const dir = tempDir();
+    const repo = gitRepo(dir);
+    const transcript = path.join(dir, "t.jsonl");
+    fs.writeFileSync(transcript, "{}\n");
+    const events: CadenceEvent[] = [];
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      await agent.preToolUse("Read", {}, transcript);
+      expect((await agent.callTool("request_handover", { note: "agent: half done" })).isError).toBeUndefined();
+      fs.writeFileSync(path.join(repo, "wip.txt"), "wip\n");
+      yield assistant("t1", { input: 1, output: 1 });
+      while (!events.includes("written")) await new Promise<void>((r) => setImmediate(r));
+      yield success;
+    }, { dir, repo, claudePath: fakeClaude(dir), checkpointTurns: 1, onCadence: (e) => events.push(e), body: { handover: "run 1: the plan\n\nThe captain answered hail H-0001." } });
+    await run.result;
+    const cps = run.emitted.filter((m) => m.type === "checkpoint_ready");
+    expect(cps).toHaveLength(2);
+    const cadence = cps[1]!;
+    if (cadence.type !== "checkpoint_ready") throw new Error("unreachable");
+    const note = fs.readFileSync(cadence.body.handover_path, "utf8");
+    expect(note).toContain("a cadence checkpoint the harness wrote while the agent worked");
+    expect(note).toContain("the session's transcript stays in the bridge's cargo bay");
+    expect(note).not.toContain("Read the transcript");
+    expect(note).toContain("The agent's latest handover note in this run:\nagent: half done");
+    expect(note).toContain("The handover note this run started from:\nrun 1: the plan\n\nThe captain answered hail H-0001.");
+  });
+
+  it("never fires with both triggers set to 0", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const dir = tempDir();
+    const repo = gitRepo(dir);
+    const t = turns(dir, repo, { checkpointTurns: 0, checkpointEveryMs: 0 });
+    for (let i = 0; i < 12; i++) t.turn(() => fs.appendFileSync(path.join(repo, "wip.txt"), `${i}\n`));
+    await t.taken(12);
+    await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+    await t.end();
+    expect(t.events).toEqual([]);
+    expect(checkpoints(t.run)).toHaveLength(0);
+  });
+});

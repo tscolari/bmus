@@ -502,6 +502,11 @@ describe("validateScript", () => {
     ["report with branch", [{ at_pct: 100, report: { summary: "x", branch: "b" } }], "step 0: unknown report key branch"],
     ["report no summary", [{ at_pct: 100, report: {} }], "step 0: report.summary must be a string"],
     ["report bad artifacts", [{ at_pct: 100, report: { summary: "x", artifacts: "a" } }], "step 0: report.artifacts must be an array of strings"],
+    ["write outside the repo", [{ at_pct: 0, write: "../x" }, report], "step 0: write must be a relative path inside the repo, outside .git"],
+    ["write absolute", [{ at_pct: 0, write: "/tmp/x" }, report], "step 0: write must be a relative path"],
+    ["write into .git", [{ at_pct: 0, write: ".git/config" }, report], "step 0: write must be a relative path"],
+    ["park_after_ms without hail", [{ at_pct: 0, progress: "p", park_after_ms: 5 }, report], "step 0: park_after_ms goes only with hail"],
+    ["park_after_ms negative", [{ at_pct: 0, hail: { category: "c", question: "q" }, park_after_ms: -1 }, report], "step 0: park_after_ms must be an integer"],
   ];
   it.each(cases)("rejects %s", (_, script, message) => {
     expect(() => validateScript(script)).toThrow(message);
@@ -513,6 +518,42 @@ describe("validateScript", () => {
 });
 
 describe("holodeck run (in process)", () => {
+  it("parks a hail with park_after_ms: a checkpoint holding the hail, with the written file as WIP; a resumed order walks past it (#145)", async () => {
+    const dir = tempDir();
+    const { repo, commit } = orderBundle(dir, ORDER);
+    const { checkoutRepos } = await import("../src/repos.js");
+    const repos = await checkoutRepos(path.join(dir, "work"), ORDER, [repo]);
+    const script = path.join(dir, "park.json");
+    fs.writeFileSync(script, JSON.stringify([
+      { at_pct: 10, write: "notes/wip.txt" },
+      { at_pct: 20, hail: { category: "clarifying_question", question: "Which way?" }, park_after_ms: 20 },
+      { at_pct: 50, progress: "after the hail" },
+      { at_pct: 100, report: { summary: "done" } },
+    ]));
+    const h = holodeckHarness({ script, stepLog: path.join(dir, "steps.ndjson"), workDir: path.join(dir, "work") });
+    const emitted: Outbound[] = [];
+    let deliver!: (m: Inbound) => void;
+    const run = h.run({ id: ORDER, body: orderBody, repos }, (m) => emitted.push(m), (fn) => (deliver = fn));
+    await vi.waitFor(() => expect(emitted.map((m) => m.type)).toEqual(["hail", "checkpoint_ready"]));
+    const cp = emitted[1]!;
+    if (cp.type !== "checkpoint_ready") throw new Error("unreachable");
+    expect(cp.body.held).toEqual([`holodeck-${ORDER}-1`]);
+    expect(cp.body.transcript_path).toBe(path.join(dir, "work", ORDER, "1", "transcript.jsonl"));
+    const note = fs.readFileSync(cp.body.handover_path, "utf8");
+    expect(note).toContain("The holodeck parked its script at step 1.");
+    expect(git(dir, "bundle", "list-heads", cp.body.repos[0]!.wip_bundle_path!)).toContain(`refs/bmus/wip/${ORDER}`);
+    expect(git(repos[0]!.dir, "show", `refs/bmus/wip/${ORDER}:notes/wip.txt`)).toBe(`${ORDER} step 0`);
+    expect(git(repos[0]!.dir, "rev-parse", `bmus/${ORDER}`)).toBe(commit);
+    expect(stepLog(dir).map((e) => e.action)).toEqual(["write", "park"]);
+    deliver({ type: "answer", body: { ref: `holodeck-${ORDER}-1`, hail_id: "H-0001", decided_by: "captain", decision: "left" } });
+    await run;
+
+    // Resumed from the park's checkpoint: the walk starts after the hail.
+    const before = stepLog(dir).length;
+    await h.run({ id: ORDER, body: { ...orderBody, handover: note }, repos }, () => {}, () => {});
+    expect(stepLog(dir).slice(before).map((e) => e.action)).toEqual(["progress", "report"]);
+  });
+
   it("records the order's model, handover, budget and used counts in the step log, and nothing without them", async () => {
     const dir = tempDir();
     const script = path.join(dir, "short.json");

@@ -16,7 +16,7 @@ import {
   type UsageBody,
   type WorkRepo,
 } from "../protocol.js";
-import { bundleWork } from "../repos.js";
+import { bundleWip, bundleWork, recordEmitted, snapshotNote, snapshotWip, type Snapshot } from "../repos.js";
 import type { Order } from "./types.js";
 
 /** Rejects with the signal's reason once it aborts, if p hasn't settled. */
@@ -48,11 +48,68 @@ export function checkpointFiles(dir: string) {
   };
 }
 
-/** Bundles each of the order's repos into `<dir>/<name>.bundle` (see bundleWork), in order. */
-export async function bundleCheckpoint(dir: string, order: Order): Promise<WorkRepo[]> {
-  const out: WorkRepo[] = [];
-  for (const r of order.repos) out.push(await bundleWork(r, order.id, path.join(dir, `${r.name}.bundle`)));
-  return out;
+/**
+ * Snapshots each of the order's repos' work in progress (snapshotWip,
+ * #145) and bundles it, in order: `bmus/<order>` into `<dir>/<name>.bundle`
+ * (see bundleWork) and the WIP refs into `<dir>/<name>.wip.bundle`
+ * (bundleWip), named in `wip_bundle_path`. since holds each repo's previous
+ * checkpoint commit, by name: that repo's bundle starts there, with the
+ * full one beside it. Each checkout records the checkpoint as emitted
+ * (recordEmitted). key says what the checkpoint holds (each repo's tip and
+ * work tree), so a harness can tell whether anything changed since
+ * (workKey); notes are what the snapshots left out, for the checkpoint's
+ * note.
+ */
+export async function bundleCheckpoint(
+  dir: string,
+  order: Order,
+  since: Record<string, string> = {},
+): Promise<{ repos: WorkRepo[]; key: string; notes: string[] }> {
+  const repos: WorkRepo[] = [];
+  const keys: string[] = [];
+  const notes: string[] = [];
+  for (const r of order.repos) {
+    const snap = await snapshotWip(r, order.id);
+    keys.push(keyOf(r.name, snap));
+    notes.push(...snapshotNote(r.name, snap));
+    const prev = since[r.name];
+    const work = await bundleWork(r, order.id, path.join(dir, `${r.name}.bundle`), prev !== undefined ? { since: prev } : {});
+    const wip = await bundleWip(r, order.id, work.commit, path.join(dir, `${r.name}.wip.bundle`));
+    await recordEmitted(r.dir, order.id, work.commit, snap.commit);
+    repos.push({ ...work, ...(wip !== undefined && { wip_bundle_path: wip }) });
+  }
+  return { repos, key: keys.join(" "), notes };
+}
+
+const keyOf = (name: string, snap: Snapshot) => `${name}:${snap.tip}:${snap.tree}:${snap.skipped ?? ""}`;
+
+/**
+ * What the order's repos hold now, as bundleCheckpoint's key: each repo's
+ * `bmus/<order>` tip and work tree. It writes no object and moves no ref.
+ */
+export async function workKey(order: Order): Promise<string> {
+  const keys: string[] = [];
+  for (const r of order.repos) keys.push(keyOf(r.name, await snapshotWip(r, order.id, { commit: false })));
+  return keys.join(" ");
+}
+
+/**
+ * A harness-written checkpoint note (#145) chained with what the next run
+ * needs from earlier ones: the latest note the agent wrote in this run, and
+ * the handover note this run started from (which holds the notes before
+ * it, the carried answers and the WIP lines). A later run gets only the
+ * note of the checkpoint it resumes from.
+ */
+export function chainNote(own: string, started: string | undefined, agent: string | undefined): string {
+  const parts = [own.trimEnd()];
+  if (agent !== undefined && agent.trim() !== "") parts.push(`The agent's latest handover note in this run:\n${agent.trim()}`);
+  if (started !== undefined && started.trim() !== "") parts.push(`The handover note this run started from:\n${started.trim()}`);
+  return parts.join("\n\n");
+}
+
+/** note with notes, if any, after a blank line. */
+export function withNotes(note: string, notes: string[]): string {
+  return notes.length === 0 ? note : `${note.trimEnd()}\n\n${notes.join("\n")}`;
 }
 
 /**
@@ -65,13 +122,14 @@ export async function writePlaceholderCheckpoint(
   order: Order,
   transcript: Record<string, unknown>,
   note: string,
+  since: Record<string, string> = {},
 ): Promise<CheckpointReadyBody> {
   fs.mkdirSync(dir, { recursive: true });
-  const repos = await bundleCheckpoint(dir, order);
+  const { repos, notes } = await bundleCheckpoint(dir, order, since);
   const files = checkpointFiles(dir);
   // No fsync on purpose: these are placeholders, written before checkpoint_ready is emitted.
   fs.writeFileSync(files.transcript_path, JSON.stringify(transcript) + "\n");
-  fs.writeFileSync(files.handover_path, note + "\n");
+  fs.writeFileSync(files.handover_path, withNotes(note, notes) + "\n");
   return { repos, ...files };
 }
 

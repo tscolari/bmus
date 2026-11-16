@@ -268,8 +268,9 @@ var addedColumns = []struct{ table, column, def string }{
 	{"hails", "decided_at", `TIMESTAMP`},
 	{"hails", "countermanded_at", `TIMESTAMP`},
 	{"hails", "original_decided_by", `TEXT NOT NULL DEFAULT ''`},
-	{"hails", "countermand_option", `INTEGER`}, // #54
-	{"beams", "removed_at", `TIMESTAMP`},       // #111
+	{"hails", "countermand_option", `INTEGER`},         // #54
+	{"hails", "carried", `INTEGER NOT NULL DEFAULT 0`}, // #145
+	{"beams", "removed_at", `TIMESTAMP`},               // #111
 	{"beams", "labels", `TEXT NOT NULL DEFAULT '{}'`},
 	{"orders", "budget_turns", `INTEGER NOT NULL DEFAULT 0`},
 	{"orders", "budget_extended", `INTEGER NOT NULL DEFAULT 0`},
@@ -2230,6 +2231,10 @@ type Hail struct {
 	// countermand from before #54).
 	CountermandedAt   *time.Time
 	CountermandOption *int
+	// Carried marks a hail held across a park on beam loss (#145): the
+	// order's other hails don't wait on it, OpenHailForOrder skips it, and
+	// closing it leaves the order's and crew member's states alone.
+	Carried bool
 }
 
 // CountermandedAway reports whether the captain countermanded h to
@@ -2283,18 +2288,31 @@ func (s *Store) InsertHail(ctx context.Context, h Hail, entry LogEntry) (string,
 	}
 	var id string
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
-		err := tx.QueryRowContext(ctx, `SELECT id FROM hails WHERE order_id = ? AND status = ? ORDER BY rowid LIMIT 1`,
-			h.OrderID, HailOpen).Scan(&id)
+		// A carried hail (#145) is found only by its own question.
+		dedupe, args := `SELECT id FROM hails WHERE order_id = ? AND status = ? AND carried = 0 ORDER BY rowid LIMIT 1`, []any{h.OrderID, HailOpen}
+		if h.Carried {
+			dedupe, args = `SELECT id FROM hails WHERE order_id = ? AND status = ? AND carried = 1 AND category = ? AND question = ? ORDER BY rowid LIMIT 1`,
+				[]any{h.OrderID, HailOpen, h.Category, h.Question}
+		}
+		err := tx.QueryRowContext(ctx, dedupe, args...).Scan(&id)
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
 		if id, err = nextID(ctx, tx, "hails", "H-%04d"); err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO hails (id, order_id, crew_id, category, question, options, context, route, status, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			id, h.OrderID, h.CrewID, h.Category, h.Question, string(opts), string(h.Context), h.Route, HailOpen, entry.TS.UTC())
+		_, err = tx.ExecContext(ctx, `INSERT INTO hails (id, order_id, crew_id, category, question, options, context, route, status, created_at, carried)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			id, h.OrderID, h.CrewID, h.Category, h.Question, string(opts), string(h.Context), h.Route, HailOpen, entry.TS.UTC(), h.Carried)
 		if err != nil {
+			return err
+		}
+		if h.Carried {
+			// Its run is gone: nobody is hailing on its account.
+			if entry.Payload, err = withField(entry.Payload, "hail_id", id); err != nil {
+				return err
+			}
+			_, err = s.appendLog(ctx, tx, entry)
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE crew SET status = ? WHERE id = ? AND status = ?
@@ -2397,7 +2415,7 @@ func (s *Store) InsertBridgeHail(ctx context.Context, h Hail, entry LogEntry) (s
 // strings (#151).
 const hailCols = `id, COALESCE(order_id, ''), COALESCE(crew_id, ''), COALESCE(deliver_to, ''), category, question, options, context, route, status,
 	decided_by, decision, rationale, confidence, countermand_until, created_at, decided_at, original_decided_by, countermanded_at,
-	countermand_option`
+	countermand_option, carried`
 
 func scanHail(row interface{ Scan(...any) error }) (Hail, error) {
 	var (
@@ -2409,7 +2427,7 @@ func scanHail(row interface{ Scan(...any) error }) (Hail, error) {
 		cmo        sql.NullInt64
 	)
 	err := row.Scan(&h.ID, &h.OrderID, &h.CrewID, &h.DeliverTo, &h.Category, &h.Question, &opts, &hctx, &h.Route, &h.Status,
-		&h.DecidedBy, &h.Decision, &h.Rationale, &conf, &cu, &ca, &da, &h.OriginalDecidedBy, &cma, &cmo)
+		&h.DecidedBy, &h.Decision, &h.Rationale, &conf, &cu, &ca, &da, &h.OriginalDecidedBy, &cma, &cmo, &h.Carried)
 	if err != nil {
 		return Hail{}, err
 	}
@@ -2458,10 +2476,52 @@ func (s *Store) GetHailLocked(ctx context.Context, id string) (h Hail, now time.
 	return h, now, err
 }
 
+// CarryHail marks open hail id carried (#145), and sets its order back to
+// away if it was hailing: the run that raised the hail is gone, and the
+// order's next run raises hails of its own. It reports whether the hail
+// was open. A re-run changes nothing more.
+func (s *Store) CarryHail(ctx context.Context, id string) (open bool, err error) {
+	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		var status string
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM hails WHERE id = ?`, id).Scan(&status); err != nil {
+			return err
+		}
+		if open = status == HailOpen; !open {
+			return nil
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE hails SET carried = 1 WHERE id = ?`, id); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE orders SET state = ? WHERE id = (SELECT order_id FROM hails WHERE id = ?) AND state = ?`,
+			OrderAway, id, OrderHailing)
+		return err
+	})
+	return open, err
+}
+
+// OpenCarriedHails lists orderID's open carried hails (#145), oldest first.
+func (s *Store) OpenCarriedHails(ctx context.Context, orderID string) ([]Hail, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+hailCols+` FROM hails WHERE order_id = ? AND status = ? AND carried = 1 ORDER BY rowid`,
+		orderID, HailOpen)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Hail
+	for rows.Next() {
+		h, err := scanHail(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
 // OpenHailForOrder returns orderID's open hail, if it has one (an order has
 // at most one, see InsertHail). found is false when none is open.
 func (s *Store) OpenHailForOrder(ctx context.Context, orderID string) (h Hail, found bool, err error) {
-	h, err = scanHail(s.db.QueryRowContext(ctx, `SELECT `+hailCols+` FROM hails WHERE order_id = ? AND status = ? ORDER BY rowid LIMIT 1`,
+	h, err = scanHail(s.db.QueryRowContext(ctx, `SELECT `+hailCols+` FROM hails WHERE order_id = ? AND status = ? AND carried = 0 ORDER BY rowid LIMIT 1`,
 		orderID, HailOpen))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Hail{}, false, nil
@@ -2899,6 +2959,14 @@ func (s *Store) decideOpenHail(ctx context.Context, tx *sql.Tx, id string, dec H
 // alone: #43) and the hail's order is still its order, away or hailing
 // (#48); the order only if hailing (#134).
 func hailClosedAway(ctx context.Context, tx *sql.Tx, id string) error {
+	var carried bool
+	if err := tx.QueryRowContext(ctx, `SELECT carried FROM hails WHERE id = ?`, id).Scan(&carried); err != nil {
+		return err
+	}
+	if carried {
+		// Nobody was hailing on a carried hail's account (#145).
+		return nil
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE crew SET status = ?
 		WHERE id = (SELECT crew_id FROM hails WHERE id = ?) AND status = ?
 		AND EXISTS (SELECT 1 FROM orders WHERE id = (SELECT order_id FROM hails WHERE id = ?)

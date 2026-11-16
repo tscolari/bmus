@@ -159,6 +159,10 @@ func TestSchemaRejects(t *testing.T) {
 			delete(b["repos"].([]any)[0].(map[string]any), "commit")
 		})},
 		{"checkpoint_ready with stopping as string", mutate("checkpoint_ready", func(_, b map[string]any) { b["stopping"] = "yes" })},
+		{"checkpoint_ready with an empty held ref", mutate("checkpoint_ready.park", func(_, b map[string]any) { b["held"] = []any{""} })},
+		{"checkpoint_ready with an empty full bundle path", mutate("checkpoint_ready.park", func(_, b map[string]any) {
+			b["repos"].([]any)[0].(map[string]any)["full_bundle_path"] = ""
+		})},
 		{"report with branch", mutate("report", func(_, b map[string]any) { b["branch"] = "bmus/ORD-0414" })},
 		{"report without repos", mutate("report", func(_, b map[string]any) { delete(b, "repos") })},
 		{"report with null repos", mutate("report", func(_, b map[string]any) { b["repos"] = nil })},

@@ -178,6 +178,12 @@ export interface CheckpointReadyBody {
   handover_path: string;
   /** True on the checkpoint that answers a stand_down or recall: the run stops after it, with no report or error. */
   stopping?: boolean;
+  /**
+   * The refs of the hails a park checkpoint holds (#145): the run parked on
+   * them, and the bridge keeps them open if the order parks before they are
+   * answered. Absent on any other checkpoint.
+   */
+  held?: string[];
 }
 
 /** The work in one repo of an order, as a git bundle on the beam's disk. */
@@ -190,6 +196,19 @@ export interface WorkRepo {
   commit: string;
   /** The branch the bundle carries, `bmus/<order>`. */
   branch: string;
+  /**
+   * A checkpoint's full bundle (#145), when bundle_path holds only what came
+   * after the previous checkpoint's commit: the bridge takes it when the
+   * incremental one doesn't verify. Absent when bundle_path is the full one.
+   */
+  full_bundle_path?: string;
+  /**
+   * A checkpoint's WIP bundle (#145): `refs/bmus/wip/<order>` and
+   * `refs/bmus/kept-wip/<order>`, those that exist, minus `branch` at
+   * `commit`. A file of its own, so the commits land even when the WIP
+   * can't. Absent when there is no WIP.
+   */
+  wip_bundle_path?: string;
 }
 
 export interface Usage {
@@ -303,6 +322,18 @@ export interface OrderBody {
   model?: string;
   /** Note of the checkpoint the order resumes from; each repo's bundle then carries that checkpoint's commits. Absent on a fresh order. */
   handover?: string;
+  /**
+   * Tool calls the captain allowed on a hail carried across a park (#145),
+   * which the earlier run never got to make: the harness lets the same call
+   * through once, without a hail.
+   */
+  grants?: OrderGrant[];
+}
+
+/** A tool call allowed in advance (#145), as the tool_approval hail's context named it. */
+export interface OrderGrant {
+  tool: string;
+  input: Record<string, unknown>;
 }
 
 /** One repo of an order. */

@@ -1295,8 +1295,25 @@ func (d *Daemon) backstop(ctx context.Context, crewID, orderID string, over bool
 	// Only from away or hailing, still crewID's and not parked, in one
 	// transaction with its entry, so it can't overwrite a mission that
 	// settled or parked meanwhile.
-	_, _, err = d.store.SettleAssignedOrder(ctx, orderID, crewID, store.OrderFailed, entry, over)
-	return err
+	if _, _, err = d.store.SettleAssignedOrder(ctx, orderID, crewID, store.OrderFailed, entry, over); err != nil {
+		return err
+	}
+	// Carried hails (#145) close once the order has ended: no run will
+	// ask them again. A parked order the backstop left alone keeps them.
+	o, err := d.store.GetOrder(ctx, orderID)
+	if err != nil || (o.State != store.OrderFailed && o.State != store.OrderDone && o.State != store.OrderBelayed) {
+		return err
+	}
+	carried, err := d.store.OpenCarriedHails(ctx, orderID)
+	if err != nil {
+		return err
+	}
+	for _, h := range carried {
+		if err := d.closeHailAs(ctx, MissionInput{OrderID: orderID, CrewID: crewID}, &openHail{ID: h.ID}, ": order "+o.State); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // toSickbay sets the crew member's status to sickbay (keeping its current

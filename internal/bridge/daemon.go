@@ -128,6 +128,13 @@ type Config struct {
 	// beam's CombadgeSpec.HailParkAfter. 0 passes no flag, leaving serve's
 	// default (15m); otherwise CheckHailParkAfter must pass.
 	HailParkAfter time.Duration
+	// CheckpointEvery and CheckpointTurns are the sdk harness's checkpoint
+	// cadence (combadge serve --checkpoint-every and --checkpoint-turns,
+	// #145): every beam's CombadgeSpec fields. nil passes no flag, leaving
+	// serve's defaults (15m, 10 turns); 0 turns that trigger off. Otherwise
+	// CheckCheckpointEvery and CheckCheckpointTurns must pass.
+	CheckpointEvery *time.Duration
+	CheckpointTurns *int
 	// ConsolePort is the port the console listens on, on 127.0.0.1;
 	// 0 picks a free one. NoConsole runs the bridge without the console.
 	ConsolePort int
@@ -216,6 +223,35 @@ func CheckHailParkAfter(d time.Duration) error {
 	return nil
 }
 
+// MinCheckpointEvery is the shortest Config.CheckpointEvery but 0 (#145),
+// as combadge serve has it: a checkpoint costs a snapshot, bundles and a
+// pull.
+const MinCheckpointEvery = time.Minute
+
+// CheckCheckpointEvery fails unless d is a --checkpoint-every combadge
+// serve takes (#145): 0 (off), or from MinCheckpointEvery to
+// MaxHailParkAfter.
+func CheckCheckpointEvery(d time.Duration) error {
+	switch {
+	case d == 0:
+		return nil
+	case d < 0:
+		return fmt.Errorf("%s is negative", d)
+	case d < MinCheckpointEvery:
+		return fmt.Errorf("%s is shorter than %s (0 turns it off)", d, MinCheckpointEvery)
+	}
+	return CheckHailParkAfter(d)
+}
+
+// CheckCheckpointTurns fails unless n is a --checkpoint-turns combadge
+// serve takes (#145): 0 (off) or more.
+func CheckCheckpointTurns(n int) error {
+	if n < 0 {
+		return fmt.Errorf("%d is negative", n)
+	}
+	return nil
+}
+
 // Daemon is a running bridge. Workflow code reaches it with daemonFrom.
 type Daemon struct {
 	home           string // absolute Config.Home; the cargo bay is <home>/cargo
@@ -235,6 +271,9 @@ type Daemon struct {
 	consultTimeout time.Duration             // cmp.Or(Config.ConsultTimeout, DefaultConsultTimeout)
 	tracker        tracker.Tracker           // Config.Tracker; nil: none
 	hailParkAfter  time.Duration             // Config.HailParkAfter
+	// checkpointEvery and checkpointTurns are Config's (#145).
+	checkpointEvery *time.Duration
+	checkpointTurns *int
 
 	// standingOrdersDefault is Config.StandingOrders. settingsMu serialises
 	// StandingOrders' seeding with SetStandingOrders, so a seed can't
@@ -387,6 +426,16 @@ func Run(ctx context.Context, cfg Config) (err error) {
 			return fmt.Errorf("bridge: hail park after: %w", err)
 		}
 	}
+	if cfg.CheckpointEvery != nil {
+		if err := CheckCheckpointEvery(*cfg.CheckpointEvery); err != nil {
+			return fmt.Errorf("bridge: checkpoint every: %w", err)
+		}
+	}
+	if cfg.CheckpointTurns != nil {
+		if err := CheckCheckpointTurns(*cfg.CheckpointTurns); err != nil {
+			return fmt.Errorf("bridge: checkpoint turns: %w", err)
+		}
+	}
 	if !cfg.NoConsole {
 		if err := console.CheckPort(cfg.ConsolePort); err != nil {
 			return fmt.Errorf("bridge: %w", err)
@@ -485,6 +534,7 @@ func Run(ctx context.Context, cfg Config) (err error) {
 		standingOrdersDefault: cfg.StandingOrders, wakeSend: cfg.wakeSend,
 		regs: cfg.Regs, regsConfigured: cfg.RegsConfigured,
 		consultTimeout: cmp.Or(cfg.ConsultTimeout, DefaultConsultTimeout), hailParkAfter: cfg.HailParkAfter,
+		checkpointEvery: cfg.CheckpointEvery, checkpointTurns: cfg.CheckpointTurns,
 		tracker: cfg.Tracker}
 	// Pumps outlive the steps that start them and stop with the daemon,
 	// through closePumps (deferred below), not through ctx: they must stop

@@ -858,3 +858,46 @@ func TestReenergizeBeamingInEndedTour(t *testing.T) {
 	requirePending(t, r.d, tourWorkflowID("sorell", 1))
 	requireOutcome(t, OutcomeUnderWay)(r.d.ReenergizeCrew(ctx, "sorell"))
 }
+
+// Config.CheckpointEvery and CheckpointTurns reach every crew member's
+// CombadgeSpec (#145); the transporter passes them only when serve runs
+// sdk. Unset, they are nil, and no flag goes.
+func TestProvisionPassesCheckpointCadence(t *testing.T) {
+	t.Parallel()
+	every, turns := 30*time.Minute, 0
+	p := &fakeProvider{hello: true}
+	cfg := testConfig(privateHome(t))
+	cfg.Transporter = p
+	cfg.CheckpointEvery, cfg.CheckpointTurns = &every, &turns
+	r := startDaemonConfig(t, cfg)
+	defer r.stop(t)
+	require.NoError(t, r.d.AddCrew(t.Context(), store.Crew{ID: "sorell", Name: "Sorell", Harness: "sdk"}))
+	waitOnDeck(t, r.d, "sorell", "fake-1")
+	specs := p.startSpecs()
+	require.Len(t, specs, 1)
+	require.Equal(t, every, *specs[0].CheckpointEvery)
+	require.Equal(t, 0, *specs[0].CheckpointTurns)
+}
+
+// Run refuses a checkpoint cadence combadge serve wouldn't take (#145);
+// 0 turns either trigger off.
+func TestRunRefusesBadCheckpointCadence(t *testing.T) {
+	t.Parallel()
+	for d, want := range map[time.Duration]string{
+		-time.Minute:                        "-1m0s is negative",
+		30 * time.Second:                    "30s is shorter than 1m0s (0 turns it off)",
+		MaxHailParkAfter + time.Millisecond: "596h31m23.648s is over the cap",
+	} {
+		cfg := testConfig(privateHome(t))
+		cfg.CheckpointEvery = &d
+		require.ErrorContains(t, Run(t.Context(), cfg), "bridge: checkpoint every: "+want)
+	}
+	n := -1
+	cfg := testConfig(privateHome(t))
+	cfg.CheckpointTurns = &n
+	require.ErrorContains(t, Run(t.Context(), cfg), "bridge: checkpoint turns: -1 is negative")
+	require.NoError(t, CheckCheckpointEvery(0))
+	require.NoError(t, CheckCheckpointEvery(time.Hour))
+	require.NoError(t, CheckCheckpointEvery(time.Minute))
+	require.NoError(t, CheckCheckpointTurns(0))
+}

@@ -10,7 +10,7 @@ import { acquireLock } from "./lock.js";
 import { ROLES, type Harness, type Inbound, type Role, type SelfCheck } from "./harness/types.js";
 import { onLines } from "./lines.js";
 import { Outbox } from "./outbox.js";
-import { bundleWork, checkoutRepos } from "./repos.js";
+import { bundleWork, checkoutRepos, previousCheckout, wipNote } from "./repos.js";
 import {
   PROTOCOL_VERSION,
   type BeamToBridgeBodies,
@@ -198,8 +198,11 @@ async function start(opts: ServeOptions, release: () => void): Promise<Server> {
       if (resumed) await clearStopped(opts.workDir, id);
       const earlier = state.usageOf(id);
       const repos = await checkoutRepos(opts.workDir, id, Array.isArray(msg.body.repos) ? msg.body.repos : []);
+      // Work in progress checkoutRepos found or restored goes into the handover note (#145).
+      const wip = wipNote(id, repos);
+      const body = wip.length === 0 ? msg.body : { ...msg.body, handover: [msg.body.handover, ...wip].filter(Boolean).join("\n\n") };
       const started = opts.harness.run(
-        { id, body: msg.body, repos, ...(earlier !== undefined && { usage: earlier }) },
+        { id, body, repos, ...(earlier !== undefined && { usage: earlier }) },
         (m) => (done ? warn(`dropping ${m.type} emitted after ${id} ended`) : emit(m.type, m.body, id)),
         (fn) => current.listeners.push(fn),
       );
@@ -449,7 +452,9 @@ async function start(opts: ServeOptions, release: () => void): Promise<Server> {
  * Removes everything under `<workDir>/<order>/` but `in/`: the repo
  * checkouts, `out/` and the checkpoint dirs of a stopped run. `in/` holds the
  * bundles the bridge shipped for the order's next run, from its latest
- * checkpoint.
+ * checkpoint. Each repo checkout is set aside as `.<name>.prev` instead
+ * (previousCheckout), so checkoutRepos can take its work in progress from it
+ * and then removes it (#145).
  */
 async function clearStopped(workDir: string, order: string): Promise<void> {
   const dir = path.join(path.resolve(workDir), order);
@@ -460,7 +465,19 @@ async function clearStopped(workDir: string, order: string): Promise<void> {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
     throw err;
   }
-  for (const e of entries) if (e !== "in") await fs.promises.rm(path.join(dir, e), { recursive: true, force: true });
+  for (const e of entries) {
+    if (e === "in") continue;
+    const p = path.join(dir, e);
+    // Repo names never start with "." and are never "out" or all digits.
+    if (!e.startsWith(".") && e !== "out" && !/^[0-9]+$/.test(e) && fs.existsSync(path.join(p, ".git"))) {
+      const prev = previousCheckout(p);
+      await fs.promises.rm(prev, { recursive: true, force: true });
+      await fs.promises.rename(p, prev);
+      continue;
+    }
+    if (e.endsWith(".prev")) continue; // set aside by an earlier clear whose run never checked out
+    await fs.promises.rm(p, { recursive: true, force: true });
+  }
 }
 
 /** Whether something accepts connections on socket. */
@@ -494,6 +511,9 @@ function warn(msg: string): void {
 
 const UNIT_MS = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 } as const;
 
+/** The shortest --checkpoint-every but 0 (#145): a checkpoint costs a snapshot, bundles and a pull. */
+export const MIN_CHECKPOINT_EVERY_MS = 60_000;
+
 /** The longest delay setTimeout takes (2^31-1 ms, about 596h). */
 const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 
@@ -509,11 +529,14 @@ export function parseDuration(text: string): number {
  * `combadge serve --socket <path> --crew <id> [--outbox <path>]
  * [--harness <name>] [--heartbeat-interval <ms>] [--work-dir <path>]
  * [--script <path> [--step-log <path>]] [--claude-path <path>]
- * [--hail-park-after <duration>] [--check-model <model>] [--env-file <path>]
+ * [--hail-park-after <duration>] [--checkpoint-every <duration>]
+ * [--checkpoint-turns <n>] [--check-model <model>] [--env-file <path>]
  * [--role command]`.
  * --script and --step-log are holodeck's (see harness/holodeck.ts); --script
  * is required with it. --claude-path, --hail-park-after (default 15m, see
- * parseDuration) and --check-model (the startup check's model, the SDK's
+ * parseDuration), --checkpoint-every and --checkpoint-turns (the checkpoint
+ * cadence, #145: default 15m and 10 turns, 0 turns either off; the
+ * interval is at least 1m) and --check-model (the startup check's model, the SDK's
  * default when unset; #172) are sdk's (see harness/sdk.ts). --role
  * command is passed by the bridge for Command's crew members, whatever their
  * harness; only sdk uses it (split_order, #155).
@@ -536,6 +559,8 @@ export async function main(argv: string[]): Promise<void> {
       "work-dir": { type: "string" },
       "claude-path": { type: "string" },
       "hail-park-after": { type: "string" },
+      "checkpoint-every": { type: "string" },
+      "checkpoint-turns": { type: "string" },
       "check-model": { type: "string" },
       "env-file": { type: "string" },
       role: { type: "string" },
@@ -549,11 +574,13 @@ export async function main(argv: string[]): Promise<void> {
   if (!factory) {
     throw new Error(`unknown harness ${values.harness} (available: ${Object.keys(harnesses).join(", ")})`);
   }
-  const only: [flag: "script" | "step-log" | "claude-path" | "hail-park-after" | "check-model", harnesses: string[]][] = [
+  const only: [flag: "script" | "step-log" | "claude-path" | "hail-park-after" | "checkpoint-every" | "checkpoint-turns" | "check-model", harnesses: string[]][] = [
     ["script", ["holodeck"]],
     ["step-log", ["holodeck"]],
     ["claude-path", ["sdk"]],
     ["hail-park-after", ["sdk"]],
+    ["checkpoint-every", ["sdk"]],
+    ["checkpoint-turns", ["sdk"]],
     ["check-model", ["sdk"]],
   ];
   for (const [flag, allowed] of only) {
@@ -572,6 +599,21 @@ export async function main(argv: string[]): Promise<void> {
   }
   // Node runs a longer setTimeout after 1ms.
   if (hailParkAfterMs !== undefined && hailParkAfterMs > MAX_TIMEOUT_MS) throw new Error(`--hail-park-after ${parkAfter} is too long (at most 596h)`);
+  const every = values["checkpoint-every"];
+  // 0 (Go prints it 0s) turns the time trigger off (#145).
+  const checkpointEveryMs = every === undefined ? undefined : every === "0" ? 0 : parseDuration(every);
+  if (checkpointEveryMs !== undefined && !(checkpointEveryMs >= 0)) {
+    throw new Error(`--checkpoint-every ${every} is not a duration (e.g. 15m, 1h; 0 turns it off)`);
+  }
+  if (checkpointEveryMs !== undefined && checkpointEveryMs > 0 && checkpointEveryMs < MIN_CHECKPOINT_EVERY_MS) {
+    throw new Error(`--checkpoint-every ${every} is too short (at least 1m; 0 turns it off)`);
+  }
+  if (checkpointEveryMs !== undefined && checkpointEveryMs > MAX_TIMEOUT_MS) throw new Error(`--checkpoint-every ${every} is too long (at most 596h)`);
+  const turns = values["checkpoint-turns"];
+  const checkpointTurns = turns === undefined ? undefined : /^[0-9]+$/.test(turns) ? Number(turns) : NaN;
+  if (checkpointTurns !== undefined && !Number.isSafeInteger(checkpointTurns)) {
+    throw new Error(`--checkpoint-turns ${turns} is not a whole number of turns (0 turns it off)`);
+  }
   const workDir = path.resolve(values["work-dir"] ?? path.join(path.dirname(values.outbox), values.harness));
   // Built before serve starts, so a bad holodeck script or sdk flag fails here.
   const harness = await factory({
@@ -580,6 +622,8 @@ export async function main(argv: string[]): Promise<void> {
     ...(values["step-log"] !== undefined && { stepLog: values["step-log"] }),
     ...(values["claude-path"] !== undefined && { claudePath: values["claude-path"] }),
     ...(hailParkAfterMs !== undefined && { hailParkAfterMs }),
+    ...(checkpointEveryMs !== undefined && { checkpointEveryMs }),
+    ...(checkpointTurns !== undefined && { checkpointTurns }),
     ...(values["check-model"] !== undefined && { checkModel: values["check-model"] }),
     ...(role !== undefined && { role: role as Role }),
   });

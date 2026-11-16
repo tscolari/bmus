@@ -410,6 +410,10 @@ type CheckpointReadyBody struct {
 	// the harness stops after it, and the order ends with no report or
 	// error.
 	Stopping bool `json:"stopping,omitempty"`
+	// Held are the refs of the hails a park checkpoint holds (#145): the
+	// run parked on them, and the bridge keeps them open if the order
+	// parks before they are answered.
+	Held []string `json:"held,omitempty"`
 }
 
 // MarshalJSON writes a nil Repos as [], which the schema requires.
@@ -450,6 +454,15 @@ type WorkRepo struct {
 	BundlePath string `json:"bundle_path"`
 	Commit     string `json:"commit"`
 	Branch     string `json:"branch"`
+	// FullBundlePath is a checkpoint's full bundle (#145), when BundlePath
+	// holds only what came after the previous checkpoint's commit: the
+	// bridge takes it when the incremental one doesn't verify.
+	FullBundlePath string `json:"full_bundle_path,omitempty"`
+	// WipBundlePath is a checkpoint's WIP bundle (#145):
+	// refs/bmus/wip/<order> and refs/bmus/kept-wip/<order>, those that
+	// exist, minus Branch at Commit. A file of its own, so the commits
+	// land even when the WIP can't.
+	WipBundlePath string `json:"wip_bundle_path,omitempty"`
 }
 
 // Usage is token usage for an order.
@@ -507,6 +520,17 @@ type OrderBody struct {
 	// repo's bundle then carries that checkpoint's commits. Empty on a fresh
 	// order.
 	Handover string `json:"handover,omitempty"`
+	// Grants are tool calls the captain allowed on a hail carried across a
+	// park (#145), which the earlier run never got to make: the harness
+	// lets the same call through once, without a hail.
+	Grants []OrderGrant `json:"grants,omitempty"`
+}
+
+// OrderGrant is a tool call allowed in advance (#145): the tool and its
+// input, as the tool_approval hail's context named them.
+type OrderGrant struct {
+	Tool  string          `json:"tool"`
+	Input json.RawMessage `json:"input"`
 }
 
 // MarshalJSON writes a nil Repos as [], which the schema requires.
