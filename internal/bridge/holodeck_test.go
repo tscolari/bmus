@@ -381,14 +381,24 @@ func requireCheckpointFiles(t *testing.T, home string, cp store.Checkpoint, hand
 }
 
 // stepLogEntries reads the holodeck step log and requires that no (order,
-// index) step ran twice.
+// index) step ran twice. A last line with no newline yet is still being
+// written by serve and is left for the next read.
 func stepLogEntries(t *testing.T, path string) []map[string]any {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
 	var out []map[string]any
 	seen := map[string]bool{}
-	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+	text := string(data)
+	if i := strings.LastIndexByte(text, '\n'); i >= 0 {
+		text = text[:i]
+	} else {
+		text = ""
+	}
+	if text == "" {
+		return nil
+	}
+	for _, line := range strings.Split(text, "\n") {
 		var e map[string]any
 		require.NoError(t, json.Unmarshal([]byte(line), &e))
 		// None of these is a step of an order: a budget hail precedes the step of its index (#119).
