@@ -100,7 +100,7 @@ A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026
   - [x] An order starts from another order's work ([#143](https://github.com/tscolari/bmus/issues/143))
   - [x] Rebase or reorder orders nobody has started, from the CLI or through Command ([#148](https://github.com/tscolari/bmus/issues/148))
 - [ ] Stage 2: crew file findings as issues, and you discard the ones you don't want ([#150](https://github.com/tscolari/bmus/issues/150))
-- [ ] Stage 3: `bmus campaign run --issue <ref>` implements, reviews, fixes and lands one task
+- [ ] Stage 3: `bmus campaign run --issue <ref>` implements, reviews, fixes and lands one task ([#179](https://github.com/tscolari/bmus/issues/179))
 - [ ] Stage 4: run a campaign over a backlog query with an in-flight limit, respecting blockers
 - [ ] Stage 5: land as a pull request or a merge on green CI, with stacked tasks
 
