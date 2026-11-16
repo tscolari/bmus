@@ -159,7 +159,9 @@ func carriedGrants(answers []carriedAnswer) []comms.OrderGrant {
 }
 
 // carriedNote is a resumed run's handover note with the answers to its
-// carried hails added (#145).
+// carried hails added (#145). combadge's chainNote finds these lines by
+// their opening, "While the order was parked, the captain answered hail "
+// (CARRIED_ANSWER), each on a line of its own, after a blank line (#174).
 func carriedNote(handover string, answers []carriedAnswer) string {
 	if len(answers) == 0 {
 		return handover

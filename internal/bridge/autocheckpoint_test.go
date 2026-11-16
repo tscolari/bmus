@@ -702,9 +702,9 @@ func TestBackstopClosesCarriedHails(t *testing.T) {
 }
 
 // #145 (M1): the resumed run parks again and its beam is lost after that
-// park checkpoint is pulled. The carried answer and run 1's note reach
-// run 3: the harness-written note chains the handover its run started
-// from.
+// park checkpoint is pulled. The carried answer reaches run 3: the
+// harness-written note carries the answers no agent note has taken in.
+// Run 1's park line doesn't (#174).
 func TestCarriedAnswerSurvivesNewRunsPark(t *testing.T) {
 	t.Parallel()
 	script := filepath.Join(t.TempDir(), "twice.json")
@@ -742,8 +742,8 @@ func TestCarriedAnswerSurvivesNewRunsPark(t *testing.T) {
 	require.NotNil(t, run3, "run 3 walked on from its park at step 3")
 	handover := run3["handover"].(string)
 	require.Contains(t, handover, "The holodeck parked its script at step 3.")
-	require.Contains(t, handover, "The handover note this run started from:")
-	require.Contains(t, handover, "The holodeck parked its script at step 1.") // run 1's note
+	require.Contains(t, handover, "--- Carried forward from earlier checkpoints ---")
+	require.NotContains(t, handover, "The holodeck parked its script at step 1.") // run 1's park line
 	require.Contains(t, handover, answeredLine)
 	require.Contains(t, handover, `the captain answered hail H-0002, which the earlier session asked: "How far?". The answer: "near".`)
 }

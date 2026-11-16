@@ -84,7 +84,7 @@ func TestRecallResumesFromCheckpoint(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, cps, 1)
 	require.Equal(t, c.CurrentBeam, cps[0].Beam)
-	note := "Order " + id + ": stopped by recall: reprioritise. The holodeck stopped its script here."
+	note := "Order " + id + ": stopped by recall: reprioritise. The holodeck stopped its script here." + noChain
 	requireCheckpointFiles(t, b.home, cps[0], note, first)
 	// Standing orders are off: nobody claims the pool order yet.
 	time.Sleep(time.Second)

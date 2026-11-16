@@ -68,7 +68,7 @@ describe("chainNote (#174)", () => {
     const note = chainNote(cadence(1), undefined, long);
     const block = chained(note, cadence(1));
     expect(bytes(block)).toBeLessThanOrEqual(CHAIN_MAX_BYTES);
-    expect(block).toMatch(/\(Cut to stay under 8 KiB: [0-9]+ bytes of the oldest text were cut\.\)/);
+    expect(block).toMatch(/\(Cut to stay under 8 KiB: [0-9]+ bytes were cut, the agent's note first, from its end, then the oldest answers\.\)/);
     expect(block).toContain("start of the note");
     expect(block).not.toContain("end of the note");
     expect(block).toContain(" [...]\n--- End");

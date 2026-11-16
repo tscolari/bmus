@@ -170,7 +170,7 @@ export function chainNote(own: string, started: string | undefined, agent: strin
   const render = (answers: string[], note: string | undefined, cut: number) =>
     [
       CHAIN_BEGIN,
-      ...(cut > 0 ? [`${CHAIN_CUT}${cut} bytes of the oldest text were cut.)`] : []),
+      ...(cut > 0 ? [`${CHAIN_CUT}${cut} bytes were cut, the agent's note first, from its end, then the oldest answers.)`] : []),
       ...(answers.length > 0 ? [ANSWERS, ...answers, ""] : []),
       ...(note === undefined ? [NO_AGENT] : [header, note]),
       CHAIN_END,

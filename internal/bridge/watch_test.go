@@ -215,7 +215,7 @@ func testWatchChange(t *testing.T, restart bool) {
 	require.NoError(t, err)
 	require.Len(t, cps, 1)
 	require.Equal(t, c.CurrentBeam, cps[0].Beam)
-	note := "Order " + id + ": stopped by stand_down: watch change. The holodeck stopped its script here."
+	note := "Order " + id + ": stopped by stand_down: watch change. The holodeck stopped its script here." + noChain
 	requireCheckpointFiles(t, b.home, cps[0], note, first)
 	var resumed []map[string]any
 	for _, e := range readSteps(t, b.stepLog) {
