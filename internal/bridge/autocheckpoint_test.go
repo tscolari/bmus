@@ -560,6 +560,30 @@ func TestCarriedToolApprovalBecomesGrant(t *testing.T) {
 	require.Contains(t, steps[0]["handover"], `the captain answered hail H-0001, which the earlier session asked: "Run `+"`make deploy`"+`?". The answer: "allow".`)
 }
 
+// combadgeCarriedAnswer mirrors CARRIED_ANSWER in
+// combadge/src/harness/common.ts: chainNote finds the bridge's
+// carried-answer lines by this opening, each on a line of its own after a
+// blank line (#174). Change both together.
+const combadgeCarriedAnswer = "While the order was parked, the captain answered hail "
+
+// #174: carriedNote's lines open as combadge's chainNote expects, one to a
+// paragraph, with no newline inside (the question and answer are quoted).
+func TestCarriedNoteMatchesCombadge(t *testing.T) {
+	t.Parallel()
+	note := carriedNote("the checkpoint's note", []carriedAnswer{
+		{HailID: "H-0001", Question: "Which way?\nReally?", Decision: "left"},
+		{HailID: "H-0002", Question: "How far?", Decision: "near\nish"},
+	})
+	paras := strings.Split(note, "\n\n")
+	require.Len(t, paras, 3)
+	require.Equal(t, "the checkpoint's note", paras[0])
+	for _, p := range paras[1:] {
+		require.True(t, strings.HasPrefix(p, combadgeCarriedAnswer), p)
+		require.NotContains(t, p, "\n")
+	}
+	require.True(t, strings.HasPrefix(carriedNote("", []carriedAnswer{{HailID: "H-0001", Question: "q", Decision: "d"}}), combadgeCarriedAnswer))
+}
+
 // answeredLine is the handover line for H-0001 of parkScript answered left.
 const answeredLine = `While the order was parked, the captain answered hail H-0001, which the earlier session asked: "Which way?". The answer: "left".`
 
