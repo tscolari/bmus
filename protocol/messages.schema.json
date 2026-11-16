@@ -150,7 +150,7 @@
       "required": ["key", "title", "body"],
       "properties": {
         "key": {"description": "The finding's key within its order, which fits a tracker marker key. Reusing it replaces the earlier finding.", "$ref": "#/$defs/finding_key"},
-        "title": {"description": "The issue's title: one line, without control characters.", "type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\x00-\\x1f\\x7f]*[^\\s\\x00-\\x1f\\x7f][^\\x00-\\x1f\\x7f]*$"},
+        "title": {"description": "The issue's title: one line, without control characters.", "$ref": "#/$defs/one_line_title"},
         "body": {"description": "The issue's body (markdown). At most 32 KiB of UTF-8.", "type": "string", "maxLength": 32768},
         "labels": {"description": "Labels for the issue, beside the bridge's own: no commas, control characters or surrounding spaces, and none starting with bmus: in any letter case, which the bridge reserves.", "type": "array", "maxItems": 5, "items": {"type": "string", "minLength": 1, "maxLength": 50, "pattern": "^[^\\s,\\x00-\\x1f\\x7f]([^,\\x00-\\x1f\\x7f]*[^\\s,\\x00-\\x1f\\x7f])?$", "not": {"pattern": "^[Bb][Mm][Uu][Ss]:"}}},
         "severity": {"enum": ["low", "medium", "high"]},
@@ -315,9 +315,34 @@
           "items": {"$ref": "#/$defs/work_repo"}
         },
         "artifacts": {"description": "Paths or references to produced artifacts.", "type": "array", "items": {"type": "string"}},
-        "usage": {"$ref": "#/$defs/usage"}
+        "usage": {"$ref": "#/$defs/usage"},
+        "verdict": {"description": "A review order's verdict (#181). The bridge fails a review whose report has none, or one outside its limits, with code no_verdict, and drops one on a work order with a warning.", "$ref": "#/$defs/verdict"}
       }
     },
+    "verdict": {
+      "description": "A review's findings on the work under review (#181). An empty list is a pass. high must be fixed before the work lands, medium should be and is a judgement call, low is follow-up work.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["findings"],
+      "properties": {
+        "findings": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/verdict_finding"}}
+      }
+    },
+    "verdict_finding": {
+      "description": "One finding of a verdict. title's, body's and path's limits are in characters here; the bridge and combadge count body and path in bytes of UTF-8.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["severity", "title", "body"],
+      "properties": {
+        "severity": {"enum": ["high", "medium", "low"]},
+        "title": {"description": "One line, without control characters.", "$ref": "#/$defs/one_line_title"},
+        "body": {"description": "What is wrong and why (markdown). At most 8 KiB of UTF-8.", "type": "string", "maxLength": 8192},
+        "path": {"description": "The file the finding is about, relative to the repo. At most 512 bytes of UTF-8.", "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\x00-\\x1f\\x7f]*$"},
+        "line": {"description": "The line in path, from 1.", "type": "integer", "minimum": 1}
+      },
+      "dependentRequired": {"line": ["path"]}
+    },
+    "one_line_title": {"description": "A title: one non-blank line of at most 200 characters, without control characters (C0 and DEL).", "type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\x00-\\x1f\\x7f]*[^\\s\\x00-\\x1f\\x7f][^\\x00-\\x1f\\x7f]*$"},
     "work_repo": {
       "description": "The work in one repo of an order, as a git bundle on the beam's disk.",
       "type": "object",
@@ -401,7 +426,26 @@
         "dossier": {"description": "Crew dossier of learned conventions (markdown).", "type": "string"},
         "model": {"description": "Model to run the order on: the order's own, else the crew member's, else its division's default. Opaque to the bridge; the harness checks it when the order starts and fails the order if it is unknown. Absent means the harness's default.", "type": "string", "minLength": 1},
         "handover": {"description": "Handover note of the checkpoint the order resumes from; each repo's bundle then carries that checkpoint's commits. Absent on a fresh order.", "type": "string"},
-        "grants": {"description": "Tool calls the captain allowed on a hail carried across a park (#145), which the order's earlier run never got to make: the harness lets the same call through once, without a hail. Absent when there are none.", "type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["tool", "input"], "properties": {"tool": {"type": "string", "minLength": 1}, "input": {"type": "object"}}}}
+        "grants": {"description": "Tool calls the captain allowed on a hail carried across a park (#145), which the order's earlier run never got to make: the harness lets the same call through once, without a hail. Absent when there are none.", "type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["tool", "input"], "properties": {"tool": {"type": "string", "minLength": 1}, "input": {"type": "object"}}}},
+        "kind": {"description": "The order's kind (#181): work, or review for a campaign's review of a task's work. Absent means work.", "enum": ["work", "review"]},
+        "review": {"description": "What a review order reviews (#181), present exactly when kind is review. The checkout holds the head under review; the task's work is base..HEAD.", "$ref": "#/$defs/order_review"}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["kind"], "properties": {"kind": {"const": "review"}}},
+          "then": {"required": ["review"], "properties": {"review": {"$ref": "#/$defs/order_review"}}},
+          "else": {"properties": {"review": false}}
+        }
+      ]
+    },
+    "order_review": {
+      "description": "A review order's base and round (#181).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base", "round"],
+      "properties": {
+        "base": {"description": "The commit the task's first work order started from: git diff base..HEAD is the task's work.", "type": "string", "minLength": 1},
+        "round": {"description": "The task's round, from 1: one work order and its review.", "type": "integer", "minimum": 1}
       }
     },
     "order_repo": {

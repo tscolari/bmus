@@ -230,6 +230,8 @@ func TestZeroBodiesValidate(t *testing.T) {
 		{TypeAnswer, "ORD-0001", AnswerBody{Ref: "h-1", HailID: "H-0001", DecidedBy: DecidedByCaptain, Decision: OptionAllow, Option: &zero}},
 		{TypeBelay, "ORD-0001", BelayBody{}},
 		{TypeReport, "ORD-0001", ReportBody{}},
+		{TypeReport, "ORD-0001", ReportBody{Verdict: &Verdict{}}},
+		{TypeOrder, "ORD-0001", OrderBody{Title: "t", Kind: OrderKindReview, Review: &OrderReview{Base: "abc", Round: 1}}},
 		{TypeCheckpointReady, "ORD-0001", CheckpointReadyBody{TranscriptPath: "/t", HandoverPath: "/h"}},
 	} {
 		t.Run(tc.typ, func(t *testing.T) {
@@ -579,4 +581,162 @@ func TestSchemaFinding(t *testing.T) {
 	raw, err := json.Marshal(m)
 	require.NoError(t, err)
 	require.Error(t, validate(sch, raw), "a finding is order-bound")
+}
+
+// verdictCases is protocol/cases/verdict.json, which combadge's
+// test/verdict.test.ts runs through ajv and the report tool's zod.
+type verdictCase struct {
+	Name    string          `json:"name"`
+	OK      bool            `json:"ok"`
+	Schema  *bool           `json:"schema"`
+	Check   *bool           `json:"check"`
+	Verdict json.RawMessage `json:"verdict"`
+}
+
+// expandRepeats replaces each {"repeat": x, "times": n} in v: a string x
+// repeated n times, or an array of n copies of x.
+func expandRepeats(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		if r, ok := x["repeat"]; ok && len(x) == 2 {
+			n := int(x["times"].(float64))
+			if s, ok := r.(string); ok {
+				return strings.Repeat(s, n)
+			}
+			out := make([]any, n)
+			for i := range out {
+				out[i] = expandRepeats(r)
+			}
+			return out
+		}
+		for k, e := range x {
+			x[k] = expandRepeats(e)
+		}
+		return x
+	case []any:
+		for i, e := range x {
+			x[i] = expandRepeats(e)
+		}
+		return x
+	}
+	return v
+}
+
+// A verdict (#181) holds the plan's limits. Every case of
+// protocol/cases/verdict.json goes through the schema and Verdict.Check
+// here, and through ajv and zod in combadge. A verdict Check takes encodes,
+// as the bridge would store it, into one the schema takes.
+func TestSchemaVerdict(t *testing.T) {
+	t.Parallel()
+	sch := compileSchema(t)
+	golden := loadGolden(t)
+	raw, err := os.ReadFile(filepath.Join(protocolDir, "cases", "verdict.json"))
+	require.NoError(t, err)
+	var file struct {
+		Cases []verdictCase `json:"cases"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &file))
+	require.NotEmpty(t, file.Cases)
+	report := func(verdict any) []byte {
+		var m map[string]any
+		require.NoError(t, json.Unmarshal(golden["report.review"], &m))
+		m["body"].(map[string]any)["verdict"] = verdict
+		out, err := json.Marshal(m)
+		require.NoError(t, err)
+		return out
+	}
+	for _, tc := range file.Cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			t.Parallel()
+			var v any
+			require.NoError(t, json.Unmarshal(tc.Verdict, &v))
+			expanded, err := json.Marshal(expandRepeats(v))
+			require.NoError(t, err)
+
+			schemaOK, checkOK := tc.OK, tc.OK
+			if tc.Schema != nil {
+				schemaOK = *tc.Schema
+			}
+			if tc.Check != nil {
+				checkOK = *tc.Check
+			}
+			if schemaOK {
+				require.NoError(t, validate(sch, report(json.RawMessage(expanded))))
+			} else {
+				require.Error(t, validate(sch, report(json.RawMessage(expanded))))
+			}
+
+			// Decoded as the bridge decodes a report: leniently, and a
+			// verdict decodes whatever it holds.
+			var verdict Verdict
+			require.NoError(t, json.Unmarshal(expanded, &verdict))
+			err = verdict.Check()
+			if !checkOK {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.NoError(t, validate(sch, report(verdict)))
+		})
+	}
+}
+
+// A report whose verdict doesn't decode still decodes, and the verdict's
+// Check says why (#181): the bridge reads the rest of the report.
+func TestVerdictDecodeKeepsReport(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ verdict, want string }{
+		{`5`, "the verdict is not an object"},
+		{`{}`, "the verdict has no findings list"},
+		{`{"findings": null}`, "the verdict has no findings list"},
+		{`{"findings": {}}`, "the verdict's findings don't decode"},
+		{`{"findings": [{"severity": "low", "title": "t", "body": "", "line": "12"}]}`, "the verdict's findings don't decode"},
+	} {
+		var r ReportBody
+		require.NoError(t, json.Unmarshal([]byte(`{"summary": "s", "repos": [], "usage": {"input_tokens": 1, "output_tokens": 2}, "verdict": `+tc.verdict+`}`), &r), tc.verdict)
+		require.Equal(t, "s", r.Summary)
+		require.NotNil(t, r.Verdict, tc.verdict)
+		require.Empty(t, r.Verdict.Findings, tc.verdict)
+		require.ErrorContains(t, r.Verdict.Check(), tc.want, tc.verdict)
+	}
+	var r ReportBody
+	require.NoError(t, json.Unmarshal([]byte(`{"summary": "s", "repos": [], "usage": {"input_tokens": 1, "output_tokens": 2}, "verdict": null}`), &r))
+	require.Nil(t, r.Verdict)
+	require.NoError(t, Verdict{}.Check(), "a verdict built in Go with no findings is a pass")
+}
+
+// A review order (#181) carries review exactly when its kind is review, and
+// a work order may say so or leave kind out.
+func TestSchemaOrderReview(t *testing.T) {
+	t.Parallel()
+	sch := compileSchema(t)
+	golden := loadGolden(t)
+	order := func(fn func(body map[string]any)) []byte {
+		var m map[string]any
+		require.NoError(t, json.Unmarshal(golden["order.review"], &m))
+		fn(m["body"].(map[string]any))
+		raw, err := json.Marshal(m)
+		require.NoError(t, err)
+		return raw
+	}
+	require.NoError(t, validate(sch, order(func(map[string]any) {})))
+	require.NoError(t, validate(sch, order(func(b map[string]any) { delete(b, "kind"); delete(b, "review") })))
+	require.NoError(t, validate(sch, order(func(b map[string]any) { b["kind"] = OrderKindWork; delete(b, "review") })))
+	for _, tc := range []struct {
+		name string
+		fn   func(b map[string]any)
+	}{
+		{"review without kind", func(b map[string]any) { delete(b, "kind") }},
+		{"review on a work order", func(b map[string]any) { b["kind"] = OrderKindWork }},
+		{"a review kind without review", func(b map[string]any) { delete(b, "review") }},
+		{"an unknown kind", func(b map[string]any) { b["kind"] = "fix" }},
+		{"round 0", func(b map[string]any) { b["review"].(map[string]any)["round"] = 0 }},
+		{"no base", func(b map[string]any) { delete(b["review"].(map[string]any), "base") }},
+		{"an empty base", func(b map[string]any) { b["review"].(map[string]any)["base"] = "" }},
+		{"an unknown review key", func(b map[string]any) { b["review"].(map[string]any)["head"] = "ORD-0418" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Error(t, validate(sch, order(tc.fn)))
+		})
+	}
 }

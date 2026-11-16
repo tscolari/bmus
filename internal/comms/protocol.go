@@ -434,6 +434,9 @@ type ReportBody struct {
 	Repos     []WorkRepo `json:"repos"`
 	Artifacts []string   `json:"artifacts,omitempty"`
 	Usage     Usage      `json:"usage"`
+	// Verdict is a review order's verdict (#181); nil on a work order's
+	// report, and on a review's that reported none.
+	Verdict *Verdict `json:"verdict,omitempty"`
 }
 
 // MarshalJSON writes a nil Repos as [], which the schema requires.
@@ -443,6 +446,121 @@ func (b ReportBody) MarshalJSON() ([]byte, error) {
 		b.Repos = []WorkRepo{}
 	}
 	return json.Marshal(plain(b))
+}
+
+// Verdict is a review's findings on the work it reviewed (#181). An empty
+// list is a pass. Check holds the schema's limits. Never null on the wire:
+// nil Findings marshals as [].
+//
+// Decoding a verdict never fails, so a bad one leaves the rest of its
+// report readable: a verdict that isn't an object, has no findings list or
+// holds findings of the wrong shape decodes with no findings, and Check
+// returns why.
+type Verdict struct {
+	Findings []VerdictFinding `json:"findings"`
+	// invalid is why the verdict as received didn't decode.
+	invalid error
+}
+
+// VerdictFinding is one finding of a verdict. Path and Line are optional:
+// an empty Path and a zero Line are absent, so a beam's "line": 0 reads as
+// no line.
+type VerdictFinding struct {
+	// Severity is SeverityHigh, SeverityMedium or SeverityLow.
+	Severity string `json:"severity"`
+	Title    string `json:"title"`
+	// Body is markdown, at most MaxVerdictBody bytes.
+	Body string `json:"body"`
+	// Path is the file the finding is about, relative to the repo.
+	Path string `json:"path,omitempty"`
+	// Line is the line in Path, from 1.
+	Line int `json:"line,omitempty"`
+}
+
+// Severities of a verdict's findings, and of a finding's (#153). high must
+// be fixed before the work lands, medium should be and is a judgement
+// call, low is follow-up work.
+const (
+	SeverityHigh   = "high"
+	SeverityMedium = "medium"
+	SeverityLow    = "low"
+)
+
+// Limits of a verdict (schema $defs.verdict and $defs.verdict_finding).
+const (
+	MaxVerdictFindings = 20
+	MaxVerdictTitle    = MaxFindingTitle // characters
+	MaxVerdictBody     = 8 * 1024        // bytes of UTF-8
+	MaxVerdictPath     = 512             // bytes of UTF-8
+)
+
+// MarshalJSON writes a nil Findings as [], which the schema requires.
+func (v Verdict) MarshalJSON() ([]byte, error) {
+	type plain Verdict
+	if v.Findings == nil {
+		v.Findings = []VerdictFinding{}
+	}
+	return json.Marshal(plain(v))
+}
+
+// UnmarshalJSON decodes a verdict, keeping any error for Check.
+func (v *Verdict) UnmarshalJSON(data []byte) error {
+	*v = Verdict{}
+	var raw struct {
+		Findings json.RawMessage `json:"findings"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		v.invalid = errors.New("the verdict is not an object")
+		return nil
+	}
+	if f := bytes.TrimSpace(raw.Findings); len(f) == 0 || bytes.Equal(f, []byte("null")) {
+		v.invalid = errors.New("the verdict has no findings list (an empty list is a pass)")
+		return nil
+	}
+	if err := json.Unmarshal(raw.Findings, &v.Findings); err != nil {
+		v.Findings = nil
+		v.invalid = fmt.Errorf("the verdict's findings don't decode: %w", err)
+	}
+	return nil
+}
+
+// Check returns an error naming the first finding and field outside the
+// schema's limits, nil when v is valid.
+func (v Verdict) Check() error {
+	if v.invalid != nil {
+		return v.invalid
+	}
+	if len(v.Findings) > MaxVerdictFindings {
+		return fmt.Errorf("%d findings, over %d", len(v.Findings), MaxVerdictFindings)
+	}
+	for i, f := range v.Findings {
+		if err := f.check(); err != nil {
+			return fmt.Errorf("finding %d: %w", i+1, err)
+		}
+	}
+	return nil
+}
+
+func (f VerdictFinding) check() error {
+	switch {
+	case f.Severity != SeverityHigh && f.Severity != SeverityMedium && f.Severity != SeverityLow:
+		return fmt.Errorf("severity %q is not high, medium or low", f.Severity)
+	case strings.TrimSpace(f.Title) == "" || hasControl(f.Title):
+		return errors.New("title must be one non-blank line, without control characters")
+	case utf8.RuneCountInString(f.Title) > MaxVerdictTitle:
+		return fmt.Errorf("title is over %d characters", MaxVerdictTitle)
+	case len(f.Body) > MaxVerdictBody:
+		return fmt.Errorf("body is over %d bytes", MaxVerdictBody)
+	case len(f.Path) > MaxVerdictPath:
+		return fmt.Errorf("path is over %d bytes", MaxVerdictPath)
+	case hasControl(f.Path):
+		return errors.New("path has control characters")
+	case f.Line < 0:
+		return fmt.Errorf("line %d is not from 1", f.Line)
+	case f.Line > 0 && f.Path == "":
+		return errors.New("a line needs a path")
+	}
+	return nil
 }
 
 // WorkRepo is the work in one repo of an order: a git bundle at BundlePath
@@ -524,6 +642,28 @@ type OrderBody struct {
 	// park (#145), which the earlier run never got to make: the harness
 	// lets the same call through once, without a hail.
 	Grants []OrderGrant `json:"grants,omitempty"`
+	// Kind is OrderKindReview for a campaign's review of a task's work
+	// (#181); empty, and absent on the wire, means OrderKindWork.
+	Kind string `json:"kind,omitempty"`
+	// Review is what a review order reviews: set exactly when Kind is
+	// OrderKindReview.
+	Review *OrderReview `json:"review,omitempty"`
+}
+
+// Kinds of an order (OrderBody.Kind), as store.OrderKindWork and
+// store.OrderKindReview.
+const (
+	OrderKindWork   = "work"
+	OrderKindReview = "review"
+)
+
+// OrderReview is a review order's base and round (#181). The checkout holds
+// the head under review, and Base..HEAD is the task's work.
+type OrderReview struct {
+	// Base is the commit the task's first work order started from.
+	Base string `json:"base"`
+	// Round is the task's round, from 1: one work order and its review.
+	Round int `json:"round"`
 }
 
 // OrderGrant is a tool call allowed in advance (#145): the tool and its

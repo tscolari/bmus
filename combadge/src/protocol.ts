@@ -274,7 +274,40 @@ export interface ReportBody {
   repos: WorkRepo[];
   artifacts?: string[];
   usage: Usage;
+  /**
+   * A review order's verdict (#181). The bridge fails a review whose report
+   * has none, or one outside the limits, with code no_verdict, and drops one
+   * on a work order with a warning.
+   */
+  verdict?: Verdict;
 }
+
+/** A review's findings on the work it reviewed (#181). An empty list is a pass. */
+export interface Verdict {
+  findings: VerdictFinding[];
+}
+
+/**
+ * One finding of a verdict: high must be fixed before the work lands,
+ * medium should be and is a judgement call, low is follow-up work.
+ */
+export interface VerdictFinding {
+  severity: "high" | "medium" | "low";
+  /** One line of at most MAX_VERDICT_TITLE characters. */
+  title: string;
+  /** Markdown, at most MAX_VERDICT_BODY bytes of UTF-8. */
+  body: string;
+  /** The file it is about, relative to the repo: at most MAX_VERDICT_PATH bytes of UTF-8, one line. */
+  path?: string;
+  /** The line in path, from 1. */
+  line?: number;
+}
+
+/** Limits of a verdict (the schema's, and comms.Verdict.Check's). */
+export const MAX_VERDICT_FINDINGS = 20;
+export const MAX_VERDICT_TITLE = 200;
+export const MAX_VERDICT_BODY = 8 * 1024;
+export const MAX_VERDICT_PATH = 512;
 
 /** Harness crash, tool failure or exceeded budget. */
 export interface ErrorBody {
@@ -328,6 +361,21 @@ export interface OrderBody {
    * through once, without a hail.
    */
   grants?: OrderGrant[];
+  /** The order's kind (#181): review for a campaign's review of a task's work. Absent means work. */
+  kind?: OrderKind;
+  /** What a review order reviews: present exactly when kind is review. */
+  review?: OrderReview;
+}
+
+/** Kinds of an order (OrderBody.kind). */
+export type OrderKind = "work" | "review";
+
+/** A review order's base and round (#181). The checkout holds the head under review: base..HEAD is the task's work. */
+export interface OrderReview {
+  /** The commit the task's first work order started from. */
+  base: string;
+  /** The task's round, from 1: one work order and its review. */
+  round: number;
 }
 
 /** A tool call allowed in advance (#145), as the tool_approval hail's context named it. */
