@@ -95,7 +95,10 @@ export async function workKey(order: Order): Promise<string> {
 
 /** The opening of each line the bridge adds for a carried hail's answer (carriedNote in internal/bridge). */
 export const CARRIED_ANSWER = "While the order was parked, the captain answered hail ";
-/** The most a harness-written note carries forward from earlier checkpoints, its markers included (#174). */
+/**
+ * The most of the agent's note a harness-written note carries forward (#174).
+ * Undelivered answers are never cut: the order's hails bound them.
+ */
 export const CHAIN_MAX_BYTES = 8 * 1024;
 
 const CHAIN_BEGIN = "--- Carried forward from earlier checkpoints ---";
@@ -146,6 +149,19 @@ export function chainedFrom(started: string | undefined): Chained {
   return { ...(agent !== "" && { agent }), answers: appended };
 }
 
+/**
+ * The agent's request_handover note as a checkpoint stores it (#174): a
+ * line equal to CHAIN_BEGIN or CHAIN_END, or opening with CARRIED_ANSWER,
+ * gets "> " before it, so a note quoting a harness note or an answer never
+ * reads as a harness note's block or as the bridge's answers (chainedFrom).
+ */
+export function agentNoteOf(note: string): string {
+  return note
+    .split("\n")
+    .map((l) => (l === CHAIN_BEGIN || l === CHAIN_END || l.startsWith(CARRIED_ANSWER) ? `> ${l}` : l))
+    .join("\n");
+}
+
 const isAnswer = (line: string) => line.startsWith(CARRIED_ANSWER) && !line.trim().includes("\n");
 const bytes = (s: string) => Buffer.byteLength(s, "utf8");
 
@@ -157,8 +173,8 @@ const bytes = (s: string) => Buffer.byteLength(s, "utf8");
  * the bridge sent it) and the carried answers not yet delivered: those in
  * started, unless this run's agent wrote a note, which came after them.
  * Earlier park, stop, cadence, WIP and snapshot lines are not carried. The
- * block stays under CHAIN_MAX_BYTES: the agent's note, the oldest part, is
- * cut first (from its end), then the oldest answers, and the block says so.
+ * agent's note is cut from its end to CHAIN_MAX_BYTES, ending "[...]", and
+ * a cut line gives the bytes cut; the answers are never cut.
  * A later run gets only the note of the checkpoint it resumes from.
  */
 export function chainNote(own: string, started: string | undefined, agent: string | undefined): string {
@@ -170,31 +186,14 @@ export function chainNote(own: string, started: string | undefined, agent: strin
   const render = (answers: string[], note: string | undefined, cut: number) =>
     [
       CHAIN_BEGIN,
-      ...(cut > 0 ? [`${CHAIN_CUT}${cut} bytes were cut, the agent's note first, from its end, then the oldest answers.)`] : []),
+      ...(cut > 0 ? [`${CHAIN_CUT}${cut} bytes were cut from the end of the agent's note.)`] : []),
       ...(answers.length > 0 ? [ANSWERS, ...answers, ""] : []),
       ...(note === undefined ? [NO_AGENT] : [header, note]),
       CHAIN_END,
     ].join("\n");
-  let block = render(answers, note, 0);
-  if (bytes(block) > CHAIN_MAX_BYTES) {
-    // The cut line's room is taken at its longest, so the result never grows past the cap.
-    const room = (answers: string[]) => CHAIN_MAX_BYTES - bytes(render(answers, CUT_MARK, Number.MAX_SAFE_INTEGER));
-    let kept = answers;
-    let cut = 0;
-    while (kept.length > 0 && room(kept) < 0) {
-      cut += bytes(kept[0]!) + 1;
-      kept = kept.slice(1);
-    }
-    let text = CUT_MARK;
-    if (note !== undefined) {
-      // The note goes whole before any answer does.
-      const keep = kept.length < answers.length ? 0 : Math.max(0, room(kept) - bytes(` ${CUT_MARK}`));
-      const head = Buffer.from(note, "utf8").subarray(0, keep).toString("utf8").replace(/\uFFFD+$/, "").trimEnd();
-      text = head === "" ? CUT_MARK : `${head} ${CUT_MARK}`;
-      cut += bytes(note) - bytes(head);
-    }
-    block = render(kept, note === undefined ? undefined : text, cut);
-  }
+  if (note === undefined || bytes(note) <= CHAIN_MAX_BYTES) return `${own.trimEnd()}\n\n${render(answers, note, 0)}`;
+  const head = Buffer.from(note, "utf8").subarray(0, CHAIN_MAX_BYTES - bytes(` ${CUT_MARK}`)).toString("utf8").replace(/\uFFFD+$/, "").trimEnd();
+  const block = render(answers, `${head} ${CUT_MARK}`, bytes(note) - bytes(head));
   return `${own.trimEnd()}\n\n${block}`;
 }
 

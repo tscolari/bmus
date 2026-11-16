@@ -1,6 +1,6 @@
 // Unit tests of the harness-written note's chain (#174): chainNote and chainedFrom.
 import { describe, expect, it } from "vitest";
-import { CARRIED_ANSWER, CHAIN_MAX_BYTES, chainedFrom, chainNote, withNotes } from "../src/harness/common.js";
+import { agentNoteOf, CARRIED_ANSWER, CHAIN_MAX_BYTES, chainedFrom, chainNote, withNotes } from "../src/harness/common.js";
 
 const bytes = (s: string) => Buffer.byteLength(s, "utf8");
 const count = (s: string, sub: string) => s.split(sub).length - 1;
@@ -63,27 +63,46 @@ describe("chainNote (#174)", () => {
     expect(chainNote(cadence(4), sent(run3b), undefined)).not.toContain(CARRIED_ANSWER);
   });
 
-  it("cuts the agent's note first, then the oldest answers, and says so", () => {
+  it("cuts the agent's note alone, from its end, and says so; answers are never cut", () => {
     const long = `start of the note\n${"x".repeat(20_000)}\nend of the note`;
     const note = chainNote(cadence(1), undefined, long);
     const block = chained(note, cadence(1));
-    expect(bytes(block)).toBeLessThanOrEqual(CHAIN_MAX_BYTES);
-    expect(block).toMatch(/\(Cut to stay under 8 KiB: [0-9]+ bytes were cut, the agent's note first, from its end, then the oldest answers\.\)/);
+    const agentPart = block.slice(block.indexOf("written in this run:\n") + "written in this run:\n".length, block.indexOf("\n--- End"));
+    expect(bytes(agentPart)).toBeLessThanOrEqual(CHAIN_MAX_BYTES);
+    const cut = /\(Cut to stay under 8 KiB: ([0-9]+) bytes were cut from the end of the agent's note\.\)/.exec(block);
+    expect(Number(cut?.[1])).toBe(bytes(long) - bytes(agentPart.slice(0, -" [...]".length)));
     expect(block).toContain("start of the note");
     expect(block).not.toContain("end of the note");
-    expect(block).toContain(" [...]\n--- End");
-    // Chained again, it keeps its size.
+    expect(agentPart.endsWith(" [...]")).toBe(true);
+    // Chained again, it keeps its size, with nothing more cut.
     const again = chained(chainNote(cadence(2), sent(note), undefined), cadence(2));
-    expect(bytes(again)).toBeLessThanOrEqual(CHAIN_MAX_BYTES);
-    expect(again).toContain("start of the note");
+    expect(again).toContain(`written in an earlier run:\n${agentPart}\n--- End`);
+    expect(again).not.toContain("(Cut to stay under");
 
     const answers = Array.from({ length: 100 }, (_, i) => answer(`H-${String(i).padStart(4, "0")}`, `question ${i} ${"q".repeat(80)}`, "yes"));
     const many = chained(chainNote(cadence(1), sent("an agent note", answers), undefined), cadence(1));
-    expect(bytes(many)).toBeLessThanOrEqual(CHAIN_MAX_BYTES);
-    expect(many).not.toContain("an agent note");
-    expect(many).not.toContain("H-0000,");
-    expect(many).toContain("H-0099,");
-    expect(many).toContain("written in an earlier run:\n[...]");
+    for (const a of answers) expect(count(many, a)).toBe(1);
+    expect(many).toContain("written in an earlier run:\nan agent note\n--- End");
+    expect(many).not.toContain("(Cut to stay under");
+  });
+
+  it("an agent note quoting a harness note or an answer stays the agent's note", () => {
+    const x = answer("H-0001", "Which way?", "left");
+    const old = chainNote(cadence(1), sent("the old note", [x]), undefined);
+    const quoting = agentNoteOf(`New plan: do it the other way.\n\nFor reference, what I started from:\n${old}`);
+    expect(quoting).toContain("> --- Carried forward from earlier checkpoints ---");
+    expect(quoting).toContain(`> ${x}`);
+    // As a raw request_handover checkpoint's note.
+    const raw = chainedFrom(sent(quoting));
+    expect(raw.agent).toBe(quoting);
+    expect(raw.answers).toEqual([]);
+    // Chained by a harness note and read back.
+    const harness = chainNote(cadence(2), sent(quoting), undefined);
+    expect(chainedFrom(sent(harness))).toEqual({ agent: quoting, answers: [] });
+    // A note ending with an answer's line isn't read as the bridge's answer.
+    const ending = agentNoteOf(`Done so far.\n\n${x}`);
+    expect(chainedFrom(sent(ending))).toEqual({ agent: ending, answers: [] });
+    expect(chainedFrom(sent(`Done so far.\n\n${x}`))).toEqual({ agent: "Done so far.", answers: [x] }); // why it's needed
   });
 
   it("chainedFrom reads a harness note's block, the bridge's answers and a plain note", () => {

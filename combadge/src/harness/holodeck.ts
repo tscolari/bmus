@@ -137,7 +137,7 @@ import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AnswerBody, ConsultReplyBody, FindingBody, HailBody, ReportBody, UsageBody } from "../protocol.js";
 import { git } from "../repos.js";
-import { abortable, Budget, BudgetExceeded, chainNote, orderDir, startedFrom, Stopped, writePlaceholderCheckpoint } from "./common.js";
+import { abortable, agentNoteOf, Budget, BudgetExceeded, chainNote, orderDir, startedFrom, Stopped, writePlaceholderCheckpoint } from "./common.js";
 import type { Harness, HarnessOptions, HarnessReport, Inbound, Order } from "./types.js";
 
 type HailSpec = Omit<HailBody, "ref">;
@@ -365,9 +365,9 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
             const body = await placeholder(
               path.join(orderDir(workDir, order), String(index)),
               { holodeck: true, order: order.id, step: index },
-              step.request_handover,
+              agentNoteOf(step.request_handover),
             );
-            agentNote = step.request_handover;
+            agentNote = agentNoteOf(step.request_handover);
             signal.throwIfAborted();
             emit({ type: "checkpoint_ready", body });
             log();

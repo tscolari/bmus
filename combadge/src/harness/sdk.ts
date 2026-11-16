@@ -251,7 +251,7 @@ import {
   type UsageBody,
   USAGE_EVERY_TURNS,
 } from "../protocol.js";
-import { abortable, Budget, BudgetExceeded, bundleCheckpoint, checkpointFiles, chainNote, escalate, orderDir, startedFrom, Stopped, withNotes, workKey, type StopCommand } from "./common.js";
+import { abortable, agentNoteOf, Budget, BudgetExceeded, bundleCheckpoint, checkpointFiles, chainNote, escalate, orderDir, startedFrom, Stopped, withNotes, workKey, type StopCommand } from "./common.js";
 import { git, wipRef, type RepoCheckout } from "../repos.js";
 import type { Emit, Harness, HarnessOptions, HarnessReport, Inbound, Order, Role, SelfCheck } from "./types.js";
 
@@ -1641,8 +1641,9 @@ function combadgeServer(
         "request_handover",
         `Checkpoint the work for whoever continues it: bundles the commits on branch bmus/${order.id} (commit there first; other branches are not included) with a snapshot of the uncommitted changes, copies this session's transcript and stores the note.`,
         { note: z.string() },
-        async ({ note }) => {
+        async ({ note: written }) => {
           if (live.aborted) return dropped();
+          const note = agentNoteOf(written);
           try {
             const body = await checkpoint(state, order, dirs.workDir, (dir, since) => writeCheckpoint(dir, order, transcriptOf(state, dirs.repo), note, { since }));
             state.agentNote = note;
