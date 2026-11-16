@@ -23,7 +23,7 @@ What the code has today:
 
 Where the campaigns plan has gone stale:
 
-- "An eligible reviewer ... has been assignee of no order in the task" counts the review orders too: every round would need a fresh reviewer. Section 3 reads it as work orders only (open question 2). The store keeps no assignee history either, and the rule needs a table.
+- "An eligible reviewer ... has been assignee of no order in the task" counts the review orders too: every round would need a fresh reviewer. Section 3 reads it as work orders only (decision 2). The store keeps no assignee history either, and the rule needs a table.
 - "On deck with standing orders on" treats standing orders as a crew member's state. It is one bridge-wide setting.
 - Section 4.7 asks for several hails of one category from one raiser (a stall per round, a triage per review). Stage 2's index allows one.
 - Section 4.8's settle callback "like `BelayFunc`" would have to be passed through every ending path. A store hook in `settleFamily` covers them all (section 5).
@@ -36,7 +36,7 @@ Where the campaigns plan has gone stale:
 
 ### 1. Schema
 
-`orders` gains two columns, added at `Open` as `addedColumns` entries, and an index:
+`orders` gains two columns and two indexes, written into `schema.sql`:
 
 ```sql
 kind TEXT NOT NULL DEFAULT 'work',  -- work or review
@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS orders_created_by ON orders (created_by);
 
 Fix orders are `work`: a task's head is its latest done work order, whoever made it.
 
-`hails` gains `raise_key TEXT NOT NULL DEFAULT ''`: one raiser may then raise a category more than once. The unique index becomes `hails_raise ON hails (deliver_to, category, raise_key) WHERE deliver_to IS NOT NULL`, and `Open` drops `hails_deliver_to`. Stage 2's findings hails keep the empty key. `schema.sql` runs before `addedColumns`, and an index naming a column the table lacks fails there, so the index statement moves to a short list `Open` runs after the columns are added.
+`hails` gains `raise_key TEXT NOT NULL DEFAULT ''`: one raiser may then raise a category more than once. The unique index becomes `hails_raise ON hails (deliver_to, category, raise_key) WHERE deliver_to IS NOT NULL`, and `Open` drops `hails_deliver_to`. Stage 2's findings hails keep the empty key.
 
 New tables:
 
@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS task_workers (
 
 The plan put `campaign_tasks` in stage 4. One task still needs a row for its round, head and state, and the console and CLI read it. Stage 4 adds its query, `max_in_flight` and generation columns to `campaigns` and keeps the rest. `workflowVersion` stays `"1"`: missions recorded before replay unchanged, as the new steps run only for orders with a task.
 
-Every new column has a constant default, so I'd add them in place and keep stage 2's databases (open question 1).
+Following stage 2's precedent, nothing is migrated: `requiredColumns` entries for `orders.kind` and `hails.raise_key` refuse an older database with the message to start a fresh one.
 
 ### 2. Review orders and verdicts
 
@@ -174,7 +174,7 @@ Examples: "Triage 2 medium findings from ORD-0009's review of o/r#12, round 1: a
 2. Wait for it. Once done, read its commit from the done entry (`read-head`, through `orderWork`). Round 1 also records the implementer (the order's assignee) and the review base, the commit it shipped from (`baseCommits`). Any other ending stalls (section 6).
 3. Check the new head descends from the last with `git merge-base --is-ancestor <last head> <new head>` in the bridge's clone, under the repo's lock (`check-head`). A head that doesn't stalls with `rewritten`. The same step sets `head`, `head_commit` and the state `reviewing`.
 4. Count eligible reviewers (`check-reviewers`, section 3).
-5. Create the review (`create-review`): a pool order in the review division, kind `review`, based on `order:<head>`, its body naming the round, the head, the review base and, after round 1, the last round's blocking findings, fenced. The order command carries the base and round to the harness (`OrderBody.review`).
+5. Create the review (`create-review`): a pool order in the review division, kind `review`, based on `order:<head>`, its body naming the round, the head, the review base and, after round 1, the last review's summary and blocking findings, fenced. Every order runs in a new agent session, a review by the same crew member included: the harness resumes a session only inside one run, after a park. The reviewer of round 2 knows what it asked for in round 1 through this body, and judges the fix against it. The order command carries the base and round to the harness (`OrderBody.review`).
 6. Wait for the review. A review that failed, was belayed or was withdrawn stalls the task, and `no_verdict` names its code.
 7. Read the verdict from the done entry (`read-verdict`). Any `high` blocks. With mediums, the task raises `campaign_triage` and acts on the decision once its window has passed: `fix` mediums block, `file` mediums are filed, `drop` mediums are logged and left. Lows are always filed.
 8. Write the findings to file (section 2) and start `findings/<review>` when the review order has any findings at all, the reviewer's own included (`file-review-findings`).
@@ -241,7 +241,7 @@ The run refuses, before anything is written (`campaign.run`): no tracker; a ref 
 
 The show command prints the campaign, then the task (state, round of max, head and commit, open order, open hail, why), then one row per order (ORDER, KIND, ROUND, STATE, ASSIGNEE). Titles and reasons go through `oneLine`.
 
-**Belay.** Stage 3 can stop a task without it: belay the open order, and the stall hail offers `drop`. That is two steps with a hail in between. I'd bring `bmus campaign belay` forward (open question 4). It sets the campaign `belaying` and, in one transaction per item, closes the task's open hail as timed out ("campaign belayed") and belays or withdraws its open order. The task wakes on either, reads `belaying` in its next step, drops itself with no stall hail, and the parent ends the campaign. Stage 4 adds stopping intake to the same command.
+**Belay.** `bmus campaign belay` comes forward from stage 4 (decision 4). It sets the campaign `belaying` and, in one transaction per item, closes the task's open hail as timed out ("campaign belayed") and belays or withdraws its open order. The task wakes on either, reads `belaying` in its next step, drops itself with no stall hail, and the parent ends the campaign. Stage 4 adds stopping intake to the same command.
 
 **Views.** `OrderView` gains `kind` and `task`. `HailView` gains nothing: the context names the campaign and task.
 
@@ -287,7 +287,7 @@ Stage 5 adds the `Forge`, `land: pr | merge`, `ci_timeout`, stacking and retarge
 ## Verification
 
 1. `go build ./... && go vet ./... && go test ./...`; `cd combadge && npm run build && npm test`; `cd web && npm test && npm run e2e`.
-2. Store: a stage 2 database opens and gains the columns, tables and the new index, with its hails and findings intact (`testdata/schema-before-stage3.sql`). Inserting an order twice under one key returns one id (`InsertOrderOnce`). Raising under two keys raises two hails, and under one key twice raises one (`InsertBridgeHail`). The task hook runs for each ending path: settle done and failed, withdraw, cascade, a belay of an unclaimed order, the tour's backstop.
+2. Store: a database made from stage 2's `schema.sql` is refused with the fresh-database message. Inserting an order twice under one key returns one id (`InsertOrderOnce`). Raising under two keys raises two hails, and under one key twice raises one (`InsertBridgeHail`). The task hook runs for each ending path: settle done and failed, withdraw, cascade, a belay of an unclaimed order, the tour's backstop.
 3. Claims: a crew member in `task_workers` never claims the task's review from the pool or directed, while another crew member of the division does; route refuses it; the round 1 reviewer claims round 2's review; a reviewer who claims a pooled fix order is then barred. The eligible count leaves out dismissed, sickbay and barred crew members (`EligibleReviewers`).
 4. Protocol: `TestSchemaVerdict` (limits, an empty list, bad severities, control characters) in Go and under ajv; both golden variants round-trip.
 5. combadge: the review prompt names the base; `report` without a verdict is refused for a review and taken for work; the holodeck picks `verdicts` by round and repeats the last.
@@ -299,14 +299,16 @@ Stage 5 adds the `Forge`, `land: pr | merge`, `ci_timeout`, stacking and retarge
 11. CLI and console: `campaign run`'s refusals each create nothing; `campaign show` and `list`; `campaign belay` with an open order and again with an open land hail ends the campaign with no stall hail. Vitest for `LandCard` and `StalledCard` with hostile titles, subjects and summaries as text. Playwright answers a land hail from the page.
 12. Manual, once: one issue in a scratch GitHub repository, sdk harness, two crew members; the review blocks or passes on its own judgement, and the captain lands the branch.
 
-## Open questions
+## Decisions
 
-1. **Migration.** Every new column has a constant default, so I'd add them in place (`addedColumns`) and keep stage 2's databases, the #158 run's among them. The alternative is stage 2's precedent: a `requiredColumns` entry and a fresh database.
-2. **Who may review.** I'd bar only crew members who worked on a work order in the task: the reviewer who blocked round 1 is the best judge of whether round 2 fixed it. The plan's wording bars every earlier reviewer too, and each round would then need a new one.
-3. **Medium findings.** I'd send them to Command through `campaign_triage` as the plan says, with the default of filing whatever the answer leaves out. The other choice is to treat every medium as blocking in stage 3 and add triage in stage 4.
-4. **Belay now.** I'd bring `bmus campaign belay` forward; it is a small command, and the alternative stop takes a belay and a stall hail.
-5. **Stall routing.** I'd keep `campaign_stalled` captain-only in the default `regs.yaml`, with `retry` and `drop` open to Command once the captain removes the rule, and `land` always passing through the captain.
-6. **Default branch.** `campaign/<id>/<slug>` keeps every campaign's branches apart. The plan's `campaign/<id>/<ref>` names the same thing; a ref holds `/` and `#`, so I'd slug it.
+The captain settled the open questions on 2026-11-16:
+
+1. **No migration.** The new columns go into `schema.sql` and an older database is refused (section 1).
+2. **Only workers are barred from review.** A crew member who claimed a work order in the task can't review it; the reviewer of an earlier round may review the next (section 3). Each review runs in a new session and gets the last review's summary and blocking findings in its body (section 5).
+3. **Command triages medium findings** through `campaign_triage`, and whatever its answer leaves out is filed.
+4. **`bmus campaign belay` comes with this stage** (section 9).
+5. **`campaign_stalled` is captain-only in the default `regs.yaml`**, and `land` always passes through the captain.
+6. **The default branch slugs the ref:** `campaign/<id>/<slug>`.
 
 ## Assumptions
 
