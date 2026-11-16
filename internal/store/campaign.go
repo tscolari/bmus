@@ -106,11 +106,12 @@ func sameTask(a, b CampaignTask) bool {
 // SetTask writes task t's row, found by its CampaignID and Ref, and
 // appends entry, in one transaction (#180): every column but the
 // workflow id takes t's value. entry is logged with kind LogKindCampaign
-// and its payload gains campaign, task (the ref) and round, as written;
+// and its payload gains campaign, ref and round, as written;
 // entry.OrderID names the order concerned, if any. A row that already
 // holds t's values is left alone and nothing is logged, so a re-run of
 // the step that moved the task writes nothing. It reports whether it
-// wrote. A missing task returns sql.ErrNoRows.
+// wrote. A missing task returns sql.ErrNoRows. The task workflow must be
+// the row's only writer: a second writer's changes would be overwritten.
 func (s *Store) SetTask(ctx context.Context, t CampaignTask, entry LogEntry) (wrote bool, err error) {
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		cur, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM campaign_tasks WHERE campaign_id = ? AND ref = ?`,
@@ -137,7 +138,7 @@ func (s *Store) SetTask(ctx context.Context, t CampaignTask, entry LogEntry) (wr
 		for _, f := range []struct {
 			key   string
 			value any
-		}{{"campaign", t.CampaignID}, {"task", t.Ref}, {"round", t.Round}} {
+		}{{"campaign", t.CampaignID}, {"ref", t.Ref}, {"round", t.Round}} {
 			if entry.Payload, err = withField(entry.Payload, f.key, f.value); err != nil {
 				return err
 			}

@@ -564,7 +564,7 @@ func TestSetTask(t *testing.T) {
 	require.Equal(t, LogKindCampaign, entries[0].Kind)
 	require.Equal(t, "ORD-0011", entries[0].OrderID)
 	require.Equal(t, entry.Text, entries[0].Text)
-	require.JSONEq(t, `{"head":"ORD-0011","campaign":"C-0001","task":"o/r#12","round":1}`, string(entries[0].Payload))
+	require.JSONEq(t, `{"head":"ORD-0011","campaign":"C-0001","ref":"o/r#12","round":1}`, string(entries[0].Payload))
 
 	landed := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
 	next.State, next.LandedAt = TaskLanded, &landed

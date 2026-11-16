@@ -782,6 +782,8 @@ var ErrParentEnded = errors.New("parent order no longer away")
 // parent and its CreatedBy to createdBy, each logged "order created:
 // <title>" (kind order), then entry(ids), the split's own entry, appended
 // for the parent. It returns the children's ids, in children's order.
+// Children don't inherit the parent's Task: the bridge refuses to split a
+// campaign order (#182), or a child's claimer could later review the task.
 // A child's AfterSiblings, indexes of earlier children, join its After as
 // those children's ids (#142); a later or its own index is ErrAfter.
 //
