@@ -251,7 +251,7 @@ import {
   type UsageBody,
   USAGE_EVERY_TURNS,
 } from "../protocol.js";
-import { abortable, Budget, BudgetExceeded, bundleCheckpoint, checkpointFiles, escalate, orderDir, Stopped, withNotes, workKey, type StopCommand } from "./common.js";
+import { abortable, Budget, BudgetExceeded, bundleCheckpoint, checkpointFiles, chainNote, escalate, orderDir, Stopped, withNotes, workKey, type StopCommand } from "./common.js";
 import { git, wipRef, type RepoCheckout } from "../repos.js";
 import type { Emit, Harness, HarnessOptions, HarnessReport, Inbound, Order, Role, SelfCheck } from "./types.js";
 
@@ -373,6 +373,10 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
       /** The running query's own abort, chained to the run's: a park aborts it alone. */
       let current = new AbortController();
       const state: RunState = { handovers: 0, handing: Promise.resolve(), findings: new Set(), since: {} };
+      /** What a resumed run gets to read: the commits, the WIP and this note, not the transcript. */
+      const WHERE_IT_STANDS = `The commits on bmus/${order.id} and the uncommitted work on ${wipRef(order.id)} (restored for the next run when it can be) show where the work stands; the session's transcript stays in the bridge's cargo bay.`;
+      /** A harness-written note, chained with the agent's latest and the run's starting handover (#145). */
+      const harnessNote = (own: string) => chainNote(own, order.body.handover, state.agentNote);
       /** Hails that may park, held now, by ref, with their park timers. */
       const held = new Map<string, { call: Parked; timer: NodeJS.Timeout }>();
       /**
@@ -453,11 +457,13 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
         if (order.repos.length === 0) return;
         const refs = [...parked.refs.keys()];
         const questions = [...parked.refs.values()].map((p) => `- ${p.question}`);
-        const note = [
-          `Order ${order.id}: the session parked on ${refs.length} hail(s) held past ${Math.round(hailParkAfterMs / 1000)}s, waiting for the captain:`,
-          ...questions,
-          `The harness wrote this checkpoint at the park, with the commits on bmus/${order.id} and the uncommitted work on ${wipRef(order.id)}. If the order resumes from it on another beam, the captain's answers come with it.`,
-        ].join("\n");
+        const note = harnessNote(
+          [
+            `Order ${order.id}: the session parked on ${refs.length} hail(s) held past ${Math.round(hailParkAfterMs / 1000)}s, waiting for the captain:`,
+            ...questions,
+            `The harness wrote this checkpoint at the park, with the commits on bmus/${order.id} and the uncommitted work on ${wipRef(order.id)}. If the order resumes from it on another beam, the captain's answers come with it.`,
+          ].join("\n"),
+        );
         try {
           const body = await checkpoint(state, order, workDir, (dir, since) =>
             writeCheckpoint(dir, order, transcriptOf(state, order.repos[0]!.dir), note, { missingTranscript: "empty", since }),
@@ -508,7 +514,9 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
             turnsAt = tally.turns;
             return armCadence();
           }
-          const note = `Order ${order.id}: a cadence checkpoint the harness wrote while the agent worked (every ${checkpointTurns > 0 ? `${checkpointTurns} turns` : ""}${checkpointTurns > 0 && checkpointEveryMs > 0 ? " or " : ""}${checkpointEveryMs > 0 ? `${Math.round(checkpointEveryMs / 1000)}s` : ""}, when the work changed). Read the transcript, the commits on bmus/${order.id} and the uncommitted work on ${wipRef(order.id)} to see where the work stands.`;
+          const note = harnessNote(
+            `Order ${order.id}: a cadence checkpoint the harness wrote while the agent worked (every ${checkpointTurns > 0 ? `${checkpointTurns} turns` : ""}${checkpointTurns > 0 && checkpointEveryMs > 0 ? " or " : ""}${checkpointEveryMs > 0 ? `${Math.round(checkpointEveryMs / 1000)}s` : ""}, when the work changed). ${WHERE_IT_STANDS}`,
+          );
           const body = await checkpoint(state, order, workDir, (dir, since) =>
             writeCheckpoint(dir, order, transcriptOf(state, order.repos[0]!.dir), note, { missingTranscript: "empty", since }),
           );
@@ -640,7 +648,9 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
       /** The stop timeout: the agent wrote no checkpoint, so the harness writes one with a stub note. */
       const fallback = (stopped: Stopped | BudgetExceeded) =>
         checkpoint(state, order, workDir, (dir, since) => {
-          const note = `Order ${order.id}: ${stopped.message}. The agent wrote no handover within ${Math.round(stopTimeoutMs / 1000)}s, so the harness wrote this checkpoint: read the transcript, the commits on bmus/${order.id} and the uncommitted work on ${wipRef(order.id)} to see where the work stands.`;
+          const note = harnessNote(
+            `Order ${order.id}: ${stopped.message}. The agent wrote no handover within ${Math.round(stopTimeoutMs / 1000)}s, so the harness wrote this checkpoint. ${WHERE_IT_STANDS}`,
+          );
           return writeCheckpoint(dir, order, transcriptOf(state, order.repos[0]?.dir ?? workDir), note, { missingTranscript: "empty", since });
         }).then(checkpointReady, (err: unknown) => end(err instanceof Error ? err : new Error(String(err))));
       /**
@@ -899,6 +909,8 @@ interface RunState {
   key?: string;
   /** Called with each checkpoint's key once it is written. */
   written?: (key: string) => void;
+  /** The latest note the agent wrote in this run (request_handover): harness notes chain it (#145). */
+  agentNote?: string;
   /** A stand_down, recall or budget stop the run is answering, and its fallback timer. */
   stop?: { stopped: Stopped | BudgetExceeded; timer: NodeJS.Timeout };
   /** The keys file_finding sent this run (#153): a key again replaces its finding, a new one past MAX_FINDINGS is refused. */
@@ -1633,6 +1645,7 @@ function combadgeServer(
           if (live.aborted) return dropped();
           try {
             const body = await checkpoint(state, order, dirs.workDir, (dir, since) => writeCheckpoint(dir, order, transcriptOf(state, dirs.repo), note, { since }));
+            state.agentNote = note;
             checkpointReady(body);
             const bundles = body.repos.map((r) => `${r.bundle_path} at ${r.commit}`);
             return text(`checkpoint written: ${[...bundles, body.transcript_path, body.handover_path].join(", ")}`);

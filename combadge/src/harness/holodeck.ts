@@ -24,7 +24,9 @@
  *       decision and decided_by go into the step log. With `"park_after_ms":
  *       N` beside `hail` (#145), a hail still unanswered after N ms parks:
  *       the holodeck writes a placeholder checkpoint into
- *       `<work-dir>/<order>/<index>/`, its note naming the hail and the step,
+ *       `<work-dir>/<order>/<index>/`, its note naming the hail and the step
+ *       (chained, as every holodeck-written note is, with the run's latest
+ *       request_handover note and its starting handover: chainNote),
  *       emits it with `held: [ref]`, logs a `park` step at the index, and
  *       goes on waiting. An order whose handover note carries a holodeck
  *       park ("The holodeck parked its script at step N") walks from step
@@ -135,7 +137,7 @@ import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AnswerBody, ConsultReplyBody, FindingBody, HailBody, ReportBody, UsageBody } from "../protocol.js";
 import { git } from "../repos.js";
-import { abortable, Budget, BudgetExceeded, orderDir, Stopped, writePlaceholderCheckpoint } from "./common.js";
+import { abortable, Budget, BudgetExceeded, chainNote, orderDir, Stopped, writePlaceholderCheckpoint } from "./common.js";
 import type { Harness, HarnessOptions, HarnessReport, Inbound, Order } from "./types.js";
 
 type HailSpec = Omit<HailBody, "ref">;
@@ -224,6 +226,8 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
         } else warn(`ignoring ${m.type} for ${order.id}`);
       });
 
+      /** The latest request_handover note of this run: harness notes chain it (#145). */
+      let agentNote: string | undefined;
       /** Each repo's commit in the run's latest checkpoint: the next one bundles what came after it (#145). */
       let since: Record<string, string> = {};
       /** writePlaceholderCheckpoint, from the run's previous checkpoint. */
@@ -239,7 +243,7 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
           const body = await placeholder(
             path.join(orderDir(workDir, order), String(steps.length)),
             { holodeck: true, order: order.id, stopped: stopped.command },
-            `Order ${order.id}: ${stopped.message}. The holodeck stopped its script here.`,
+            chainNote(`Order ${order.id}: ${stopped.message}. The holodeck stopped its script here.`, order.body.handover, agentNote),
           );
           if (haltedBy !== "stop") return; // a belay came in meanwhile and ended the run
           emit({ type: "checkpoint_ready", body: { ...body, stopping: true } });
@@ -282,7 +286,7 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
         const body = await placeholder(
           path.join(orderDir(workDir, order), String(steps.length)),
           { holodeck: true, order: order.id, stopped: "budget" },
-          `Order ${order.id}: ${stopped.message}. The holodeck stopped its script here.`,
+          chainNote(`Order ${order.id}: ${stopped.message}. The holodeck stopped its script here.`, order.body.handover, agentNote),
         );
         signal.throwIfAborted();
         emit({ type: "checkpoint_ready", body });
@@ -325,7 +329,7 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
                 const body = await placeholder(
                   path.join(orderDir(workDir, order), String(index)),
                   { holodeck: true, order: order.id, parked: index },
-                  `Order ${order.id}: the holodeck parked on hail ${ref} (${step.hail.question}). The holodeck parked its script at step ${index}.`,
+                  chainNote(`Order ${order.id}: the holodeck parked on hail ${ref} (${step.hail.question}). The holodeck parked its script at step ${index}.`, order.body.handover, agentNote),
                 );
                 if (signal.aborted) return;
                 emit({ type: "checkpoint_ready", body: { ...body, held: [ref] } });
@@ -352,6 +356,7 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
               { holodeck: true, order: order.id, step: index },
               step.request_handover,
             );
+            agentNote = step.request_handover;
             signal.throwIfAborted();
             emit({ type: "checkpoint_ready", body });
             log();

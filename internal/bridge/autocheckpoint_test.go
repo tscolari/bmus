@@ -700,3 +700,50 @@ func TestBackstopClosesCarriedHails(t *testing.T) {
 	require.NoError(t, r.d.backstop(ctx, "sorell", id, false))
 	require.Equal(t, store.HailOpen, status(hid))
 }
+
+// #145 (M1): the resumed run parks again and its beam is lost after that
+// park checkpoint is pulled. The carried answer and run 1's note reach
+// run 3: the harness-written note chains the handover its run started
+// from.
+func TestCarriedAnswerSurvivesNewRunsPark(t *testing.T) {
+	t.Parallel()
+	script := filepath.Join(t.TempDir(), "twice.json")
+	require.NoError(t, os.WriteFile(script, []byte(`[{"at_pct": 10, "commit": "a change"},
+		{"at_pct": 20, "hail": {"category": "clarifying_question", "question": "Which way?", "options": ["left", "right"]}, "park_after_ms": 200},
+		{"at_pct": 30, "progress": "resumed once"},
+		{"at_pct": 40, "hail": {"category": "clarifying_question", "question": "How far?", "options": ["near", "far"]}, "park_after_ms": 200},
+		{"at_pct": 50, "progress": "resumed twice"},
+		{"at_pct": 100, "report": {"summary": "done after two parks"}}]`), 0o600))
+	b, hd, id := parkedWithCarried(t, script, "")
+	require.NoError(t, hd.d.AnswerHail(t.Context(), "H-0001", "left", nil))
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		require.Equal(ct, 1, countSteps(t, hd.d, missionWorkflowID(id), "carried-answer"))
+	}, 30*time.Second, 20*time.Millisecond)
+	requireOutcome(t, OutcomeRequested)(hd.d.ReenergizeCrew(t.Context(), "sorell"))
+	// Run 2 parks on its own hail; its checkpoint is pulled, then its beam goes.
+	hd.waitHail(t, "H-0002")
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		cps, err := hd.d.store.ListCheckpoints(t.Context(), id)
+		require.NoError(ct, err)
+		require.Len(ct, cps, 2)
+	}, 30*time.Second, 20*time.Millisecond)
+	require.NoError(t, b.h.Kill(hd.crew(t, "sorell").CurrentBeam))
+	require.Equal(t, CrewTourResult{Ended: store.CrewSickbay}, tourResult(t, hd.d, tourWorkflowID("sorell", 1)))
+	require.NoError(t, hd.d.AnswerHail(t.Context(), "H-0002", "near", nil))
+	requireOutcome(t, OutcomeRequested)(hd.d.ReenergizeCrew(t.Context(), "sorell"))
+	require.Equal(t, MissionDone, missionResult(t, hd.d, id).Status)
+
+	var run3 map[string]any
+	for _, e := range resumedSteps(t, b.stepLog, id) {
+		if e["action"] == "progress" && strings.Contains(e["handover"].(string), "step 3.") {
+			run3 = e
+		}
+	}
+	require.NotNil(t, run3, "run 3 walked on from its park at step 3")
+	handover := run3["handover"].(string)
+	require.Contains(t, handover, "The holodeck parked its script at step 3.")
+	require.Contains(t, handover, "The handover note this run started from:")
+	require.Contains(t, handover, "The holodeck parked its script at step 1.") // run 1's note
+	require.Contains(t, handover, answeredLine)
+	require.Contains(t, handover, `the captain answered hail H-0002, which the earlier session asked: "How far?". The answer: "near".`)
+}

@@ -93,6 +93,20 @@ export async function workKey(order: Order): Promise<string> {
   return keys.join(" ");
 }
 
+/**
+ * A harness-written checkpoint note (#145) chained with what the next run
+ * needs from earlier ones: the latest note the agent wrote in this run, and
+ * the handover note this run started from (which holds the notes before
+ * it, the carried answers and the WIP lines). A later run gets only the
+ * note of the checkpoint it resumes from.
+ */
+export function chainNote(own: string, started: string | undefined, agent: string | undefined): string {
+  const parts = [own.trimEnd()];
+  if (agent !== undefined && agent.trim() !== "") parts.push(`The agent's latest handover note in this run:\n${agent.trim()}`);
+  if (started !== undefined && started.trim() !== "") parts.push(`The handover note this run started from:\n${started.trim()}`);
+  return parts.join("\n\n");
+}
+
 /** note with notes, if any, after a blank line. */
 export function withNotes(note: string, notes: string[]): string {
   return notes.length === 0 ? note : `${note.trimEnd()}\n\n${notes.join("\n")}`;

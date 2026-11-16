@@ -3266,6 +3266,35 @@ describe("sdk harness automatic checkpoints (#145)", () => {
     await t.end();
   });
 
+  it("chains a harness note with the agent's latest note and the handover the run started from", async () => {
+    const dir = tempDir();
+    const repo = gitRepo(dir);
+    const transcript = path.join(dir, "t.jsonl");
+    fs.writeFileSync(transcript, "{}\n");
+    const events: CadenceEvent[] = [];
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      await agent.preToolUse("Read", {}, transcript);
+      expect((await agent.callTool("request_handover", { note: "agent: half done" })).isError).toBeUndefined();
+      fs.writeFileSync(path.join(repo, "wip.txt"), "wip\n");
+      yield assistant("t1", { input: 1, output: 1 });
+      while (!events.includes("written")) await new Promise<void>((r) => setImmediate(r));
+      yield success;
+    }, { dir, repo, claudePath: fakeClaude(dir), checkpointTurns: 1, onCadence: (e) => events.push(e), body: { handover: "run 1: the plan\n\nThe captain answered hail H-0001." } });
+    await run.result;
+    const cps = run.emitted.filter((m) => m.type === "checkpoint_ready");
+    expect(cps).toHaveLength(2);
+    const cadence = cps[1]!;
+    if (cadence.type !== "checkpoint_ready") throw new Error("unreachable");
+    const note = fs.readFileSync(cadence.body.handover_path, "utf8");
+    expect(note).toContain("a cadence checkpoint the harness wrote while the agent worked");
+    expect(note).toContain("the session's transcript stays in the bridge's cargo bay");
+    expect(note).not.toContain("Read the transcript");
+    expect(note).toContain("The agent's latest handover note in this run:\nagent: half done");
+    expect(note).toContain("The handover note this run started from:\nrun 1: the plan\n\nThe captain answered hail H-0001.");
+  });
+
   it("never fires with both triggers set to 0", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const dir = tempDir();
