@@ -208,11 +208,11 @@ async function start(opts: ServeOptions, release: () => void): Promise<Server> {
       );
       current.started = true;
       for (const m of current.pending.splice(0)) deliver(current, m);
-      const { summary, artifacts, usage } = await started;
+      const { summary, artifacts, usage, verdict } = await started;
       const out = path.join(path.resolve(opts.workDir), id, "out");
       const work = [];
       for (const r of repos) work.push(await bundleWork(r, id, path.join(out, `${r.name}.bundle`)));
-      return { summary, repos: work, ...(artifacts && { artifacts }), usage };
+      return { summary, repos: work, ...(artifacts && { artifacts }), usage, ...(verdict && { verdict }) };
     })();
     result.then(
       (report) => finish("report", report),

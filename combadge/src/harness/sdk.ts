@@ -37,7 +37,10 @@
  *     anything else denies with the decision as the message.
  * - In-process tools (MCP server `combadge`, pre-allowed):
  *   - `progress(pct, note)` emits progress.
- *   - `report(summary, artifacts?)` records the order's report.
+ *   - `report(summary, artifacts?)` records the order's report. For a review
+ *     order (#181, reviewOf) it also takes `verdict` and refuses a call
+ *     without one; a work order's has no verdict field, and zod strips one.
+ *     A review order with no base and round fails before the query starts.
  *   - `tracker_comment({ref, body})` and `tracker_close({ref, reason?})`, for
  *     every role (#54): ask the bridge to comment on or close an item of its
  *     issue tracker, as a `tracker_comment` or `tracker_close` hail
@@ -230,6 +233,12 @@ import {
   MAX_FINDINGS,
   RESERVED_LABEL_PREFIX,
   type FindingBody,
+  MAX_VERDICT_BODY,
+  MAX_VERDICT_FINDINGS,
+  MAX_VERDICT_PATH,
+  MAX_VERDICT_TITLE,
+  type Verdict,
+  type OrderReview,
   MAX_REORDER_CHANGES,
   MAX_REORDER_IDS,
   MAX_REORDER_ONTO,
@@ -716,6 +725,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
         if (order.repos.length !== 1) {
           throw new Error(`the sdk harness works in exactly one repo; order ${order.id} has ${order.repos.length}`);
         }
+        const review = reviewOf(order);
         const checkout = order.repos[0]!;
         const repo = checkout.dir;
         const claude = claudePath ?? findOnPath("claude", env.PATH);
@@ -725,7 +735,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
           pathToClaudeCodeExecutable: claude,
           permissionMode: "bypassPermissions",
           allowDangerouslySkipPermissions: true,
-          systemPrompt: { type: "preset", preset: "claude_code", append: instructions(order, checkout, opts.role) },
+          systemPrompt: { type: "preset", preset: "claude_code", append: instructions(order, checkout, review, opts.role) },
           hooks: {
             PreToolUse: [
               { hooks: [budgetPolicy, recordTranscript(state), gitPushPolicy] },
@@ -761,7 +771,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
           const perQuery: Options = {
             abortController: q,
             canUseTool: canUseTool(hailIn(q), { take: takeIn(q), running: (id) => running.add(id) }, budgetGate(hailIn(q))),
-            mcpServers: { [MCP_SERVER]: combadgeServer(order, checkpointReady, emit, state, { repo, workDir }, q.signal, hailIn(q), opts.role) },
+            mcpServers: { [MCP_SERVER]: combadgeServer(order, checkpointReady, emit, state, { repo, workDir }, q.signal, hailIn(q), review, opts.role) },
             ...(resume !== undefined && { resume }),
           };
           const chain = () => q.abort(signal.reason);
@@ -830,6 +840,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
           summary: reported?.summary ?? result.result,
           ...(reported?.artifacts && { artifacts: reported.artifacts }),
           usage: tally.tokens,
+          ...(reported?.verdict && { verdict: reported.verdict }),
         };
       };
       const driven = drive().finally(() => {
@@ -898,7 +909,7 @@ interface RunState {
   transcriptPath?: string;
   /** Session id from the SDK's messages: the transcript fallback. */
   sessionId?: string;
-  report?: { summary: string; artifacts?: string[] };
+  report?: { summary: string; artifacts?: string[]; verdict?: Verdict };
   /** Checkpoints written so far; the next goes to `<order>/<handovers + 1>`. */
   handovers: number;
   /** The latest checkpoint being written, which the next one waits for. */
@@ -1467,6 +1478,46 @@ export const fileFindingInput = {
     .optional(),
 };
 
+/** One finding of a verdict: the schema's limits, which the bridge checks again (comms.Verdict.Check). */
+const verdictFindingInput = z
+  .strictObject({
+    severity: z.enum(["high", "medium", "low"]),
+    title: z
+      .string()
+      .trim()
+      .min(1)
+      .regex(ONE_LINE, "title is one line")
+      .refine((s) => chars(s) <= MAX_VERDICT_TITLE, `title is at most ${MAX_VERDICT_TITLE} characters`),
+    body: z.string().refine((s) => Buffer.byteLength(s) <= MAX_VERDICT_BODY, `body is at most ${MAX_VERDICT_BODY} bytes of UTF-8`),
+    path: z
+      .string()
+      .min(1)
+      .regex(ONE_LINE, "path is one line")
+      .refine((s) => Buffer.byteLength(s) <= MAX_VERDICT_PATH, `path is at most ${MAX_VERDICT_PATH} bytes of UTF-8`)
+      .optional(),
+    line: z.number().int().min(1).optional(),
+  })
+  .refine((f) => f.line === undefined || f.path !== undefined, "a line needs a path");
+
+/** A review's verdict as the report tool takes it (#181). */
+export const verdictInput = z.strictObject({ findings: z.array(verdictFindingInput).max(MAX_VERDICT_FINDINGS) });
+
+/** The verdict a review's report carries for input, without absent fields. */
+export function verdictBody(input: z.infer<typeof verdictInput>): Verdict {
+  return {
+    findings: input.findings.map((f) => ({
+      severity: f.severity,
+      title: f.title,
+      body: f.body,
+      ...(f.path !== undefined && { path: f.path }),
+      ...(f.line !== undefined && { line: f.line }),
+    })),
+  };
+}
+
+/** What the report tool says to a review's report that has no verdict. */
+export const NO_VERDICT = "a review's report needs a verdict; findings may be empty";
+
 /** The finding message file_finding emits for input. */
 export function findingBody(input: z.infer<z.ZodObject<typeof fileFindingInput>>): FindingBody {
   return {
@@ -1518,6 +1569,8 @@ function combadgeServer(
   live: AbortSignal,
   /** Raises the hails of split_order, reorder_orders and the tracker tools. */
   hails: Hail,
+  /** What a review order reviews (reviewOf); undefined for a work order. */
+  review: OrderReview | undefined,
   /** Command (--role command) gets split_order and reorder_orders. */
   role?: Role,
 ) {
@@ -1627,19 +1680,36 @@ function combadgeServer(
           return Promise.resolve(text("progress recorded"));
         },
       ),
-      tool(
-        "report",
-        "Record the order's final report: a summary of what was done and any artifact paths. Call it once, when the work is finished and committed, then stop.",
-        { summary: z.string(), artifacts: z.array(z.string()).optional() },
-        ({ summary, artifacts }) => {
-          if (live.aborted) return dropped();
-          state.report = { summary, ...(artifacts && { artifacts }) };
-          return Promise.resolve(text("report recorded; finish now"));
-        },
-      ),
+      review
+        ? tool(
+            "report",
+            "Record the review's final report: a summary of what you found and the verdict. " +
+              "The verdict's findings each have a severity (high: must be fixed before the work lands; medium: should be, a judgement call; low: follow-up work), " +
+              `a one-line title, a body, and a path and line where they apply; at most ${MAX_VERDICT_FINDINGS}. An empty list is a pass. Call it once, when the review is done, then stop.`,
+            { summary: z.string(), artifacts: z.array(z.string()).optional(), verdict: verdictInput.optional() },
+            ({ summary, artifacts, verdict }) => {
+              if (live.aborted) return dropped();
+              if (verdict === undefined) return Promise.resolve(text(NO_VERDICT, true));
+              state.report = { summary, ...(artifacts && { artifacts }), verdict: verdictBody(verdict) };
+              return Promise.resolve(text("report recorded; finish now"));
+            },
+          )
+        : tool(
+            "report",
+            "Record the order's final report: a summary of what was done and any artifact paths. Call it once, when the work is finished and committed, then stop.",
+            { summary: z.string(), artifacts: z.array(z.string()).optional() },
+            ({ summary, artifacts }) => {
+              if (live.aborted) return dropped();
+              state.report = { summary, ...(artifacts && { artifacts }) };
+              return Promise.resolve(text("report recorded; finish now"));
+            },
+          ),
       tool(
         "request_handover",
-        `Checkpoint the work for whoever continues it: bundles the commits on branch bmus/${order.id} (commit there first; other branches are not included) with a snapshot of the uncommitted changes, copies this session's transcript and stores the note.`,
+        review
+          ? "Checkpoint the review for whoever continues it: copies this session's transcript and stores the note, which should say what you have checked, what you found so far and what is left. " +
+              "Commit nothing for it: a review changes nothing."
+          : `Checkpoint the work for whoever continues it: bundles the commits on branch bmus/${order.id} (commit there first; other branches are not included) with a snapshot of the uncommitted changes, copies this session's transcript and stores the note.`,
         { note: z.string() },
         async ({ note: written }) => {
           if (live.aborted) return dropped();
@@ -1854,20 +1924,46 @@ function orderPrompt(order: Order): string {
   return `Order ${order.id}: ${order.body.title}\n\n${order.body.body}`;
 }
 
-function instructions(order: Order, checkout: RepoCheckout, role?: Role): string {
+/**
+ * What a review order reviews (#181), undefined for a work order. A review
+ * order without its base and round can't be reviewed: it throws, failing
+ * the run before the query starts.
+ */
+export function reviewOf(order: Order): OrderReview | undefined {
+  if (order.body.kind !== "review") return undefined;
+  if (!order.body.review) throw new Error(`order ${order.id} is a review with no review base and round`);
+  return order.body.review;
+}
+
+function instructions(order: Order, checkout: RepoCheckout, review: OrderReview | undefined, role?: Role): string {
   const handover = order.body.handover;
   const start = handover
     ? `already checked out at ${checkout.base_commit.slice(0, 12)}, the checkpoint this order resumes from (the work started from ${checkout.base_ref})`
     : `already checked out from ${checkout.base_ref} (${checkout.base_commit.slice(0, 12)})`;
-  const lines = [
-    "You are a crew member working on an order from the captain, who is not watching this session.",
-    `Work in ${checkout.dir}, on branch bmus/${order.id}, ${start}. Commit your work on it. Don't push: the bridge takes your commits from here.`,
-    `Report progress with mcp__${MCP_SERVER}__progress at meaningful milestones.`,
-    "If you need a decision from the captain, ask with AskUserQuestion; the answer may take a while.",
-    `When the work is finished and committed, call mcp__${MCP_SERVER}__report with a summary and any artifact paths, then stop.`,
+  const lines = review
+    ? [
+        "You are a crew member reviewing another crew member's work for the captain, who is not watching this session.",
+        `The checkout in ${checkout.dir}, on branch bmus/${order.id}, holds the head under review (${checkout.base_commit.slice(0, 12)}), round ${review.round} of the task. ` +
+          `\`git diff ${review.base}..HEAD\` and \`git log ${review.base}..HEAD\` show the task's work.`,
+        "Judge whether it does what the order asks, correctly and safely. Run what helps (tests, builds, linters), but change nothing and commit nothing: a review's commits are ignored.",
+        "When the order carries an earlier review's summary and blocking findings, judge the fix against them: say in your summary whether each one is resolved, and report any that isn't again.",
+        `Report progress with mcp__${MCP_SERVER}__progress at meaningful milestones.`,
+        "If you need a decision from the captain, ask with AskUserQuestion; the answer may take a while.",
+        `When the review is done, call mcp__${MCP_SERVER}__report with a summary and a verdict, then stop. ` +
+          "The verdict lists your findings on the work: high for what must be fixed before landing, medium for what should be and is a judgement call, low for follow-up work. An empty list is a pass.",
+      ]
+    : [
+        "You are a crew member working on an order from the captain, who is not watching this session.",
+        `Work in ${checkout.dir}, on branch bmus/${order.id}, ${start}. Commit your work on it. Don't push: the bridge takes your commits from here.`,
+        `Report progress with mcp__${MCP_SERVER}__progress at meaningful milestones.`,
+        "If you need a decision from the captain, ask with AskUserQuestion; the answer may take a while.",
+        `When the work is finished and committed, call mcp__${MCP_SERVER}__report with a summary and any artifact paths, then stop.`,
+      ];
+  lines.push(
     `You have no issue tracker access. To comment on or close a tracker item, ask the bridge with mcp__${MCP_SERVER}__tracker_comment or mcp__${MCP_SERVER}__tracker_close; it may be refused.`,
     `When you find something outside this order's scope that deserves its own issue (a bug, a gap, follow-up work), file it with mcp__${MCP_SERVER}__file_finding and carry on; the bridge files it once the order ends.`,
-  ];
+  );
+  if (review) lines.push("What is wrong with the work under review goes in the verdict, not in file_finding.");
   if (role === "command") {
     lines.push(
       `You are Command. When this order is too big for one crew member, split it with mcp__${MCP_SERVER}__split_order: each child becomes an order of its own, for whoever its division sends. Children run side by side unless a child's after names earlier children it must wait for. The captain approves every split. To change the base or the wait of orders nobody has started yet, use mcp__${MCP_SERVER}__reorder_orders; the captain approves it too.`,
