@@ -885,7 +885,7 @@ func TestRunRefusesBadCheckpointCadence(t *testing.T) {
 	t.Parallel()
 	for d, want := range map[time.Duration]string{
 		-time.Minute:                        "-1m0s is negative",
-		500 * time.Microsecond:              "500µs is shorter than 1ms",
+		30 * time.Second:                    "30s is shorter than 1m0s (0 turns it off)",
 		MaxHailParkAfter + time.Millisecond: "596h31m23.648s is over the cap",
 	} {
 		cfg := testConfig(privateHome(t))
@@ -898,5 +898,6 @@ func TestRunRefusesBadCheckpointCadence(t *testing.T) {
 	require.ErrorContains(t, Run(t.Context(), cfg), "bridge: checkpoint turns: -1 is negative")
 	require.NoError(t, CheckCheckpointEvery(0))
 	require.NoError(t, CheckCheckpointEvery(time.Hour))
+	require.NoError(t, CheckCheckpointEvery(time.Minute))
 	require.NoError(t, CheckCheckpointTurns(0))
 }

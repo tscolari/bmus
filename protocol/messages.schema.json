@@ -328,7 +328,8 @@
         "bundle_path": {"description": "Absolute path on the beam of a git bundle of `branch` minus the order's base commit, or of its whole history when the branch has no commits past it (git refuses an empty bundle).", "type": "string", "minLength": 1},
         "commit": {"description": "The commit `branch` points at in the bundle.", "type": "string", "minLength": 1},
         "branch": {"description": "The branch the bundle carries, `bmus/<order>`.", "type": "string", "minLength": 1},
-        "full_bundle_path": {"description": "A checkpoint's full bundle (#145), when bundle_path holds only what came after the previous checkpoint's commit: the bridge takes it when the incremental one doesn't verify. Absent when bundle_path is the full one.", "type": "string", "minLength": 1}
+        "full_bundle_path": {"description": "A checkpoint's full bundle (#145), when bundle_path holds only what came after the previous checkpoint's commit: the bridge takes it when the incremental one doesn't verify. Absent when bundle_path is the full one.", "type": "string", "minLength": 1},
+        "wip_bundle_path": {"description": "A checkpoint's WIP bundle (#145): refs/bmus/wip/<order> and refs/bmus/kept-wip/<order>, those that exist, minus `branch` at `commit`. A file of its own, so the commits land even when the WIP can't. Absent when there is no WIP.", "type": "string", "minLength": 1}
       }
     },
     "repo_name": {

@@ -541,8 +541,7 @@ describe("holodeck run (in process)", () => {
     expect(cp.body.transcript_path).toBe(path.join(dir, "work", ORDER, "1", "transcript.jsonl"));
     const note = fs.readFileSync(cp.body.handover_path, "utf8");
     expect(note).toContain("The holodeck parked its script at step 1.");
-    const heads = git(dir, "bundle", "list-heads", cp.body.repos[0]!.bundle_path);
-    expect(heads).toContain(`refs/bmus/wip/${ORDER}`);
+    expect(git(dir, "bundle", "list-heads", cp.body.repos[0]!.wip_bundle_path!)).toContain(`refs/bmus/wip/${ORDER}`);
     expect(git(repos[0]!.dir, "show", `refs/bmus/wip/${ORDER}:notes/wip.txt`)).toBe(`${ORDER} step 0`);
     expect(git(repos[0]!.dir, "rev-parse", `bmus/${ORDER}`)).toBe(commit);
     expect(stepLog(dir).map((e) => e.action)).toEqual(["write", "park"]);

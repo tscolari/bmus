@@ -458,6 +458,11 @@ type WorkRepo struct {
 	// holds only what came after the previous checkpoint's commit: the
 	// bridge takes it when the incremental one doesn't verify.
 	FullBundlePath string `json:"full_bundle_path,omitempty"`
+	// WipBundlePath is a checkpoint's WIP bundle (#145):
+	// refs/bmus/wip/<order> and refs/bmus/kept-wip/<order>, those that
+	// exist, minus Branch at Commit. A file of its own, so the commits
+	// land even when the WIP can't.
+	WipBundlePath string `json:"wip_bundle_path,omitempty"`
 }
 
 // Usage is token usage for an order.

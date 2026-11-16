@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -2022,6 +2023,9 @@ func pullCheckpoint(ctx context.Context, d *Daemon, in MissionInput, beamAlias s
 		if err := d.landCheckpoint(ctx, beam, in.OrderID, r, cp.Repos[i].BundlePath); err != nil {
 			return err
 		}
+		if err := d.pullWip(ctx, beam, in, seq, r, cp.Repos[i].BundlePath); err != nil {
+			return err
+		}
 	}
 	if err := d.store.InsertCheckpoint(ctx, cp); err != nil {
 		return err
@@ -2079,6 +2083,47 @@ func (d *Daemon) landCheckpoint(ctx context.Context, beam transporter.Beam, orde
 	}
 	if err := land(); err != nil && !errors.Is(err, errWorkPermanent) {
 		return err
+	}
+	return nil
+}
+
+// pullWip copies a checkpoint's WIP bundle (#145), when it has one, into
+// the cargo bay beside its bundle (wipBundleOf). One over
+// Config.MaxBundleBytes is left on the beam and logged
+// (bundle_too_large): the checkpoint's commits land without it. An older
+// copy from an earlier attempt is removed first.
+func (d *Daemon) pullWip(ctx context.Context, beam transporter.Beam, in MissionInput, seq uint64, r comms.WorkRepo, local string) error {
+	dst := wipBundleOf(local)
+	if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if r.WipBundlePath == "" {
+		return nil
+	}
+	if !path.IsAbs(r.WipBundlePath) {
+		return fmt.Errorf("repo %s: WIP bundle path %q is not absolute: %w", r.Name, r.WipBundlePath, errWorkPermanent)
+	}
+	size, err := d.transporter.Size(ctx, beam, r.WipBundlePath)
+	if err != nil {
+		return fmt.Errorf("size repo %s's WIP bundle %s on %s: %w", r.Name, r.WipBundlePath, beam.Alias, err)
+	}
+	tooLarge := func(size int64) error {
+		text := fmt.Sprintf("checkpoint %d: repo %s's uncommitted work is %d bytes, over the %d byte cap; its commits are pulled without it",
+			seq, r.Name, size, d.maxBundleBytes)
+		return d.appendLog(ctx, logOrder, in.CrewID, in.OrderID, text, map[string]any{"seq": seq, "reason": text, "code": CodeBundleTooLarge})
+	}
+	if size > d.maxBundleBytes {
+		return tooLarge(size)
+	}
+	if err := d.transporter.CopyFrom(ctx, beam, r.WipBundlePath, dst); err != nil {
+		return fmt.Errorf("copy %s from %s: %w", r.WipBundlePath, beam.Alias, err)
+	}
+	if err := d.checkCopiedBundle(r.Name, dst); err != nil {
+		if !errors.Is(err, errBundleTooLarge) {
+			return err
+		}
+		// checkCopiedBundle removed it; the beam's own size was under the cap.
+		return tooLarge(size)
 	}
 	return nil
 }

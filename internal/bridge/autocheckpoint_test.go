@@ -136,17 +136,22 @@ func TestBundleRepoFromShipsWip(t *testing.T) {
 	require.NoError(t, err)
 	clone, base := wipClone(t, shipped, in.OrderID)
 	branch := "refs/heads/" + orderBranch(in.OrderID)
-	bundle := func(refs ...string) string {
+	// A checkpoint as the beam writes it: bmus/<order> from the base, and
+	// the WIP refs on their own from the tip (wipBundleOf).
+	bundle := func(wips ...string) string {
 		out := filepath.Join(t.TempDir(), "cp.bundle")
-		gitT(t, clone, append([]string{"bundle", "create", "-q", out}, append(refs, "^"+base)...)...)
+		gitT(t, clone, "bundle", "create", "-q", out, branch, "^"+base)
+		gitT(t, clone, append(append([]string{"bundle", "create", "-q", wipBundleOf(out)}, wips...), "^"+branch)...)
 		return out
 	}
 	older := commitFile(t, clone, "older.txt", "older\n")
 	olderWip := snapshotWip(t, clone, in.OrderID, "draft.txt", "older draft\n")
-	olderBundle := bundle(branch, wipRef(in.OrderID))
+	olderBundle := bundle(wipRef(in.OrderID))
 	newer := commitFile(t, clone, "newer.txt", "newer\n")
 	newerWip := snapshotWip(t, clone, in.OrderID, "draft.txt", "newer draft\n")
-	newerBundle := bundle(branch, wipRef(in.OrderID))
+	gitT(t, clone, "update-ref", keptWipRef(in.OrderID), olderWip) // a WIP an earlier run couldn't restore
+	newerBundle := bundle(wipRef(in.OrderID), keptWipRef(in.OrderID))
+	kept := "\n" + olderWip + " " + keptWipRef(in.OrderID)
 	cp := func(seq int, bundle, commit string) store.Checkpoint {
 		return store.Checkpoint{OrderID: in.OrderID, Beam: "b1", Seq: seq,
 			Repos: []store.CheckpointRepo{{Name: "app", Commit: commit, BundlePath: bundle}}}
@@ -154,8 +159,10 @@ func TestBundleRepoFromShipsWip(t *testing.T) {
 	heads := func(out string) string { return bundleHeads(t, out) }
 	out := filepath.Join(t.TempDir(), "out.bundle")
 	clean := func() {
-		_, err := runGit(ctx, d.repoDir("app"), "rev-parse", "--verify", "--quiet", wipRef(in.OrderID))
-		require.Error(t, err, "the clone keeps no WIP ref")
+		for _, ref := range []string{wipRef(in.OrderID), keptWipRef(in.OrderID), "refs/bmus/scratch/" + in.OrderID} {
+			_, err := runGit(ctx, d.repoDir("app"), "rev-parse", "--verify", "--quiet", ref)
+			require.Error(t, err, "the clone keeps no %s", ref)
+		}
 	}
 
 	// From the newest: its WIP.
@@ -163,7 +170,7 @@ func TestBundleRepoFromShipsWip(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, newer, commit)
 	require.Equal(t, 2, from.Seq)
-	require.Equal(t, newer+" "+branch+"\n"+newerWip+" "+wipRef(in.OrderID), heads(out))
+	require.Equal(t, newer+" "+branch+"\n"+newerWip+" "+wipRef(in.OrderID)+kept, heads(out))
 	clean()
 
 	// The newest is rejected (its row names a commit its bundle lacks): it
@@ -172,7 +179,7 @@ func TestBundleRepoFromShipsWip(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, older, commit)
 	require.Equal(t, 1, from.Seq)
-	require.Equal(t, older+" "+branch+"\n"+newerWip+" "+wipRef(in.OrderID), heads(out))
+	require.Equal(t, older+" "+branch+"\n"+newerWip+" "+wipRef(in.OrderID)+kept, heads(out))
 	clean()
 
 	// All rejected: base_ref, still with the newest's WIP.
@@ -180,7 +187,7 @@ func TestBundleRepoFromShipsWip(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, from)
 	require.Equal(t, base, commit)
-	require.Equal(t, base+" "+branch+"\n"+newerWip+" "+wipRef(in.OrderID), heads(out))
+	require.Equal(t, base+" "+branch+"\n"+newerWip+" "+wipRef(in.OrderID)+kept, heads(out))
 	clean()
 	require.NotEqual(t, olderWip, newerWip)
 
@@ -263,10 +270,11 @@ func testParkCheckpointOutlivesBeam(t *testing.T, before bool) {
 	require.Contains(t, string(note), "The holodeck parked its script at step 2.")
 	first := commitOf(t, b.stepLog, id, 0)
 	require.Equal(t, first, cp.Repos[0].Commit)
-	heads := bundleHeads(t, cp.Repos[0].BundlePath)
-	wip, _, ok := strings.Cut(strings.Split(heads, "\n")[1], " ")
+	require.Equal(t, first+" refs/heads/bmus/"+id, bundleHeads(t, cp.Repos[0].BundlePath))
+	heads := bundleHeads(t, wipBundleOf(cp.Repos[0].BundlePath))
+	wip, _, ok := strings.Cut(heads, " ")
 	require.True(t, ok, heads)
-	require.Equal(t, wip+" "+wipRef(id), strings.Split(heads, "\n")[1])
+	require.Equal(t, wip+" "+wipRef(id), heads)
 
 	require.NoError(t, b.h.Kill(c.CurrentBeam))
 	require.Equal(t, CrewTourResult{Ended: store.CrewSickbay}, tourResult(t, hd.d, tourWorkflowID("sorell", 0)))
@@ -392,4 +400,37 @@ func TestStoppedOrderRestoresWipFromCheckout(t *testing.T) {
 	clone := filepath.Join(b.home, "repos", "app")
 	require.Equal(t, res.Report.Repos[0].Commit, gitT(t, clone, "rev-parse", "bmus/"+id))
 	require.Equal(t, res.Report.Repos[0].Commit+" refs/heads/bmus/"+id, bundleHeads(t, filepath.Join(b.home, "cargo", id, "final", "app.bundle")))
+}
+
+// #145: a checkpoint's WIP bundle over the size cap stays on the beam and
+// is logged; the checkpoint's commits are pulled without it. One under
+// the cap lands beside the checkpoint's bundle.
+func TestPullWipOverCap(t *testing.T) {
+	t.Parallel()
+	d := testDaemon(t, nil)
+	st, err := store.Open(t.Context(), filepath.Join(d.home, store.DBFile))
+	require.NoError(t, err)
+	t.Cleanup(func() { st.Close() })
+	d.store = st
+	root := t.TempDir()
+	d.transporter = &fakeProvider{copyRoot: root}
+	d.maxBundleBytes = 10
+	require.NoError(t, os.WriteFile(filepath.Join(root, "app.wip.bundle"), []byte("0123456789abc"), 0o600))
+	local := filepath.Join(t.TempDir(), "app.bundle")
+	in := MissionInput{OrderID: "ORD-0001", CrewID: "sorell"}
+	r := comms.WorkRepo{Name: "app", WipBundlePath: "/app.wip.bundle"}
+	beam := transporter.Beam{Alias: "beam-1"}
+	require.NoError(t, d.pullWip(t.Context(), beam, in, 3, r, local))
+	require.NoFileExists(t, wipBundleOf(local))
+	entries, err := st.ListLog(t.Context(), 0)
+	require.NoError(t, err)
+	require.Equal(t, map[string]int{CodeBundleTooLarge: 1}, codes(t, entries))
+	require.Equal(t, "checkpoint 3: repo app's uncommitted work is 13 bytes, over the 10 byte cap; its commits are pulled without it", entries[len(entries)-1].Text)
+
+	d.maxBundleBytes = 100
+	require.NoError(t, d.pullWip(t.Context(), beam, in, 4, r, local))
+	require.FileExists(t, wipBundleOf(local))
+	// A later checkpoint without WIP leaves no stale copy.
+	require.NoError(t, d.pullWip(t.Context(), beam, in, 4, comms.WorkRepo{Name: "app"}, local))
+	require.NoFileExists(t, wipBundleOf(local))
 }

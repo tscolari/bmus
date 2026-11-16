@@ -223,15 +223,22 @@ func CheckHailParkAfter(d time.Duration) error {
 	return nil
 }
 
+// MinCheckpointEvery is the shortest Config.CheckpointEvery but 0 (#145),
+// as combadge serve has it: a checkpoint costs a snapshot, bundles and a
+// pull.
+const MinCheckpointEvery = time.Minute
+
 // CheckCheckpointEvery fails unless d is a --checkpoint-every combadge
-// serve takes (#145): 0 (off), or from 1ms to MaxHailParkAfter, as
-// CheckHailParkAfter.
+// serve takes (#145): 0 (off), or from MinCheckpointEvery to
+// MaxHailParkAfter.
 func CheckCheckpointEvery(d time.Duration) error {
-	if d == 0 {
+	switch {
+	case d == 0:
 		return nil
-	}
-	if d < 0 {
+	case d < 0:
 		return fmt.Errorf("%s is negative", d)
+	case d < MinCheckpointEvery:
+		return fmt.Errorf("%s is shorter than %s (0 turns it off)", d, MinCheckpointEvery)
 	}
 	return CheckHailParkAfter(d)
 }

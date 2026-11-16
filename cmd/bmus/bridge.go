@@ -83,7 +83,7 @@ A graceful shutdown can take about a minute; a second signal kills it at once.`,
 	fl.DurationVar(&f.hailParkAfter, "hail-park-after", 0,
 		"how long an sdk beam holds a hail before it parks the session, at most "+bridge.MaxHailParkAfter.String()+" (default: unset, serve's 15m)")
 	fl.DurationVar(&f.checkpointEvery, "checkpoint-every", 0,
-		"how long an sdk beam works before it checkpoints, when the work changed; 0 turns it off, at most "+bridge.MaxHailParkAfter.String()+" (default: unset, serve's 15m)")
+		"how long an sdk beam works before it checkpoints, when the work changed; 0 turns it off, else at least 1m and at most "+bridge.MaxHailParkAfter.String()+" (default: unset, serve's 15m)")
 	fl.IntVar(&f.checkpointTurns, "checkpoint-turns", 0,
 		"how many main-loop turns an sdk beam takes before it checkpoints, when the work changed; 0 turns it off (default: unset, serve's 10)")
 	fl.Int64Var(&f.maxBundleBytes, "max-bundle-bytes", bridge.DefaultMaxBundleBytes,

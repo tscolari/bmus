@@ -329,30 +329,72 @@ func wipRef(orderID string) string { return "refs/bmus/wip/" + orderID }
 // bundle needs its commit. Jettison removes it with bmus/<order>.
 func checkpointRef(orderID string) string { return "refs/bmus/checkpoints/" + orderID }
 
-// fetchWipLocked fetches bundle's refs/bmus/wip/<order>, if it carries
-// one, into the clone of repo name as the same ref, after the object
-// check, and returns its commit ("" when the bundle has none). The caller
-// holds the repo's lock.
+// keptWipRef is where a WIP the beam couldn't restore travels (#145):
+// refs/bmus/kept-wip/<order>.
+func keptWipRef(orderID string) string { return "refs/bmus/kept-wip/" + orderID }
+
+// wipBundleOf is the WIP bundle beside a checkpoint's bundle in the cargo
+// bay (#145): <name>.wip.bundle next to <name>.bundle.
+func wipBundleOf(bundle string) string {
+	return strings.TrimSuffix(bundle, ".bundle") + ".wip.bundle"
+}
+
+// fetchWipLocked fetches the WIP refs (refs/bmus/wip/<order> and
+// refs/bmus/kept-wip/<order>) of the checkpoint whose bundle is bundle
+// from its WIP bundle (wipBundleOf), when it has one, into the clone of
+// repo name under the same names, after the object check, and returns
+// the WIP commit ("" when there is none). The WIP bundle's prerequisite is
+// the checkpoint's own commit: when the clone lacks it (a checkpoint that
+// wasn't shipped), the checkpoint's bundle is fetched first, into a
+// scratch ref deleted afterwards. The caller holds the repo's lock.
 func (d *Daemon) fetchWipLocked(ctx context.Context, name, orderID, bundle string) (string, error) {
+	wipBundle := wipBundleOf(bundle)
+	if _, err := os.Stat(wipBundle); err != nil {
+		return "", nil
+	}
 	dir := d.repoDir(name)
-	ref := wipRef(orderID)
-	heads, err := runGit(ctx, dir, "bundle", "list-heads", bundle, ref)
+	branch := "refs/heads/" + orderBranch(orderID)
+	heads, err := runGit(ctx, dir, "bundle", "list-heads", bundle, branch)
 	if err != nil {
 		return "", classifyBundleErr(err)
 	}
-	commit, _, _ := strings.Cut(heads, " ")
-	if commit == "" {
-		return "", nil
-	}
-	if err := verifyBundleObjects(ctx, dir, bundle); err != nil {
-		return "", err
-	}
+	tip, _, _ := strings.Cut(heads, " ")
 	fctx, cancel := context.WithTimeout(ctx, gitFetchTimeout)
 	defer cancel()
-	if _, err := runGit(fctx, dir, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", bundle, "+"+ref+":"+ref); err != nil {
-		return "", classifyBundleErr(err)
+	if _, err := runGit(ctx, dir, "cat-file", "-e", tip+"^{commit}"); err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if err := verifyBundleObjects(ctx, dir, bundle); err != nil {
+			return "", err
+		}
+		scratch := "refs/bmus/scratch/" + orderID
+		if _, err := runGit(fctx, dir, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", bundle, "+"+branch+":"+scratch); err != nil {
+			return "", classifyBundleErr(err)
+		}
+		defer runGit(context.WithoutCancel(ctx), dir, "update-ref", "-d", scratch) //nolint:errcheck // unreferenced objects stay harmless
 	}
-	return commit, nil
+	if err := verifyBundleObjects(ctx, dir, wipBundle); err != nil {
+		return "", err
+	}
+	var wip string
+	for _, ref := range []string{wipRef(orderID), keptWipRef(orderID)} {
+		heads, err := runGit(ctx, dir, "bundle", "list-heads", wipBundle, ref)
+		if err != nil {
+			return "", classifyBundleErr(err)
+		}
+		commit, _, _ := strings.Cut(heads, " ")
+		if commit == "" {
+			continue
+		}
+		if _, err := runGit(fctx, dir, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", wipBundle, "+"+ref+":"+ref); err != nil {
+			return "", classifyBundleErr(err)
+		}
+		if ref == wipRef(orderID) {
+			wip = commit
+		}
+	}
+	return wip, nil
 }
 
 // verifyBundleObjects checks every object bundle's pack would add to

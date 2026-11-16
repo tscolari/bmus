@@ -82,6 +82,7 @@ func TestBridgeRunRefusesBadCheckpointCadence(t *testing.T) {
 	for flag, want := range map[string]string{
 		"--checkpoint-every=600h": "--checkpoint-every: 600h0m0s is over the cap of 596h31m23.647s",
 		"--checkpoint-every=-1m":  "--checkpoint-every: -1m0s is negative",
+		"--checkpoint-every=10s":  "--checkpoint-every: 10s is shorter than 1m0s (0 turns it off)",
 		"--checkpoint-turns=-3":   "--checkpoint-turns: -3 is negative",
 	} {
 		t.Run(flag, func(t *testing.T) {

@@ -516,10 +516,10 @@ func (d *Daemon) bundleRepo(ctx context.Context, name, url, orderID, baseRef, ou
 // commit and the checkpoint shipped from, nil for base_ref. A checkpoint
 // without a bundle for name is skipped.
 //
-// The bundle also carries refs/bmus/wip/<order> (#145): the work in
-// progress of the checkpoint shipped from, or, when that isn't the
-// newest, the newest checkpoint's when its objects are in the cargo bay
-// and pass the object check. The ref lives in the clone only while the
+// The bundle also carries refs/bmus/wip/<order> and
+// refs/bmus/kept-wip/<order> (#145), from the WIP bundle of the checkpoint
+// shipped from, or, when that isn't the newest, of the newest checkpoint
+// when its objects are in the cargo bay and pass the object check. The ref lives in the clone only while the
 // bundle is written: bmus/<order> never takes it, so neither do the report
 // and the push.
 //
@@ -555,11 +555,17 @@ func (d *Daemon) bundleRepoFrom(ctx context.Context, in MissionInput, name, url,
 	branch := "refs/heads/" + orderBranch(in.OrderID)
 	// The work in progress goes along on its own ref (#145), set only for
 	// the bundle below: an earlier ship's is never sent again.
-	wip := wipRef(in.OrderID)
-	if _, err := runGit(ctx, dir, "update-ref", "-d", wip); err != nil {
-		return "", nil, err
+	wips := []string{wipRef(in.OrderID), keptWipRef(in.OrderID)}
+	for _, ref := range wips {
+		if _, err := runGit(ctx, dir, "update-ref", "-d", ref); err != nil {
+			return "", nil, err
+		}
 	}
-	defer runGit(context.WithoutCancel(ctx), dir, "update-ref", "-d", wip) //nolint:errcheck // best effort: the next ship deletes it first
+	defer func() {
+		for _, ref := range wips {
+			runGit(context.WithoutCancel(ctx), dir, "update-ref", "-d", ref) //nolint:errcheck // best effort: the next ship deletes it first
+		}
+	}()
 
 	var (
 		commit string
@@ -651,10 +657,12 @@ func (d *Daemon) bundleRepoFrom(ctx context.Context, in MissionInput, name, url,
 		}
 	}
 	refs := []string{branch}
-	if _, err := runGit(ctx, dir, "rev-parse", "--verify", "--quiet", "--end-of-options", wip+"^{commit}"); err == nil {
-		refs = append(refs, wip)
-	} else if ctx.Err() != nil {
-		return "", nil, ctx.Err()
+	for _, ref := range wips {
+		if _, err := runGit(ctx, dir, "rev-parse", "--verify", "--quiet", "--end-of-options", ref+"^{commit}"); err == nil {
+			refs = append(refs, ref)
+		} else if ctx.Err() != nil {
+			return "", nil, ctx.Err()
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(out), 0o700); err != nil {
 		return "", nil, err

@@ -511,6 +511,9 @@ function warn(msg: string): void {
 
 const UNIT_MS = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 } as const;
 
+/** The shortest --checkpoint-every but 0 (#145): a checkpoint costs a snapshot, bundles and a pull. */
+export const MIN_CHECKPOINT_EVERY_MS = 60_000;
+
 /** The longest delay setTimeout takes (2^31-1 ms, about 596h). */
 const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 
@@ -532,7 +535,8 @@ export function parseDuration(text: string): number {
  * --script and --step-log are holodeck's (see harness/holodeck.ts); --script
  * is required with it. --claude-path, --hail-park-after (default 15m, see
  * parseDuration), --checkpoint-every and --checkpoint-turns (the checkpoint
- * cadence, #145: default 15m and 10 turns, 0 turns either off) and --check-model (the startup check's model, the SDK's
+ * cadence, #145: default 15m and 10 turns, 0 turns either off; the
+ * interval is at least 1m) and --check-model (the startup check's model, the SDK's
  * default when unset; #172) are sdk's (see harness/sdk.ts). --role
  * command is passed by the bridge for Command's crew members, whatever their
  * harness; only sdk uses it (split_order, #155).
@@ -600,6 +604,9 @@ export async function main(argv: string[]): Promise<void> {
   const checkpointEveryMs = every === undefined ? undefined : every === "0" ? 0 : parseDuration(every);
   if (checkpointEveryMs !== undefined && !(checkpointEveryMs >= 0)) {
     throw new Error(`--checkpoint-every ${every} is not a duration (e.g. 15m, 1h; 0 turns it off)`);
+  }
+  if (checkpointEveryMs !== undefined && checkpointEveryMs > 0 && checkpointEveryMs < MIN_CHECKPOINT_EVERY_MS) {
+    throw new Error(`--checkpoint-every ${every} is too short (at least 1m; 0 turns it off)`);
   }
   if (checkpointEveryMs !== undefined && checkpointEveryMs > MAX_TIMEOUT_MS) throw new Error(`--checkpoint-every ${every} is too long (at most 596h)`);
   const turns = values["checkpoint-turns"];

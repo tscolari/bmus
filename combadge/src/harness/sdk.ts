@@ -249,7 +249,7 @@ import {
   type UsageBody,
   USAGE_EVERY_TURNS,
 } from "../protocol.js";
-import { abortable, Budget, BudgetExceeded, bundleCheckpoint, checkpointFiles, escalate, orderDir, Stopped, workKey, type StopCommand } from "./common.js";
+import { abortable, Budget, BudgetExceeded, bundleCheckpoint, checkpointFiles, escalate, orderDir, Stopped, withNotes, workKey, type StopCommand } from "./common.js";
 import { git, wipRef, type RepoCheckout } from "../repos.js";
 import type { Emit, Harness, HarnessOptions, HarnessReport, Inbound, Order, Role, SelfCheck } from "./types.js";
 
@@ -266,7 +266,12 @@ export interface SdkDeps {
   consultTimeoutMs: number;
   /** How long the startup check's query may run before it is aborted (inconclusive). */
   checkTimeoutMs: number;
+  /** Tests: told when a cadence check starts ("check") and how it ended. */
+  onCadence?: (event: CadenceEvent) => void;
 }
+
+/** What SdkDeps.onCadence hears: a check started, then wrote a checkpoint, found nothing changed, or failed. */
+export type CadenceEvent = "check" | "written" | "unchanged" | "failed";
 
 /** Default SdkDeps.stopTimeoutMs; a guess, to revisit after the first real watch changes. */
 export const STOP_TIMEOUT_MS = 10 * 60_000;
@@ -411,16 +416,23 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
         const q = current;
         // The checkpoint goes first (#145): the work and the transcript
         // outlive the beam if it goes away while the hails wait.
-        void parkCheckpoint(parked).finally(() => {
+        abortParked = () => {
           if (halted) return; // a belay or a failure ended the run meanwhile
+          // A call let through while the checkpoint was written (an entry, say) finishes first.
+          if (running.size > 0) return void (abortDue = true);
+          abortParked = undefined;
           input.close();
           q.abort(new Error(`parked: ${order.id} resumes once the captain answers`));
           windDown = setTimeout(() => {
             warn(`${order.id}: the parked query hasn't ended ${Math.round(WIND_DOWN_MS / 1000)}s after its abort; resuming without it`);
             abandon();
           }, WIND_DOWN_MS);
-        });
+        };
+        void parkCheckpoint(parked).finally(() => abortParked?.());
       };
+      /** The parked query's abort, set from the park until it runs; abortDue: a running call holds it off. */
+      let abortParked: (() => void) | undefined;
+      let abortDue = false;
       /**
        * The park's checkpoint (#145): the bundle, the transcript and a note
        * naming the held hails, emitted with their refs in `held`, so the
@@ -477,10 +489,13 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
       const cadenceCheck = async () => {
         if (!cadenceOn || cadenceBusy || halted || park || state.stop || input.closed) return armCadence();
         cadenceBusy = true;
+        let outcome: CadenceEvent = "failed";
+        deps.onCadence?.("check");
         try {
           await baseline;
           const key = await workKey(order);
           if (key === state.key || halted || park || state.stop) {
+            outcome = "unchanged";
             turnsAt = tally.turns;
             return armCadence();
           }
@@ -489,12 +504,14 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
             writeCheckpoint(dir, order, transcriptOf(state, order.repos[0]!.dir), note, { missingTranscript: "empty", since }),
           );
           checkpointReady(body, true);
+          outcome = "written";
         } catch (err) {
           warn(`${order.id}: a cadence checkpoint failed: ${err instanceof Error ? err.message : String(err)}`);
           turnsAt = tally.turns;
           armCadence();
         } finally {
           cadenceBusy = false;
+          deps.onCadence?.(outcome);
         }
       };
       /**
@@ -503,9 +520,15 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
        * record the call's result; parkRun checks everything again then.
        */
       const finished: HookCallback = (hookInput) => {
-        if ("tool_use_id" in hookInput && running.delete(hookInput.tool_use_id) && due && running.size === 0) {
-          clearTimeout(grace);
-          grace = setTimeout(parkRun, RESULT_GRACE_MS);
+        if ("tool_use_id" in hookInput && running.delete(hookInput.tool_use_id) && running.size === 0) {
+          if (due) {
+            clearTimeout(grace);
+            grace = setTimeout(parkRun, RESULT_GRACE_MS);
+          } else if (abortDue) {
+            abortDue = false;
+            clearTimeout(grace);
+            grace = setTimeout(() => abortParked?.(), RESULT_GRACE_MS);
+          }
         }
         return Promise.resolve({});
       };
@@ -1647,10 +1670,10 @@ export async function writeCheckpoint(
   const files = checkpointFiles(dir);
   fs.mkdirSync(dir, { recursive: true });
   try {
-    const { repos, key } = await bundleCheckpoint(dir, order, opts.since);
+    const { repos, key, notes } = await bundleCheckpoint(dir, order, opts.since);
     if (found) fs.copyFileSync(transcript, files.transcript_path);
     else fs.writeFileSync(files.transcript_path, "");
-    fs.writeFileSync(files.handover_path, note.endsWith("\n") ? note : note + "\n");
+    fs.writeFileSync(files.handover_path, withNotes(note, notes).trimEnd() + "\n");
     return { body: { repos, ...files }, key };
   } catch (err) {
     fs.rmSync(dir, { recursive: true, force: true });

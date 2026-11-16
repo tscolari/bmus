@@ -202,6 +202,13 @@ export interface WorkRepo {
    * incremental one doesn't verify. Absent when bundle_path is the full one.
    */
   full_bundle_path?: string;
+  /**
+   * A checkpoint's WIP bundle (#145): `refs/bmus/wip/<order>` and
+   * `refs/bmus/kept-wip/<order>`, those that exist, minus `branch` at
+   * `commit`. A file of its own, so the commits land even when the WIP
+   * can't. Absent when there is no WIP.
+   */
+  wip_bundle_path?: string;
 }
 
 export interface Usage {

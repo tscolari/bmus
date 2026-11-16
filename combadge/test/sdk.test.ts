@@ -11,7 +11,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, beforeEach, describe, expect, inject, it, vi } from "vitest";
 import { BudgetExceeded, Stopped } from "../src/harness/common.js";
-import { checkFailReason, classifyGitPush, gitPushPolicy, GRANT_TTL_MS, RESULT_GRACE_MS, sdkHarness, WIND_DOWN_MS, type PushKind, type QueryFn } from "../src/harness/sdk.js";
+import { type CadenceEvent, checkFailReason, classifyGitPush, gitPushPolicy, GRANT_TTL_MS, RESULT_GRACE_MS, sdkHarness, WIND_DOWN_MS, type PushKind, type QueryFn } from "../src/harness/sdk.js";
 import type { HarnessReport, Inbound, Outbound, Role } from "../src/harness/types.js";
 import { onLines } from "../src/lines.js";
 import type { AnswerBody, BeamToBridgeMessage, ConsultBody, OrderBody, UsageBody } from "../src/protocol.js";
@@ -287,6 +287,7 @@ function start(
     /** The checkpoint cadence (#145); both triggers are off unless given. */
     checkpointEveryMs?: number;
     checkpointTurns?: number;
+    onCadence?: (e: CadenceEvent) => void;
   },
 ) {
   const emitted: Outbound[] = [];
@@ -311,7 +312,12 @@ function start(
       checkpointEveryMs: opts.checkpointEveryMs ?? 0,
       checkpointTurns: opts.checkpointTurns ?? 0,
     },
-    { query, ...(opts.env && { env: opts.env }), ...(opts.stopTimeoutMs !== undefined && { stopTimeoutMs: opts.stopTimeoutMs }) },
+    {
+      query,
+      ...(opts.env && { env: opts.env }),
+      ...(opts.stopTimeoutMs !== undefined && { stopTimeoutMs: opts.stopTimeoutMs }),
+      ...(opts.onCadence && { onCadence: opts.onCadence }),
+    },
   );
   const repos = opts.repos ?? (opts.repo === undefined ? [] : [{ name: "app", dir: opts.repo, base_ref: "main", base_commit: "main" }]);
   const result = harness.run(
@@ -2909,6 +2915,8 @@ describe("serve --harness sdk", () => {
     expect(turns.stderr).toContain("--checkpoint-turns is only for --harness sdk");
     const often = await serveFails(dir, undefined, ["--harness", "sdk", "--checkpoint-every", "often"]);
     expect(often.stderr).toContain("--checkpoint-every often is not a duration (e.g. 15m, 1h; 0 turns it off)");
+    const short = await serveFails(dir, undefined, ["--harness", "sdk", "--checkpoint-every", "30s"]);
+    expect(short.stderr).toContain("--checkpoint-every 30s is too short (at least 1m; 0 turns it off)");
     const longEvery = await serveFails(dir, undefined, ["--harness", "sdk", "--checkpoint-every", "597h"]);
     expect(longEvery.stderr).toContain("--checkpoint-every 597h is too long (at most 596h)");
     for (const bad of ["ten", "1.5", "1e3"]) {
@@ -3040,10 +3048,8 @@ describe("sdk harness automatic checkpoints (#145)", () => {
     expect(note).toContain("the session parked on 1 hail(s)");
     expect(note).toContain("- Run `make deploy`?");
     expect(fs.existsSync(cp.body.transcript_path)).toBe(true);
-    const bundle = cp.body.repos[0]!.bundle_path;
-    const heads = sh(repo, "bundle", "list-heads", bundle);
-    expect(heads).toContain(`refs/heads/bmus/${ORDER}`);
-    expect(heads).toContain(`refs/bmus/wip/${ORDER}`);
+    expect(sh(repo, "bundle", "list-heads", cp.body.repos[0]!.bundle_path)).toContain(`refs/heads/bmus/${ORDER}`);
+    expect(sh(repo, "bundle", "list-heads", cp.body.repos[0]!.wip_bundle_path!)).toContain(`refs/bmus/wip/${ORDER}`);
     const wip = sh(repo, "rev-parse", `refs/bmus/wip/${ORDER}`);
     expect(sh(repo, "rev-parse", `${wip}^`)).toBe(sh(repo, "rev-parse", `bmus/${ORDER}`));
     // The work tree as it is, staged or not, untracked included.
@@ -3056,31 +3062,48 @@ describe("sdk harness automatic checkpoints (#145)", () => {
     await run.result;
   });
 
-  /** A run whose agent takes turns as the test calls next(); each turn may first change the repo. */
+  /**
+   * A run whose agent takes a turn each time the test calls turn(), after
+   * the turn's change to the repo. events are the cadence's (SdkDeps.onCadence).
+   */
   function turns(dir: string, repo: string, opts: { checkpointTurns?: number; checkpointEveryMs?: number }) {
-    const queue: ((agent: Agent) => void)[] = [];
+    const queue: (() => void)[] = [];
+    const events: CadenceEvent[] = [];
     let wake: (() => void) | undefined;
     let done = false;
+    let waiting = false;
     let n = 0;
     const run = start(async function* (agent) {
       await agent.nextInput();
       yield init;
       for (;;) {
-        while (queue.length === 0 && !done) await new Promise<void>((r) => (wake = r));
+        while (queue.length === 0 && !done) {
+          waiting = true;
+          await new Promise<void>((r) => (wake = r));
+          waiting = false;
+        }
         if (queue.length === 0) break;
-        queue.shift()!(agent);
+        queue.shift()!();
         yield assistant(`t${++n}`, { input: 1, output: 1 });
       }
       yield success;
-    }, { dir, repo, claudePath: fakeClaude(dir), ...opts });
+    }, { dir, repo, claudePath: fakeClaude(dir), onCadence: (e) => events.push(e), ...opts });
+    const outcomes = () => events.filter((e) => e !== "check");
     return {
       run,
+      events,
       turn: (change?: () => void) => {
         queue.push(() => change?.());
         wake?.();
       },
+      /** Waits until the harness has taken k turns (the agent waits for the next one). */
       async taken(k: number) {
-        await until(() => queue.length === 0 && n >= k, `${k} turns`);
+        await until(() => queue.length === 0 && n >= k && waiting, `${k} turns`);
+      },
+      /** Waits for the cadence's kth outcome (1-based) and returns it. */
+      async outcome(k: number): Promise<CadenceEvent> {
+        await until(() => outcomes().length >= k, `cadence outcome ${k}`);
+        return outcomes()[k - 1]!;
       },
       end: async () => {
         done = true;
@@ -3096,25 +3119,23 @@ describe("sdk harness automatic checkpoints (#145)", () => {
     const t = turns(dir, repo, { checkpointTurns: 3 });
     for (let i = 0; i < 3; i++) t.turn();
     await t.taken(3);
-    await sleepReal(200); // a check that found nothing changed writes nothing
-    expect(checkpoints(t.run)).toHaveLength(0);
+    expect(await t.outcome(1)).toBe("unchanged");
     t.turn(() => fs.writeFileSync(path.join(repo, "wip.txt"), "wip\n"));
     t.turn();
     await t.taken(5);
-    await sleepReal(100);
-    expect(checkpoints(t.run)).toHaveLength(0); // 2 turns since the last check
+    expect(t.events).toEqual(["check", "unchanged"]); // 2 turns since the last check
     t.turn();
     await t.taken(6);
-    await until(() => checkpoints(t.run).length === 1, "the cadence checkpoint");
+    expect(await t.outcome(2)).toBe("written");
     const cp = checkpoints(t.run)[0]!;
     if (cp.type !== "checkpoint_ready") throw new Error("unreachable");
     expect(cp.body.held).toBeUndefined();
     expect(fs.readFileSync(cp.body.handover_path, "utf8")).toContain("a cadence checkpoint the harness wrote while the agent worked (every 3 turns");
-    expect(sh(repo, "bundle", "list-heads", cp.body.repos[0]!.bundle_path)).toContain(`refs/bmus/wip/${ORDER}`);
+    expect(sh(repo, "bundle", "list-heads", cp.body.repos[0]!.wip_bundle_path!)).toContain(`refs/bmus/wip/${ORDER}`);
     // Nothing changed since: three more turns write nothing.
     for (let i = 0; i < 3; i++) t.turn();
     await t.taken(9);
-    await sleepReal(200);
+    expect(await t.outcome(3)).toBe("unchanged");
     expect(checkpoints(t.run)).toHaveLength(1);
     // A commit is a change too.
     t.turn(() => {
@@ -3124,13 +3145,14 @@ describe("sdk harness automatic checkpoints (#145)", () => {
     t.turn();
     t.turn();
     await t.taken(12);
-    await until(() => checkpoints(t.run).length === 2, "the second cadence checkpoint");
+    expect(await t.outcome(4)).toBe("written");
     const second = checkpoints(t.run)[1]!;
     if (second.type !== "checkpoint_ready") throw new Error("unreachable");
-    // From the first one's commit, with the full bundle beside it.
+    // From the first one's commit, with the full bundle beside it; nothing uncommitted is left.
     expect(second.body.repos[0]!.full_bundle_path).toMatch(/app\.full\.bundle$/);
-    expect(sh(repo, "bundle", "list-heads", second.body.repos[0]!.bundle_path)).not.toContain(`refs/bmus/wip/${ORDER}`);
+    expect(second.body.repos[0]!.wip_bundle_path).toBeUndefined();
     await t.end();
+    expect(t.events.filter((e) => e === "check")).toHaveLength(4);
   });
 
   it("fires on its interval only when something changed", async () => {
@@ -3141,18 +3163,16 @@ describe("sdk harness automatic checkpoints (#145)", () => {
     const t = turns(dir, repo, { checkpointEveryMs: EVERY });
     t.turn();
     await t.taken(1);
-    await sleepReal(50);
     await vi.advanceTimersByTimeAsync(EVERY);
-    await sleepReal(200);
-    expect(checkpoints(t.run)).toHaveLength(0);
+    expect(await t.outcome(1)).toBe("unchanged");
     fs.writeFileSync(path.join(repo, "wip.txt"), "wip\n");
     await vi.advanceTimersByTimeAsync(EVERY - 1);
-    await sleepReal(100);
-    expect(checkpoints(t.run)).toHaveLength(0);
+    expect(t.events).toEqual(["check", "unchanged"]);
     await vi.advanceTimersByTimeAsync(1);
-    await until(() => checkpoints(t.run).length === 1, "the cadence checkpoint");
+    expect(await t.outcome(2)).toBe("written");
+    expect(checkpoints(t.run)).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(EVERY);
-    await sleepReal(200);
+    expect(await t.outcome(3)).toBe("unchanged");
     expect(checkpoints(t.run)).toHaveLength(1);
     await t.end();
   });
@@ -3165,8 +3185,8 @@ describe("sdk harness automatic checkpoints (#145)", () => {
     for (let i = 0; i < 12; i++) t.turn(() => fs.appendFileSync(path.join(repo, "wip.txt"), `${i}\n`));
     await t.taken(12);
     await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
-    await sleepReal(200);
-    expect(checkpoints(t.run)).toHaveLength(0);
     await t.end();
+    expect(t.events).toEqual([]);
+    expect(checkpoints(t.run)).toHaveLength(0);
   });
 });
