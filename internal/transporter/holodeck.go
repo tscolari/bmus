@@ -568,6 +568,27 @@ func (h *Holodeck) Kill(alias string) error {
 	return nil
 }
 
+// Pause stops (SIGSTOP) or, with paused false, continues (SIGCONT) the
+// serve process of the beam with alias and its process group, so a test
+// can hold a beam's answer to a command back. Like Kill, only the
+// holodeck test harness calls it.
+func (h *Holodeck) Pause(alias string, paused bool) error {
+	dir, err := h.dir(Beam{Alias: alias})
+	if err != nil {
+		return err
+	}
+	pid, err := readPID(filepath.Join(dir, holodeckPID))
+	if err != nil {
+		return fmt.Errorf("holodeck: pause %s: %w", alias, err)
+	}
+	sig := syscall.SIGCONT
+	if paused {
+		sig = syscall.SIGSTOP
+	}
+	killGroup(pid, sig)
+	return nil
+}
+
 // killGroup sends sig to pid's process group (serve leads its own) and to
 // pid itself, ignoring processes already gone.
 func killGroup(pid int, sig syscall.Signal) {

@@ -629,6 +629,62 @@ func TestCarriedAnswerUntilNewRunCheckpoints(t *testing.T) {
 	require.Contains(t, later[0]["handover"], answeredLine)
 }
 
+// #174 (a #145 fix): an answer to a carried hail taken while the resumed
+// run's recall is under way came after that run's order went out, so the
+// recall's checkpoint doesn't hold it: the next send still carries it. The
+// beam is paused so the answer reaches the mission before that checkpoint.
+func TestCarriedAnswerDuringStopReachesNextSend(t *testing.T) {
+	t.Parallel()
+	script := filepath.Join(t.TempDir(), "stop.json")
+	require.NoError(t, os.WriteFile(script, []byte(`[{"at_pct": 10, "commit": "a change"},
+		{"at_pct": 20, "hail": {"category": "clarifying_question", "question": "Which way?", "options": ["left", "right"]}, "park_after_ms": 200},
+		{"at_pct": 30, "hail": {"category": "clarifying_question", "question": "How far?", "options": ["near", "far"]}},
+		{"at_pct": 100, "report": {"summary": "done after the recall"}}]`), 0o600))
+	b, hd, id := parkedWithCarried(t, script, "ops")
+	mission := missionWorkflowID(id)
+	// Run 2 is sent with no answer, and waits on its own hail.
+	requireOutcome(t, OutcomeRequested)(hd.d.ReenergizeCrew(t.Context(), "sorell"))
+	hd.waitHail(t, "H-0002")
+	beam := hd.crew(t, "sorell").CurrentBeam
+	require.NoError(t, b.h.Pause(beam, true))
+	paused := true
+	defer func() {
+		if paused {
+			_ = b.h.Pause(beam, false)
+		}
+	}()
+	require.NoError(t, hd.d.RecallOrder(t.Context(), id, "reassign"))
+	require.NoError(t, hd.d.AnswerHail(t.Context(), "H-0001", "left", nil))
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		require.Equal(ct, 1, countSteps(t, hd.d, mission, "carried-answer"))
+	}, 30*time.Second, 20*time.Millisecond)
+	require.Zero(t, countSteps(t, hd.d, mission, "send-correction"))
+	require.NoError(t, b.h.Pause(beam, false))
+	paused = false
+	// The recall's checkpoint is pulled and the order goes back to the pool.
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		cps, err := hd.d.store.ListCheckpoints(t.Context(), id)
+		require.NoError(ct, err)
+		require.Len(ct, cps, 2)
+		require.Equal(ct, store.OrderPool, hd.order(ct, id).State)
+	}, 30*time.Second, 20*time.Millisecond)
+	before := len(resumedSteps(t, b.stepLog, id))
+	require.NoError(t, hd.d.SetStandingOrders(t.Context(), true))
+	var raised string
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		h, found, err := hd.d.store.OpenHailForOrder(t.Context(), id)
+		require.NoError(ct, err)
+		require.True(ct, found)
+		require.NotEqual(ct, "H-0002", h.ID)
+		raised = h.ID
+	}, 60*time.Second, 20*time.Millisecond)
+	require.NoError(t, hd.d.AnswerHail(t.Context(), raised, "near", nil))
+	require.Equal(t, MissionDone, missionResult(t, hd.d, id).Status)
+	later := resumedSteps(t, b.stepLog, id)[before:]
+	require.NotEmpty(t, later)
+	require.Contains(t, later[0]["handover"], answeredLine)
+}
+
 // #145 (item 6): two hails held by one park checkpoint, the second queued
 // behind the first, are both carried when the beam is lost.
 func TestBeamLossCarriesQueuedHeldHail(t *testing.T) {

@@ -479,6 +479,10 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections, carrie
 		// carried are answers to carried hails that came while the order
 		// had no run, for the resumed run's order (#145).
 		carried []carriedAnswer
+		// sent is how many of carried the latest send-order shipped: a
+		// pulled checkpoint of that run holds those, and only those
+		// (#174). An answer taken while its stop was under way came after.
+		sent int
 	)
 	// park parks the mission. A non-nil result is the mission's end: the
 	// backstop had failed the order. lost: the beam went away, so the
@@ -612,7 +616,7 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections, carrie
 				if id != orderNotSent {
 					// carried stays until the new run's first checkpoint is
 					// pulled: a beam lost before it sends them again.
-					onBeam, beam = true, ship.Beam
+					onBeam, beam, sent = true, ship.Beam, len(carried)
 					if err := deliverHeld(ctx, cur, held); err != nil {
 						return MissionResult{}, cur.CrewID, err
 					}
@@ -1060,8 +1064,10 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections, carrie
 			if err == nil {
 				heldRefs = body.Held
 				// The new run's checkpoint holds its note and its state:
-				// the carried answers have reached it (#145).
-				carried = nil
+				// the carried answers it was sent have reached it (#145).
+				// Those taken since (while its stop was under way) go
+				// with the next send (#174).
+				carried, sent = carried[sent:], 0
 				if len(pulled.WipSkipped) > 0 {
 					if err := storeStep(ctx, "log-wip-skipped", func(c context.Context, d *Daemon) error {
 						for _, w := range pulled.WipSkipped {
