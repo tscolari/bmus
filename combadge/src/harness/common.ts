@@ -176,8 +176,11 @@ const bytes = (s: string) => Buffer.byteLength(s, "utf8");
  * agent's note is cut from its end to CHAIN_MAX_BYTES, ending "[...]", and
  * a cut line gives the bytes cut; the answers are never cut.
  * A later run gets only the note of the checkpoint it resumes from.
+ * Marker lines in own (a hail question in a park note, say) are
+ * neutralised as in an agent's note, so they can't be read as the block.
  */
 export function chainNote(own: string, started: string | undefined, agent: string | undefined): string {
+  own = agentNoteOf(own);
   const thisRun = agent !== undefined && agent.trim() !== "";
   const from = chainedFrom(started);
   const note = thisRun ? agent.trim() : from.agent;
