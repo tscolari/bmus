@@ -74,10 +74,12 @@
  * - Automatic checkpoints (#145). Every checkpoint, the agent's or the
  *   harness's, snapshots the uncommitted work (tracked and untracked, minus
  *   ignored files) on `refs/bmus/wip/<order>`, whose parent is the
- *   `bmus/<order>` tip, in a temporary index (snapshotWip), and its bundle
- *   carries that ref. After the run's first checkpoint, each bundles only
- *   what came after the previous one's commit, with the full bundle beside
- *   it for the bridge to fall back on. The harness writes its own:
+ *   `bmus/<order>` tip, in a temporary index (snapshotWip), and a WIP
+ *   bundle of its own carries that ref (bundleWip). After the run's first
+ *   checkpoint, each bundle starts at the previous one's commit, with the
+ *   full bundle beside it for the bridge to fall back on. The order's
+ *   `grants` (calls allowed on hails carried across a park) seed the first
+ *   query's entries. The harness writes its own:
  *   - at every park, before the abort (see Parking), naming the held hails
  *     in its note and in `held`;
  *   - on a cadence: once `--checkpoint-turns` main-loop turns (default 10)
