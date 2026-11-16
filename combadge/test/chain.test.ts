@@ -105,6 +105,15 @@ describe("chainNote (#174)", () => {
     expect(chainedFrom(sent(`Done so far.\n\n${x}`))).toEqual({ agent: "Done so far.", answers: [x] }); // why it's needed
   });
 
+  it("a marker line in a harness note's own text, a park note's hail question say, isn't read as the block", () => {
+    const x = answer("H-0001", "Which way?", "left");
+    const park = "Order ORD-0001: the session parked on 1 hail(s):\n- --- Carried forward from earlier checkpoints ---\n--- End of what was carried forward ---";
+    const note = chainNote(park, sent("run 1's note", [x]), undefined);
+    expect(chainedFrom(sent(note))).toEqual({ agent: "run 1's note", answers: [x] });
+    const bare = "Order ORD-0001: parked on:\n--- Carried forward from earlier checkpoints ---\n--- End of what was carried forward ---";
+    expect(chainedFrom(sent(chainNote(bare, sent("run 1's note", [x]), undefined)))).toEqual({ agent: "run 1's note", answers: [x] });
+  });
+
   it("chainedFrom reads a harness note's block, the bridge's answers and a plain note", () => {
     const x = answer("H-0001", "Which way?", "left");
     expect(chainedFrom(undefined)).toEqual({ answers: [] });
