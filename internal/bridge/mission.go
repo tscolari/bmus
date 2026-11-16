@@ -790,10 +790,12 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections, carrie
 			var body comms.AnswerBody
 			if err := json.Unmarshal(msg.Body, &body); err == nil {
 				if _, ok := carriedOpen.take(body.HailID); ok {
-					if parked || !onBeam {
-						// No run has the order (parked, recalled, or the
-						// resume's send-order found the tour ended): the
-						// next send carries it.
+					if parked || !onBeam || parking || recalling {
+						// No run will take it (parked, recalled, the
+						// resume's send-order found the tour ended, or a
+						// stand_down or recall is stopping the run, whose
+						// harness drops corrections): the next send
+						// carries it.
 						a, err := takeCarriedAnswer(ctx, cur, body)
 						if err != nil {
 							return MissionResult{}, cur.CrewID, err
