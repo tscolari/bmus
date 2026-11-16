@@ -455,11 +455,19 @@ func (b ReportBody) MarshalJSON() ([]byte, error) {
 // Decoding a verdict never fails, so a bad one leaves the rest of its
 // report readable: a verdict that isn't an object, has no findings list or
 // holds findings of the wrong shape decodes with no findings, and Check
-// returns why.
+// returns why. Such a verdict encodes back to the bytes it was decoded
+// from, so a round trip through JSON (a DBOS step's output, say) keeps the
+// error instead of turning it into a pass.
+//
+// Keys match exactly: a verdict's "Findings" or a finding's "SEVERITY" is
+// an unknown key, ignored like any other, and never stands in for the
+// lowercase one.
 type Verdict struct {
 	Findings []VerdictFinding `json:"findings"`
-	// invalid is why the verdict as received didn't decode.
+	// invalid is why the verdict as received didn't decode, and raw what
+	// was received then.
 	invalid error
+	raw     json.RawMessage
 }
 
 // VerdictFinding is one finding of a verdict. Path and Line are optional:
@@ -496,6 +504,9 @@ const (
 
 // MarshalJSON writes a nil Findings as [], which the schema requires.
 func (v Verdict) MarshalJSON() ([]byte, error) {
+	if v.invalid != nil {
+		return v.raw, nil
+	}
 	type plain Verdict
 	if v.Findings == nil {
 		v.Findings = []VerdictFinding{}
@@ -505,23 +516,46 @@ func (v Verdict) MarshalJSON() ([]byte, error) {
 
 // UnmarshalJSON decodes a verdict, keeping any error for Check.
 func (v *Verdict) UnmarshalJSON(data []byte) error {
-	*v = Verdict{}
-	var raw struct {
-		Findings json.RawMessage `json:"findings"`
-	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		v.invalid = errors.New("the verdict is not an object")
+	findings, err := decodeVerdict(data)
+	if err != nil {
+		*v = Verdict{invalid: err, raw: append(json.RawMessage(nil), data...)}
 		return nil
 	}
-	if f := bytes.TrimSpace(raw.Findings); len(f) == 0 || bytes.Equal(f, []byte("null")) {
-		v.invalid = errors.New("the verdict has no findings list (an empty list is a pass)")
-		return nil
-	}
-	if err := json.Unmarshal(raw.Findings, &v.Findings); err != nil {
-		v.Findings = nil
-		v.invalid = fmt.Errorf("the verdict's findings don't decode: %w", err)
-	}
+	*v = Verdict{Findings: findings}
 	return nil
+}
+
+// decodeVerdict reads a verdict's findings with exact-case keys.
+func decodeVerdict(data []byte) ([]VerdictFinding, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(data, &obj); err != nil || obj == nil {
+		return nil, errors.New("the verdict is not an object")
+	}
+	list := bytes.TrimSpace(obj["findings"])
+	if len(list) == 0 || bytes.Equal(list, []byte("null")) {
+		return nil, errors.New("the verdict has no findings list (an empty list is a pass)")
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(list, &items); err != nil {
+		return nil, fmt.Errorf("the verdict's findings don't decode: %w", err)
+	}
+	findings := make([]VerdictFinding, 0, len(items))
+	for i, item := range items {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(item, &fields); err != nil || fields == nil {
+			return nil, fmt.Errorf("the verdict's findings don't decode: finding %d is not an object", i+1)
+		}
+		var f VerdictFinding
+		for key, dst := range map[string]any{"severity": &f.Severity, "title": &f.Title, "body": &f.Body, "path": &f.Path, "line": &f.Line} {
+			if raw, ok := fields[key]; ok {
+				if err := json.Unmarshal(raw, dst); err != nil {
+					return nil, fmt.Errorf("the verdict's findings don't decode: finding %d's %s: %w", i+1, key, err)
+				}
+			}
+		}
+		findings = append(findings, f)
+	}
+	return findings, nil
 }
 
 // Check returns an error naming the first finding and field outside the

@@ -673,6 +673,13 @@ func TestSchemaVerdict(t *testing.T) {
 			err = verdict.Check()
 			if !checkOK {
 				require.Error(t, err)
+				// A refused verdict stays refused through a JSON round
+				// trip, as a DBOS step's output takes one.
+				again, err := json.Marshal(verdict)
+				require.NoError(t, err)
+				var back Verdict
+				require.NoError(t, json.Unmarshal(again, &back))
+				require.Error(t, back.Check(), string(again))
 				return
 			}
 			require.NoError(t, err)
@@ -703,6 +710,52 @@ func TestVerdictDecodeKeepsReport(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(`{"summary": "s", "repos": [], "usage": {"input_tokens": 1, "output_tokens": 2}, "verdict": null}`), &r))
 	require.Nil(t, r.Verdict)
 	require.NoError(t, Verdict{}.Check(), "a verdict built in Go with no findings is a pass")
+}
+
+// A verdict that didn't decode keeps its error through a JSON round trip of
+// its report, as a DBOS step's output or workflow result takes (#181).
+func TestVerdictRoundTripKeepsError(t *testing.T) {
+	t.Parallel()
+	for _, verdict := range []string{
+		`5`, `"pass"`, `[]`, `{}`, `{"findings": null}`, `{"findings": {}}`, `{"Findings": []}`,
+		`{"findings": [5]}`, `{"findings": [{"severity": "low", "title": "t", "body": "", "line": "12"}]}`,
+		`{"findings": [{"severity": "low", "title": "t", "body": "", "line": 1.5}]}`,
+	} {
+		var r ReportBody
+		require.NoError(t, json.Unmarshal([]byte(`{"summary": "s", "repos": [], "usage": {"input_tokens": 1, "output_tokens": 2}, "verdict": `+verdict+`}`), &r), verdict)
+		want := r.Verdict.Check()
+		require.Error(t, want, verdict)
+		for range 2 {
+			raw, err := json.Marshal(r)
+			require.NoError(t, err, verdict)
+			r = ReportBody{}
+			require.NoError(t, json.Unmarshal(raw, &r), verdict)
+			require.NotNil(t, r.Verdict, verdict)
+			require.Equal(t, want.Error(), r.Verdict.Check().Error(), verdict)
+		}
+	}
+}
+
+// Keys match exactly (#181): a case variant of a known key is an unknown
+// key, so it can neither stand in for the real one nor override it.
+func TestVerdictExactKeys(t *testing.T) {
+	t.Parallel()
+	high := []VerdictFinding{{Severity: SeverityHigh, Title: "t", Body: "b", Path: "a.go", Line: 3}}
+	for _, raw := range []string{
+		`{"findings": [{"severity": "high", "title": "t", "body": "b", "path": "a.go", "line": 3}], "FINDINGS": []}`,
+		`{"FINDINGS": [], "findings": [{"severity": "high", "title": "t", "body": "b", "path": "a.go", "line": 3}]}`,
+		`{"findings": [{"SEVERITY": "low", "severity": "high", "Title": "x", "title": "t", "body": "b", "Body": "", "path": "a.go", "PATH": "b.go", "line": 3, "Line": 9}]}`,
+	} {
+		var v Verdict
+		require.NoError(t, json.Unmarshal([]byte(raw), &v))
+		require.NoError(t, v.Check(), raw)
+		require.Equal(t, high, v.Findings, raw)
+	}
+	var v Verdict
+	require.NoError(t, json.Unmarshal([]byte(`{"findings": [{"SEVERITY": "high", "title": "t", "body": ""}]}`), &v))
+	require.ErrorContains(t, v.Check(), "severity")
+	require.NoError(t, json.Unmarshal([]byte(`{"Findings": []}`), &v))
+	require.ErrorContains(t, v.Check(), "no findings list")
 }
 
 // A review order (#181) carries review exactly when its kind is review, and
