@@ -120,6 +120,9 @@ type Store struct {
 	// writeSem, one slot, queues the store's own write transactions
 	// (#204).
 	writeSem chan struct{}
+
+	// taskHook is SetTaskHook's, nil for none.
+	taskHook atomic.Pointer[TaskHook]
 }
 
 // Lock waits (#204). busyTimeoutMS is the store connections'
@@ -190,7 +193,7 @@ func open(ctx context.Context, path string, busyMS int) (*Store, error) {
 	// Columns ADD COLUMN can't (or shouldn't) add to an older database:
 	// refuse it rather than have every write that needs them fail later.
 	// This runs before the schema, whose indexes may name such a column
-	// (hails_deliver_to), and checks only the tables that exist: the
+	// (hails_raise, orders_task), and checks only the tables that exist: the
 	// schema creates the others whole.
 	for _, c := range requiredColumns {
 		var cols, n int
@@ -290,6 +293,11 @@ var requiredColumns = []struct{ table, column, what string }{
 	// SQLite can't drop the NOT NULL on hails.order_id and crew_id in
 	// place. A database with deliver_to has both nullable.
 	{"hails", "deliver_to", "the bridge-raised hails (#151)"},
+	// The campaign columns: the new indexes name them, and the raise key
+	// replaces stage 2's unique index on hails (hails_raise).
+	{"orders", "kind", "the campaign orders (#180)"},
+	{"orders", "task", "the campaign orders (#180)"},
+	{"hails", "raise_key", "the campaign orders (#180)"},
 }
 
 // addColumn adds column to table unless it is already there. Two processes
@@ -543,7 +551,18 @@ type Order struct {
 	// read with the order (#120).
 	Used             UsageTotal
 	AssigneeDivision string
+	// Kind is OrderKindWork or OrderKindReview (#180); InsertOrder takes
+	// "" as work. Task is the id of the task workflow the order belongs
+	// to, "" outside a campaign.
+	Kind string
+	Task string
 }
+
+// Order kinds (orders.kind, #180). A fix order is work.
+const (
+	OrderKindWork   = "work"
+	OrderKindReview = "review"
+)
 
 // UsageTotal is an order's usage summed over its beams (#120).
 type UsageTotal struct {
@@ -568,7 +587,7 @@ const orderCols = `id, title, body, division, priority, state, assignee, parent_
 	(SELECT COALESCE(SUM(u.input_tokens), 0) FROM order_usage u WHERE u.order_id = orders.id),
 	(SELECT COALESCE(SUM(u.output_tokens), 0) FROM order_usage u WHERE u.order_id = orders.id),
 	(SELECT COALESCE(SUM(u.turns), 0) FROM order_usage u WHERE u.order_id = orders.id),
-	COALESCE((SELECT a.division FROM crew a WHERE a.id = orders.assignee), '')`
+	COALESCE((SELECT a.division FROM crew a WHERE a.id = orders.assignee), ''), kind, task`
 
 func scanOrder(row interface{ Scan(...any) error }) (Order, error) {
 	var (
@@ -579,7 +598,8 @@ func scanOrder(row interface{ Scan(...any) error }) (Order, error) {
 	)
 	err := row.Scan(&o.ID, &o.Title, &o.Body, &o.Division, &o.Priority, &o.State, &o.Assignee, &o.ParentID, &o.Branch,
 		&o.BudgetTokens, &o.BudgetTurns, &o.BudgetExtended, &o.CreatedBy, &o.Model, &o.Source, &parked, &pct, &o.ProgressNote, &o.OpenChildren,
-		&after, &waiting, &o.Used.InputTokens, &o.Used.OutputTokens, &o.Used.Turns, &o.AssigneeDivision)
+		&after, &waiting, &o.Used.InputTokens, &o.Used.OutputTokens, &o.Used.Turns, &o.AssigneeDivision,
+		&o.Kind, &o.Task)
 	o.After, o.WaitingOn = strings.Fields(after), strings.Fields(waiting)
 	if parked.Valid {
 		o.ParkedAt = &parked.Time
@@ -629,7 +649,9 @@ func (s *Store) orderRepos(ctx context.Context, ids []string) (map[string][]Orde
 // defaults to directed when Assignee is set, pool otherwise. o.After are
 // the orders it waits on (order_after, #142): an unknown order, the order
 // itself, or one that ended failed, belayed or withdrawn is refused
-// (ErrAfter, wrapped), and nothing is written.
+// (ErrAfter, wrapped), and nothing is written. An empty Kind is work; a
+// kind other than work or review, or a review with no Task, is refused
+// (ErrOrderKind, wrapped, #180).
 func (s *Store) InsertOrder(ctx context.Context, o Order, entry LogEntry) (string, error) {
 	var id string
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
@@ -643,8 +665,23 @@ func (s *Store) InsertOrder(ctx context.Context, o Order, entry LogEntry) (strin
 	return id, nil
 }
 
+// ErrOrderKind is returned (wrapped) by InsertOrder for a kind other than
+// work or review, or a review with no task (#180).
+var ErrOrderKind = errors.New("bad order kind")
+
 // insertOrder is InsertOrder's work, in tx.
 func (s *Store) insertOrder(ctx context.Context, tx *sql.Tx, o Order, entry LogEntry) (string, error) {
+	switch o.Kind {
+	case "":
+		o.Kind = OrderKindWork
+	case OrderKindWork:
+	case OrderKindReview:
+		if o.Task == "" {
+			return "", fmt.Errorf("%w: a review order belongs to a task", ErrOrderKind)
+		}
+	default:
+		return "", fmt.Errorf("%w: %q", ErrOrderKind, o.Kind)
+	}
 	if o.State == "" {
 		o.State = OrderPool
 		if o.Assignee != "" {
@@ -656,9 +693,9 @@ func (s *Store) insertOrder(ctx context.Context, tx *sql.Tx, o Order, entry LogE
 		return "", err
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO orders (id, title, body, division, priority, state, assignee, parent_id,
-		branch, budget_tokens, budget_turns, created_by, model, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		branch, budget_tokens, budget_turns, created_by, model, source, kind, task) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, o.Title, o.Body, o.Division, o.Priority, o.State, o.Assignee, o.ParentID, o.Branch, o.BudgetTokens, o.BudgetTurns,
-		o.CreatedBy, o.Model, o.Source)
+		o.CreatedBy, o.Model, o.Source, o.Kind, o.Task)
 	if err != nil {
 		return "", err
 	}
@@ -674,6 +711,34 @@ func (s *Store) insertOrder(ctx context.Context, tx *sql.Tx, o Order, entry LogE
 	entry.OrderID = id
 	_, err = s.appendLog(ctx, tx, entry)
 	return id, err
+}
+
+// InsertOrderOnce is InsertOrder keyed on o.CreatedBy (#180): when an
+// order created by o.CreatedBy already exists, the first one's id is
+// returned and nothing is written, in the transaction that would have
+// inserted it, so a re-run of the step that creates an order creates no
+// second one. created reports whether this call inserted it. o.CreatedBy
+// is required and must be a key only its caller uses, such as a campaign
+// order's campaign:<id>:<ref>:r<round>:<kind>.
+func (s *Store) InsertOrderOnce(ctx context.Context, o Order, entry LogEntry) (id string, created bool, err error) {
+	if o.CreatedBy == "" {
+		return "", false, errors.New("store: InsertOrderOnce needs createdBy")
+	}
+	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx, `SELECT id FROM orders WHERE created_by = ? ORDER BY rowid LIMIT 1`, o.CreatedBy).Scan(&id)
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if id, err = s.insertOrder(ctx, tx, o, entry); err != nil {
+			return err
+		}
+		created = true
+		return nil
+	})
+	if err != nil {
+		return "", false, err
+	}
+	return id, created, nil
 }
 
 // ErrAfter is returned, wrapped, by InsertOrder and InsertChildOrders for
@@ -717,6 +782,8 @@ var ErrParentEnded = errors.New("parent order no longer away")
 // parent and its CreatedBy to createdBy, each logged "order created:
 // <title>" (kind order), then entry(ids), the split's own entry, appended
 // for the parent. It returns the children's ids, in children's order.
+// Children don't inherit the parent's Task: the bridge refuses to split a
+// campaign order (#182), or a child's claimer could later review the task.
 // A child's AfterSiblings, indexes of earlier children, join its After as
 // those children's ids (#142); a later or its own index is ErrAfter.
 //
@@ -1082,7 +1149,8 @@ func (s *Store) ListOrders(ctx context.Context) ([]Order, error) {
 // crew member runs one mission at a time, so if it already has an away order
 // that order is returned unchanged; otherwise the highest-priority directed
 // order assigned to it, the oldest of those, is moved to away and returned;
-// one waiting on an order in its after not yet done is skipped (#142).
+// one waiting on an order in its after not yet done is skipped (#142), and
+// so is a review of a task crewID worked on (reviewBarredSQL, #180).
 // This makes a re-run of the
 // claim (e.g. a replayed DBOS step) return the same order. found is false when
 // there is nothing to work on, or the crew member is dismissed or beaming
@@ -1090,9 +1158,11 @@ func (s *Store) ListOrders(ctx context.Context) ([]Order, error) {
 //
 // A claim that moves an order also sets the crew member away and appends
 // entry, with its OrderID set to the order's id, to the captain's log, all
-// in one transaction. Returning the order already away sets the crew member
-// away only if it is on_deck (a new tour taking up its parked order, #100),
-// appending entry only then, so a re-run writes nothing.
+// in one transaction; claiming a work order with a task records crewID in
+// task_workers in it too (#180). Returning the order already away sets
+// the crew member away only if it is on_deck (a new tour taking up its
+// parked order, #100), appending entry only then, so a re-run writes
+// nothing.
 //
 // Callers must move the order out of away (SettleOrder) on every mission
 // exit, or every later claim keeps returning it.
@@ -1125,11 +1195,16 @@ func (s *Store) ClaimOldestDirectedOrder(ctx context.Context, crewID string, ent
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
+		var kind, task string
 		err = tx.QueryRowContext(ctx, `
 			UPDATE orders SET state = ?
-			WHERE rowid = (SELECT o.rowid FROM orders o WHERE o.assignee = ? AND o.state = ? AND NOT `+waitingSQL+` `+claimOrderBy+` LIMIT 1)
-			RETURNING id`, OrderAway, crewID, OrderDirected).Scan(&id)
+			WHERE rowid = (SELECT o.rowid FROM orders o WHERE o.assignee = ? AND o.state = ? AND NOT `+waitingSQL+`
+				AND NOT `+reviewBarredSQL+` `+claimOrderBy+` LIMIT 1)
+			RETURNING id, kind, task`, OrderAway, crewID, OrderDirected, crewID).Scan(&id, &kind, &task)
 		if err != nil {
+			return err
+		}
+		if err := addTaskWorker(ctx, tx, kind, task, crewID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE crew SET status = ? WHERE id = ?`, CrewAway, crewID); err != nil {
@@ -1158,12 +1233,31 @@ const claimOrderBy = `ORDER BY priority DESC, rowid ASC`
 const waitingSQL = `EXISTS (SELECT 1 FROM order_after a JOIN orders p ON p.id = a.after_id
 	WHERE a.order_id = o.id AND p.state <> 'done')`
 
+// reviewBarredSQL is true for order o, a review, while the claiming crew
+// member, its one ? parameter, worked on o's task (#180, task_workers).
+// Both claims skip it: only workers are barred, so the reviewer of an
+// earlier round may claim the next round's review.
+const reviewBarredSQL = `(o.kind = 'review' AND EXISTS (SELECT 1 FROM task_workers w WHERE w.task = o.task AND w.crew_id = ?))`
+
+// addTaskWorker records, in tx, that crewID worked on task, when the order
+// it has just claimed is a work order of a task (#180): INSERT OR IGNORE,
+// so a second claim in the task adds nothing. A recall keeps the row.
+func addTaskWorker(ctx context.Context, tx *sql.Tx, kind, task, crewID string) error {
+	if kind != OrderKindWork || task == "" {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO task_workers (task, crew_id) VALUES (?, ?)`, task, crewID)
+	return err
+}
+
 // ClaimOldestPoolOrder claims the highest-priority pool order of division,
 // the oldest of those, for crewID (the standing-orders dispatcher, spec
 // phase-2-plan section 4), skipping one waiting on an order in its after
-// not yet done (#142): it sets the order's assignee to crewID and its
-// state to away, sets the crew member away and appends entry, with its
-// OrderID set to the order's id, all in one transaction. A claimed pool
+// not yet done (#142) and a review of a task crewID worked on
+// (reviewBarredSQL, #180): it sets the order's assignee to crewID and its
+// state to away, sets the crew member away, records crewID in task_workers
+// for a work order with a task, and appends entry, with its OrderID set
+// to the order's id, all in one transaction. A claimed pool
 // order is then indistinguishable from a claimed directed one, so the next
 // ClaimOldestDirectedOrder returns it as the order already away. The
 // order's parked_at is left as it is: a recalled order (#101) keeps its
@@ -1185,11 +1279,16 @@ func (s *Store) ClaimOldestPoolOrder(ctx context.Context, crewID, division strin
 		if status == CrewDismissed || status == CrewBeamingIn {
 			return sql.ErrNoRows
 		}
+		var kind, task string
 		err := tx.QueryRowContext(ctx, `
 			UPDATE orders SET state = ?, assignee = ?
-			WHERE rowid = (SELECT o.rowid FROM orders o WHERE o.state = ? AND o.division = ? AND NOT `+waitingSQL+` `+claimOrderBy+` LIMIT 1)
-			RETURNING id`, OrderAway, crewID, OrderPool, division).Scan(&id)
+			WHERE rowid = (SELECT o.rowid FROM orders o WHERE o.state = ? AND o.division = ? AND NOT `+waitingSQL+`
+				AND NOT `+reviewBarredSQL+` `+claimOrderBy+` LIMIT 1)
+			RETURNING id, kind, task`, OrderAway, crewID, OrderPool, division, crewID).Scan(&id, &kind, &task)
 		if err != nil {
+			return err
+		}
+		if err := addTaskWorker(ctx, tx, kind, task, crewID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE crew SET status = ? WHERE id = ?`, CrewAway, crewID); err != nil {
@@ -1302,10 +1401,21 @@ const (
 // create-children) leaves them running: it logs "order ended with N open
 // child orders, which run on: ORD-0002, ..." (kind order, payload
 // open_children).
+//
+// An order with a task that ended or split is handed to the task hook
+// (SetTaskHook, #180) first, in tx: settleFamily sees every ending.
 func (s *Store) settleFamily(ctx context.Context, tx *sql.Tx, id string) error {
-	var parent, state, assignee string
-	if err := tx.QueryRowContext(ctx, `SELECT parent_id, state, assignee FROM orders WHERE id = ?`, id).Scan(&parent, &state, &assignee); err != nil {
+	var parent, state, assignee, task string
+	if err := tx.QueryRowContext(ctx, `SELECT parent_id, state, assignee, task FROM orders WHERE id = ?`, id).
+		Scan(&parent, &state, &assignee, &task); err != nil {
 		return err
+	}
+	if task != "" && (state == OrderSplit || slices.Contains(endedStates, state)) {
+		if hook := s.taskHook.Load(); hook != nil {
+			if err := (*hook)(tx, TaskOrder{Task: task, Order: id, State: state}); err != nil {
+				return fmt.Errorf("task hook for %s: %w", id, err)
+			}
+		}
 	}
 	if state == OrderSplit {
 		return s.settleSplit(ctx, tx, id)
@@ -2235,6 +2345,10 @@ type Hail struct {
 	// order's other hails don't wait on it, OpenHailForOrder skips it, and
 	// closing it leaves the order's and crew member's states alone.
 	Carried bool
+	// RaiseKey tells apart a bridge raiser's hails of one category
+	// (#180): InsertBridgeHail raises one hail per raiser, category and
+	// key. Empty on a hail from a beam and on stage 2's raises.
+	RaiseKey string
 }
 
 // CountermandedAway reports whether the captain countermanded h to
@@ -2267,8 +2381,8 @@ func (h Hail) CountermandedAway() bool {
 // is returned and nothing is written, which makes a re-run of the insert
 // (e.g. a replayed DBOS step) a no-op.
 //
-// h.DeliverTo is ignored: a hail from a beam has none. A bridge workflow's
-// hail goes through InsertBridgeHail.
+// h.DeliverTo and h.RaiseKey are ignored: a hail from a beam has neither.
+// A bridge workflow's hail goes through InsertBridgeHail.
 func (s *Store) InsertHail(ctx context.Context, h Hail, entry LogEntry) (string, error) {
 	if h.Route == "" {
 		h.Route = "captain"
@@ -2346,10 +2460,10 @@ var ErrBridgeHail = errors.New("invalid bridge hail")
 // workflow's id) and h.Category are required. h.ID and h.Status are
 // ignored; an empty Route defaults to "captain".
 //
-// If a hail with h.DeliverTo and h.Category already exists, open or
-// closed, its id is returned and nothing is written, so a re-run of the
-// raising step raises nothing new. The unique index hails_deliver_to
-// backs this.
+// If a hail with h.DeliverTo, h.Category and h.RaiseKey already exists,
+// open or closed, its id is returned and nothing is written, so a re-run
+// of the raising step raises nothing new; another key raises a new hail
+// (#180). The unique index hails_raise backs this.
 //
 // It appends entry to the captain's log with the hail's id added to its
 // payload as hail_id, in the same transaction. entry.OrderID may name the
@@ -2385,17 +2499,17 @@ func (s *Store) InsertBridgeHail(ctx context.Context, h Hail, entry LogEntry) (s
 	}
 	var id string
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
-		err := tx.QueryRowContext(ctx, `SELECT id FROM hails WHERE deliver_to = ? AND category = ?`,
-			h.DeliverTo, h.Category).Scan(&id)
+		err := tx.QueryRowContext(ctx, `SELECT id FROM hails WHERE deliver_to = ? AND category = ? AND raise_key = ?`,
+			h.DeliverTo, h.Category, h.RaiseKey).Scan(&id)
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
 		if id, err = nextID(ctx, tx, "hails", "H-%04d"); err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO hails (id, deliver_to, category, question, options, context, route, status, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			id, h.DeliverTo, h.Category, h.Question, string(opts), string(h.Context), h.Route, HailOpen, entry.TS.UTC())
+		_, err = tx.ExecContext(ctx, `INSERT INTO hails (id, deliver_to, category, raise_key, question, options, context, route, status, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			id, h.DeliverTo, h.Category, h.RaiseKey, h.Question, string(opts), string(h.Context), h.Route, HailOpen, entry.TS.UTC())
 		if err != nil {
 			return err
 		}
@@ -2415,7 +2529,7 @@ func (s *Store) InsertBridgeHail(ctx context.Context, h Hail, entry LogEntry) (s
 // strings (#151).
 const hailCols = `id, COALESCE(order_id, ''), COALESCE(crew_id, ''), COALESCE(deliver_to, ''), category, question, options, context, route, status,
 	decided_by, decision, rationale, confidence, countermand_until, created_at, decided_at, original_decided_by, countermanded_at,
-	countermand_option, carried`
+	countermand_option, carried, raise_key`
 
 func scanHail(row interface{ Scan(...any) error }) (Hail, error) {
 	var (
@@ -2427,7 +2541,7 @@ func scanHail(row interface{ Scan(...any) error }) (Hail, error) {
 		cmo        sql.NullInt64
 	)
 	err := row.Scan(&h.ID, &h.OrderID, &h.CrewID, &h.DeliverTo, &h.Category, &h.Question, &opts, &hctx, &h.Route, &h.Status,
-		&h.DecidedBy, &h.Decision, &h.Rationale, &conf, &cu, &ca, &da, &h.OriginalDecidedBy, &cma, &cmo, &h.Carried)
+		&h.DecidedBy, &h.Decision, &h.Rationale, &conf, &cu, &ca, &da, &h.OriginalDecidedBy, &cma, &cmo, &h.Carried, &h.RaiseKey)
 	if err != nil {
 		return Hail{}, err
 	}
@@ -3308,7 +3422,7 @@ func (s *Store) SetBeamRemoved(ctx context.Context, crewID, alias string, at tim
 type LogEntry struct {
 	ID      int64
 	TS      time.Time
-	Kind    string // beam, crew, order, hail, done, fail, bridge
+	Kind    string // beam, crew, order, hail, done, fail, bridge, campaign
 	CrewID  string
 	OrderID string
 	Text    string

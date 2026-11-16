@@ -70,7 +70,8 @@ func TestOrderRepos(t *testing.T) {
 }
 
 // A database made before order_repos existed gains it on Open, and its
-// orders read back with no repos.
+// orders read back with no repos. Its orders table has the columns #180
+// requires, which Open refuses to add.
 func TestOpenAddsOrderRepos(t *testing.T) {
 	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), DBFile)
@@ -80,7 +81,8 @@ func TestOpenAddsOrderRepos(t *testing.T) {
 		id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', division TEXT NOT NULL DEFAULT '',
 		priority INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, assignee TEXT NOT NULL DEFAULT '',
 		parent_id TEXT NOT NULL DEFAULT '', base_ref TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT '',
-		budget_tokens INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL DEFAULT '');
+		budget_tokens INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL DEFAULT '',
+		kind TEXT NOT NULL DEFAULT 'work', task TEXT NOT NULL DEFAULT '');
 		INSERT INTO orders (id, title, state, base_ref) VALUES ('ORD-0001', 'old', 'done', 'main');`)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
@@ -134,7 +136,8 @@ func TestOpenRejectsBeamsWithoutTour(t *testing.T) {
 // A database made before crew.model and orders.model existed (#58) gains
 // both on Open, as it does the later order columns (#100, #141), empty for
 // existing rows, and opening it again leaves them as they are. Its hails
-// table has the shape #151 requires, which Open refuses to upgrade.
+// table has the shape #151 requires, and its orders and hails the columns
+// #180 requires, which Open refuses to upgrade.
 func TestOpenAddsModelColumns(t *testing.T) {
 	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), DBFile)
@@ -149,14 +152,15 @@ func TestOpenAddsModelColumns(t *testing.T) {
 		id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', division TEXT NOT NULL DEFAULT '',
 		priority INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, assignee TEXT NOT NULL DEFAULT '',
 		parent_id TEXT NOT NULL DEFAULT '', base_ref TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL DEFAULT '',
-		budget_tokens INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL DEFAULT '');
+		budget_tokens INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL DEFAULT '',
+		kind TEXT NOT NULL DEFAULT 'work', task TEXT NOT NULL DEFAULT '');
 		INSERT INTO orders (id, title, state) VALUES ('ORD-0001', 'old', 'done');
 		CREATE TABLE hails (
 		id TEXT PRIMARY KEY, order_id TEXT REFERENCES orders(id), crew_id TEXT REFERENCES crew(id), deliver_to TEXT,
 		category TEXT NOT NULL DEFAULT '', question TEXT NOT NULL, options TEXT NOT NULL DEFAULT '[]',
 		context TEXT NOT NULL DEFAULT '{}', route TEXT NOT NULL DEFAULT 'captain', status TEXT NOT NULL DEFAULT 'open',
 		decided_by TEXT NOT NULL DEFAULT '', decision TEXT NOT NULL DEFAULT '', rationale TEXT NOT NULL DEFAULT '',
-		confidence REAL, countermand_until TIMESTAMP);
+		confidence REAL, countermand_until TIMESTAMP, raise_key TEXT NOT NULL DEFAULT '');
 		INSERT INTO hails (id, order_id, crew_id, question, status, decided_by, decision)
 		VALUES ('H-0001', 'ORD-0001', 'sorell', '?', 'decided', 'captain', 'yes');`)
 	require.NoError(t, err)
