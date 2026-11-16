@@ -449,6 +449,92 @@ describe("sdk harness", () => {
     expect(report).toEqual({ summary: "did it", artifacts: ["out/a.txt"], usage: { input_tokens: 120, output_tokens: 11 } });
   });
 
+  it("takes a review's verdict through report, and refuses a review's report without one (#181)", async () => {
+    const dir = tempDir();
+    const verdict = {
+      findings: [
+        { severity: "high", title: "  TestSnapshot races compaction  ", body: "Fails once in 20 runs.", path: "internal/raft/snapshot_test.go", line: 88 },
+        { severity: "low", title: "Name the retry constant", body: "" },
+      ],
+    };
+    const run = start(async function* (agent) {
+      yield init;
+      expect(await agent.callTool("report", { summary: "no verdict" })).toEqual({
+        isError: true,
+        content: [{ type: "text", text: "a review's report needs a verdict; findings may be empty" }],
+      });
+      for (const bad of [
+        { findings: [{ severity: "critical", title: "t", body: "" }] },
+        { findings: [{ severity: "low", title: "t", body: "", line: 3 }] },
+        { findings: Array.from({ length: 21 }, () => ({ severity: "low", title: "t", body: "" })) },
+        {},
+      ]) {
+        expect((await agent.callTool("report", { summary: "bad", verdict: bad })).isError, JSON.stringify(bad).slice(0, 80)).toBe(true);
+      }
+      expect(await agent.callTool("report", { summary: "one high", verdict })).toMatchObject({ content: [{ text: "report recorded; finish now" }] });
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { kind: "review", review: { base: "8b1d0e2c4a55f3e7", round: 2 } } });
+    const report = await run.result;
+    expect(report).toEqual({
+      summary: "one high",
+      usage: { input_tokens: 120, output_tokens: 11 },
+      verdict: {
+        findings: [
+          { severity: "high", title: "TestSnapshot races compaction", body: "Fails once in 20 runs.", path: "internal/raft/snapshot_test.go", line: 88 },
+          { severity: "low", title: "Name the retry constant", body: "" },
+        ],
+      },
+    });
+
+    // An empty list is a pass.
+    const passing = start(async function* (agent) {
+      yield init;
+      await agent.callTool("report", { summary: "looks right", verdict: { findings: [] } });
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { kind: "review", review: { base: "8b1d0e2c4a55f3e7", round: 1 } } });
+    expect((await passing.result).verdict).toEqual({ findings: [] });
+
+    // A review that never calls report has no verdict, and the bridge fails it.
+    const silent = start(async function* () {
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { kind: "review", review: { base: "8b1d0e2c4a55f3e7", round: 1 } } });
+    expect(await silent.result).not.toHaveProperty("verdict");
+  });
+
+  it("takes a work order's report without a verdict, and leaves out one it is given (#181)", async () => {
+    const dir = tempDir();
+    for (const body of [{}, { kind: "work" as const }]) {
+      const run = start(async function* (agent) {
+        yield init;
+        expect(await agent.callTool("report", { summary: "did it" })).toMatchObject({ content: [{ text: "report recorded; finish now" }] });
+        expect(await agent.callTool("report", { summary: "did it again", verdict: { findings: [] } })).toMatchObject({ content: [{ text: "report recorded; finish now" }] });
+        yield success;
+      }, { dir, repo: dir, claudePath: fakeClaude(dir), body });
+      expect(await run.result).toEqual({ summary: "did it again", usage: { input_tokens: 120, output_tokens: 11 } });
+      expect(run.options().systemPrompt).not.toMatchObject({ append: expect.stringContaining("verdict") });
+    }
+  });
+
+  it("gives a review order review instructions in place of the work lines, naming the base (#181)", async () => {
+    const dir = tempDir();
+    const base = "8b1d0e2c4a55f3e7d9c1b0a29384756afbecd012";
+    const run = start(async function* () {
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { kind: "review", review: { base, round: 2 } } });
+    await run.result;
+    const prompt = (run.options().systemPrompt as { append: string }).append;
+    expect(prompt).toContain("reviewing another crew member's work");
+    expect(prompt).toContain(`on branch bmus/${ORDER}, holds the head under review (main), round 2 of the task.`);
+    expect(prompt).toContain(`\`git diff ${base}..HEAD\` and \`git log ${base}..HEAD\``);
+    expect(prompt).toContain("change nothing and commit nothing");
+    expect(prompt).toContain("judge the fix against them");
+    expect(prompt).toContain("call mcp__combadge__report with a summary and a verdict");
+    expect(prompt).toContain("mcp__combadge__file_finding");
+    expect(prompt).not.toContain("Commit your work on it");
+    expect(prompt).not.toContain("any artifact paths");
+    expect(run.options().allowedTools).toContain("mcp__combadge__file_finding");
+  });
+
   it("gives Command split_order, an order_split hail: option 0 lists the children, anything else is an error", async () => {
     const dir = tempDir();
     const children = [

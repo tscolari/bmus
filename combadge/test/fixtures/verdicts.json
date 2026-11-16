@@ -1,0 +1,7 @@
+[
+  { "at_pct": 10, "progress": "reading the diff" },
+  { "at_pct": 100, "report": { "summary": "reviewed", "verdicts": [
+    { "findings": [ { "severity": "high", "title": "TestSnapshot races compaction", "body": "Fails once in 20 runs.", "path": "internal/raft/snapshot_test.go", "line": 88 } ] },
+    { "findings": [] }
+  ] } }
+]

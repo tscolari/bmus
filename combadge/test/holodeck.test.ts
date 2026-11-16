@@ -44,7 +44,7 @@ function expectCheckpoint(m: BeamToBridgeMessage, dir: string, index: number, no
 
 describe("holodeck harness", () => {
   it("fixtures are valid scripts", () => {
-    for (const f of ["default.json", "crash.json", "pause.json", "work.json", "usage.json", "findings.json"]) expect(() => loadScript(fixture(f))).not.toThrow();
+    for (const f of ["default.json", "crash.json", "pause.json", "work.json", "usage.json", "findings.json", "verdicts.json"]) expect(() => loadScript(fixture(f))).not.toThrow();
     expect(loadScript(fixture("default.json")).steps.some((s) => "request_handover" in s)).toBe(true);
   });
 
@@ -160,6 +160,17 @@ describe("holodeck harness", () => {
     }
     expect(await a.next(ofOrder)).toMatchObject({ type: "report", body: { summary: "holodeck mission complete" } });
     expect(stepLog(dir).map((e) => e.action)).toEqual(["progress", "finding", "finding", "finding", "report"]);
+    await a.close();
+  });
+
+  it("reports the verdict of the review order's round through serve (#181)", async () => {
+    const dir = tempDir();
+    await startServe(dir, 60_000, holodeck(fixture("verdicts.json"), dir));
+    const a = new Attach(dir, 0); // validates every message against the schema
+    const review: OrderBody = { ...orderBody, kind: "review", review: { base: "8b1d0e2c4a55", round: 2 } };
+    a.send({ seq: 1, order: ORDER, type: "order", body: review });
+    expect(await a.next(ofOrder)).toMatchObject({ type: "progress" });
+    expect(await a.next(ofOrder)).toMatchObject({ type: "report", body: { summary: "reviewed", verdict: { findings: [] } } });
     await a.close();
   });
 
@@ -502,6 +513,11 @@ describe("validateScript", () => {
     ["report with branch", [{ at_pct: 100, report: { summary: "x", branch: "b" } }], "step 0: unknown report key branch"],
     ["report no summary", [{ at_pct: 100, report: {} }], "step 0: report.summary must be a string"],
     ["report bad artifacts", [{ at_pct: 100, report: { summary: "x", artifacts: "a" } }], "step 0: report.artifacts must be an array of strings"],
+    ["verdict not an object", [{ at_pct: 100, report: { summary: "x", verdict: [] } }], "step 0: report.verdict must be an object"],
+    ["verdicts not an array", [{ at_pct: 100, report: { summary: "x", verdicts: { findings: [] } } }], "step 0: report.verdicts must be a non-empty array of objects"],
+    ["verdicts empty", [{ at_pct: 100, report: { summary: "x", verdicts: [] } }], "step 0: report.verdicts must be a non-empty array of objects"],
+    ["verdicts holding a string", [{ at_pct: 100, report: { summary: "x", verdicts: [{ findings: [] }, "pass"] } }], "step 0: report.verdicts must be a non-empty array of objects"],
+    ["verdict and verdicts", [{ at_pct: 100, report: { summary: "x", verdict: { findings: [] }, verdicts: [{ findings: [] }] } }], "step 0: report takes verdict or verdicts, not both"],
     ["write outside the repo", [{ at_pct: 0, write: "../x" }, report], "step 0: write must be a relative path inside the repo, outside .git"],
     ["write absolute", [{ at_pct: 0, write: "/tmp/x" }, report], "step 0: write must be a relative path"],
     ["write into .git", [{ at_pct: 0, write: ".git/config" }, report], "step 0: write must be a relative path"],
@@ -619,6 +635,34 @@ describe("holodeck run (in process)", () => {
     const usage = { input_tokens: 5, output_tokens: 1, turns: 1 };
     expect((await p.run({ id: ORDER, body: orderBody, repos: [], usage }, () => {}, () => {})).usage).toEqual({ input_tokens: 5, output_tokens: 1 });
     expect((await p.run({ id: ORDER, body: orderBody, repos: [] }, () => {}, () => {})).usage).toEqual({ input_tokens: 0, output_tokens: 0 });
+  });
+
+  it("picks verdicts by the review's round, repeating the last, and sends a verdict as given (#181)", async () => {
+    const dir = tempDir();
+    const block = { findings: [{ severity: "high", title: "Leaks a handle", body: "" }] };
+    const nit = { findings: [{ severity: "low", title: "Name the constant", body: "" }] };
+    const pass = { findings: [] };
+    const run = async (report: Record<string, unknown>, body: OrderBody) => {
+      const script = path.join(dir, "verdict.json");
+      fs.writeFileSync(script, JSON.stringify([{ at_pct: 100, report: { summary: "done", ...report } }]));
+      return holodeckHarness({ script, workDir: path.join(dir, "work") }).run({ id: ORDER, body, repos: [] }, () => {}, () => {});
+    };
+    const round = (n: number): OrderBody => ({ ...orderBody, kind: "review", review: { base: "abc", round: n } });
+    const verdicts = { verdicts: [block, nit, pass] };
+    for (const [n, want] of [[1, block], [2, nit], [3, pass], [4, pass], [9, pass]] as const) {
+      const r = await run(verdicts, round(n));
+      expect(r.verdict, `round ${n}`).toEqual(want);
+      expect(r).not.toHaveProperty("verdicts");
+    }
+    // A work order has no round: it gets the first, for the bridge to drop.
+    expect((await run(verdicts, orderBody)).verdict).toEqual(block);
+    // verdict goes to every round as given, unchecked.
+    const odd = { findings: [{ severity: "critical", title: "two\nlines" }], extra: 1 };
+    expect((await run({ verdict: odd }, round(3))).verdict).toEqual(odd);
+    // A review with neither reports none.
+    const none = await run({}, round(1));
+    expect(none).not.toHaveProperty("verdict");
+    expect(none.summary).toBe("done");
   });
 
   it("emits a finding step's body unchecked, for the bridge to drop (#153)", async () => {

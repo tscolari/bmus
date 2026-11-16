@@ -56,6 +56,14 @@
  *       the run's latest usage step, else of the order's earlier runs on this
  *       beam (Order.usage), else zero; serve
  *       bundles each repo's `bmus/<order>` into it and emits it.
+ *       A verdict (#181) goes in the report as `"verdict": {...}`, or as
+ *       `"verdicts": [{...}, ...]`, one per round: an order picks
+ *       `verdicts[round - 1]` by its `review.round` (1 without one), and the
+ *       last entry once the rounds pass the list. One script serves every
+ *       order, so this is how a reviewer blocks once and then passes. Either
+ *       goes on whatever the order's kind, so a script can send a work order
+ *       a verdict the bridge must drop; a report with neither has no
+ *       verdict. Each is only checked to be an object, as for `finding`.
  *   {"at_pct": 100, "crash": 137}
  *       Terminal. The whole serve process exits at once with that code (1-255)
  *       and emits nothing. This is the point: it simulates the beam's agent
@@ -135,13 +143,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { AnswerBody, ConsultReplyBody, FindingBody, HailBody, ReportBody, UsageBody } from "../protocol.js";
+import type { AnswerBody, ConsultReplyBody, FindingBody, HailBody, ReportBody, UsageBody, Verdict } from "../protocol.js";
 import { git } from "../repos.js";
 import { abortable, agentNoteOf, Budget, BudgetExceeded, chainNote, orderDir, startedFrom, Stopped, writePlaceholderCheckpoint } from "./common.js";
 import type { Harness, HarnessOptions, HarnessReport, Inbound, Order } from "./types.js";
 
 type HailSpec = Omit<HailBody, "ref">;
-type ReportSpec = Omit<ReportBody, "usage" | "repos">;
+type ReportSpec = Omit<ReportBody, "usage" | "repos"> & { verdicts?: Verdict[] };
 type UsageSpec = UsageBody;
 
 export type Step = { at_pct: number } & (
@@ -378,7 +386,13 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
           } else if ("report" in step) {
             log();
             finished = true;
-            return { ...step.report, usage: { input_tokens: own.input_tokens, output_tokens: own.output_tokens } };
+            const { verdicts, ...report } = step.report;
+            const verdict = pickVerdict(step.report, order.body.review?.round);
+            return {
+              ...report,
+              usage: { input_tokens: own.input_tokens, output_tokens: own.output_tokens },
+              ...(verdict !== undefined && { verdict }),
+            };
           } else {
             log();
             process.exit(step.crash);
@@ -535,9 +549,14 @@ export function validateScript(raw: unknown): Step[] {
       case "report": {
         if (!isObject(v)) fail("report must be an object");
         const r = v as Record<string, unknown>;
-        onlyKeys(r, ["summary", "artifacts"], "report", fail);
+        onlyKeys(r, ["summary", "artifacts", "verdict", "verdicts"], "report", fail);
         if (typeof r.summary !== "string") fail("report.summary must be a string");
         if (r.artifacts !== undefined && !isStrings(r.artifacts)) fail("report.artifacts must be an array of strings");
+        if (r.verdict !== undefined && r.verdicts !== undefined) fail("report takes verdict or verdicts, not both");
+        if (r.verdict !== undefined && !isObject(r.verdict)) fail("report.verdict must be an object");
+        if (r.verdicts !== undefined && (!Array.isArray(r.verdicts) || r.verdicts.length === 0 || !r.verdicts.every(isObject))) {
+          fail("report.verdicts must be a non-empty array of objects");
+        }
         break;
       }
     }
@@ -546,6 +565,18 @@ export function validateScript(raw: unknown): Step[] {
     if (!TERMINAL.has(action) && last) fail("the script must end with a terminal step (report or crash)");
   });
   return raw as Step[];
+}
+
+/**
+ * The verdict a report step sends an order in round (1 when absent): its
+ * verdict, else verdicts[round - 1], the last entry past the end.
+ */
+export function pickVerdict(report: ReportSpec, round: number | undefined): Verdict | undefined {
+  if (report.verdict !== undefined) return report.verdict;
+  const all = report.verdicts;
+  if (all === undefined || all.length === 0) return undefined;
+  const r = round !== undefined && Number.isSafeInteger(round) && round >= 1 ? round : 1;
+  return all[Math.min(r, all.length) - 1];
 }
 
 function onlyKeys(o: Record<string, unknown>, allowed: string[], what: string, fail: (m: string) => never): void {
