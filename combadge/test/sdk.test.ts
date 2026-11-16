@@ -3266,7 +3266,7 @@ describe("sdk harness automatic checkpoints (#145)", () => {
     await t.end();
   });
 
-  it("chains a harness note with the agent's latest note and the handover the run started from", async () => {
+  it("chains a harness note with the agent's latest note, not the handover the run started from (#174)", async () => {
     const dir = tempDir();
     const repo = gitRepo(dir);
     const transcript = path.join(dir, "t.jsonl");
@@ -3291,8 +3291,8 @@ describe("sdk harness automatic checkpoints (#145)", () => {
     expect(note).toContain("a cadence checkpoint the harness wrote while the agent worked");
     expect(note).toContain("the session's transcript stays in the bridge's cargo bay");
     expect(note).not.toContain("Read the transcript");
-    expect(note).toContain("The agent's latest handover note in this run:\nagent: half done");
-    expect(note).toContain("The handover note this run started from:\nrun 1: the plan\n\nThe captain answered hail H-0001.");
+    expect(note).toContain("The agent's latest handover note, written in this run:\nagent: half done");
+    expect(note).not.toContain("run 1: the plan");
   });
 
   it("never fires with both triggers set to 0", async () => {

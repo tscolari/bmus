@@ -202,7 +202,7 @@ async function start(opts: ServeOptions, release: () => void): Promise<Server> {
       const wip = wipNote(id, repos);
       const body = wip.length === 0 ? msg.body : { ...msg.body, handover: [msg.body.handover, ...wip].filter(Boolean).join("\n\n") };
       const started = opts.harness.run(
-        { id, body, repos, ...(earlier !== undefined && { usage: earlier }) },
+        { id, body, repos, ...(earlier !== undefined && { usage: earlier }), ...(msg.body.handover !== undefined && { sentHandover: msg.body.handover }) },
         (m) => (done ? warn(`dropping ${m.type} emitted after ${id} ended`) : emit(m.type, m.body, id)),
         (fn) => current.listeners.push(fn),
       );

@@ -554,6 +554,30 @@ describe("holodeck run (in process)", () => {
     expect(stepLog(dir).slice(before).map((e) => e.action)).toEqual(["progress", "report"]);
   });
 
+  it("a stop after a resume from a park names that park again, so the next resume walks on from it (#174)", async () => {
+    const dir = tempDir();
+    const script = path.join(dir, "stop.json");
+    fs.writeFileSync(script, JSON.stringify([
+      { at_pct: 10, hail: { category: "clarifying_question", question: "Which way?" }, park_after_ms: 20 },
+      { at_pct: 50, sleep_ms: 60_000 },
+      { at_pct: 100, report: { summary: "done" } },
+    ]));
+    const h = holodeckHarness({ script, stepLog: path.join(dir, "steps.ndjson"), workDir: path.join(dir, "work") });
+    const parked = `Order ${ORDER}: the holodeck parked on hail h. The holodeck parked its script at step 0.\n\n--- Carried forward from earlier checkpoints ---\nThe agent has written no handover note yet.\n--- End of what was carried forward ---`;
+    const emitted: Outbound[] = [];
+    let deliver!: (m: Inbound) => void;
+    const run = h.run({ id: ORDER, body: { ...orderBody, handover: parked }, repos: [] }, (m) => emitted.push(m), (fn) => (deliver = fn));
+    await sleep(50);
+    deliver({ type: "stand_down", body: { reason: "watch change" } });
+    await expect(run).rejects.toThrow("stopped by stand_down");
+    expect(emitted.map((m) => m.type)).toEqual(["checkpoint_ready"]); // no second hail: the walk went on after step 0
+    const cp = emitted[0];
+    if (cp?.type !== "checkpoint_ready") throw new Error("no checkpoint");
+    const note = fs.readFileSync(cp.body.handover_path, "utf8");
+    expect(note).toMatch(/^Order ORD-0001: stopped by stand_down: watch change\. The holodeck stopped its script here\. The holodeck parked its script at step 0\.\n/);
+    expect(note.split("The holodeck parked its script").length - 1).toBe(1);
+  });
+
   it("records the order's model, handover, budget and used counts in the step log, and nothing without them", async () => {
     const dir = tempDir();
     const script = path.join(dir, "short.json");
