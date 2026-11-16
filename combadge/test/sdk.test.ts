@@ -3295,6 +3295,36 @@ describe("sdk harness automatic checkpoints (#145)", () => {
     expect(note).not.toContain("run 1: the plan");
   });
 
+  it("a cadence note in a run started with a bridge answer keeps it while the agent has written no note (#174)", async () => {
+    const dir = tempDir();
+    const repo = gitRepo(dir);
+    const transcript = path.join(dir, "t.jsonl");
+    fs.writeFileSync(transcript, "{}\n");
+    const events: CadenceEvent[] = [];
+    const answered = `While the order was parked, the captain answered hail H-0001, which the earlier session asked: "Which way?". The answer: "left".`;
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      await agent.preToolUse("Read", {}, transcript);
+      // A change each turn until one lands after the cadence's baseline.
+      for (let i = 1; !events.includes("written"); i++) {
+        fs.writeFileSync(path.join(repo, "wip.txt"), `wip ${i}\n`);
+        yield assistant(`t${i}`, { input: 1, output: 1 });
+        while (events.filter((e) => e !== "check").length < i) await new Promise<void>((r) => setImmediate(r));
+      }
+      yield success;
+    }, { dir, repo, claudePath: fakeClaude(dir), checkpointTurns: 1, onCadence: (e) => events.push(e), body: { handover: `run 1: the plan\n\n${answered}` } });
+    await run.result;
+    const cps = run.emitted.filter((m) => m.type === "checkpoint_ready");
+    expect(cps.length).toBeGreaterThanOrEqual(1);
+    const cadence = cps[0]!;
+    if (cadence.type !== "checkpoint_ready") throw new Error("unreachable");
+    const note = fs.readFileSync(cadence.body.handover_path, "utf8");
+    expect(note).toContain("a cadence checkpoint the harness wrote while the agent worked");
+    expect(note.split(answered).length - 1).toBe(1);
+    expect(note).toContain("The agent's latest handover note, written in an earlier run:\nrun 1: the plan");
+  });
+
   it("never fires with both triggers set to 0", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const dir = tempDir();
