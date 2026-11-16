@@ -113,7 +113,8 @@
  * `"repos"`, each repo's name to its checkout dir, when the order has repos,
  * `"model"`, the order's model, when it has one (the holodeck runs no model and
  * only records it, so tests can see what reached the harness), and
- * `"handover"`, the note a resumed order carries, when it has one, and
+ * `"handover"`, the note a resumed order carries, when it has one,
+ * `"grants"`, the calls allowed on its carried hails (#145), when it has any, and
  * `"budget_tokens"`, `"budget_turns"`, `"used_tokens"` and `"used_turns"`,
  * the budget limit and other beams' usage the order carries, when nonzero
  * (#118). The bridge
@@ -252,6 +253,7 @@ export function holodeckHarness(opts: HarnessOptions): Harness {
         ...(order.repos.length > 0 && { repos: Object.fromEntries(order.repos.map((r) => [r.name, r.dir])) }),
         ...(order.body.model !== undefined && order.body.model !== "" && { model: order.body.model }),
         ...(order.body.handover !== undefined && order.body.handover !== "" && { handover: order.body.handover }),
+        ...(order.body.grants !== undefined && order.body.grants.length > 0 && { grants: order.body.grants }),
         ...(order.body.budget_tokens > 0 && { budget_tokens: order.body.budget_tokens }),
         ...((order.body.budget_turns ?? 0) > 0 && { budget_turns: order.body.budget_turns }),
         ...((order.body.used_tokens ?? 0) > 0 && { used_tokens: order.body.used_tokens }),

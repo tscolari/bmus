@@ -329,6 +329,28 @@ func wipRef(orderID string) string { return "refs/bmus/wip/" + orderID }
 // bundle needs its commit. Jettison removes it with bmus/<order>.
 func checkpointRef(orderID string) string { return "refs/bmus/checkpoints/" + orderID }
 
+// dropCheckpointRef deletes checkpointRef(orderID) from the clone of each
+// of the order's repos (#145), best effort: an order that ended without
+// bringing work back never needs it again. Jettison sweeps what this
+// misses.
+func (d *Daemon) dropCheckpointRef(ctx context.Context, orderID string) {
+	o, err := d.store.GetOrder(ctx, orderID)
+	if err != nil {
+		return
+	}
+	for _, r := range o.Repos {
+		if _, ok := d.repos[r.Name]; !ok {
+			continue
+		}
+		unlock, err := d.lockRepo(ctx, r.Name)
+		if err != nil {
+			return
+		}
+		runGit(ctx, d.repoDir(r.Name), "update-ref", "-d", checkpointRef(orderID)) //nolint:errcheck // best effort
+		unlock()
+	}
+}
+
 // keptWipRef is where a WIP the beam couldn't restore travels (#145):
 // refs/bmus/kept-wip/<order>.
 func keptWipRef(orderID string) string { return "refs/bmus/kept-wip/" + orderID }

@@ -390,8 +390,12 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
       let grace: NodeJS.Timeout | undefined;
       /** Set from the park until the resumed query starts. */
       let park: Park | undefined;
-      /** The running query's single-use entries for calls answered while parked. */
-      let grants: Grant[] = [];
+      /**
+       * The running query's single-use entries for calls answered while
+       * parked. The first query starts with the order's grants (#145): calls
+       * the captain allowed on a hail carried across a park on another beam.
+       */
+      let grants: Grant[] = (order.body.grants ?? []).map((g) => ({ tool: g.tool, key: approvalKey(g.tool, g.input), allow: true, message: "" }));
 
       /** Parks the run: every held hail is kept for the resume, and the query is aborted. */
       const parkRun = () => {

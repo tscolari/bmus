@@ -353,6 +353,9 @@ type shipped struct {
 	// Handover is the note of the checkpoint the repos were shipped from,
 	// for the order command; empty when they were shipped from base_ref.
 	Handover string `json:",omitempty"`
+	// Grants are set on the send (not by ship-repos): the calls the
+	// captain allowed on carried hails while the order had no run (#145).
+	Grants []comms.OrderGrant `json:",omitempty"`
 	// Beam is the beam the repos were shipped to, and the order goes to:
 	// its checkpoints and work are pulled from it.
 	Beam string `json:",omitempty"`

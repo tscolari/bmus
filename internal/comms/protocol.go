@@ -520,6 +520,17 @@ type OrderBody struct {
 	// repo's bundle then carries that checkpoint's commits. Empty on a fresh
 	// order.
 	Handover string `json:"handover,omitempty"`
+	// Grants are tool calls the captain allowed on a hail carried across a
+	// park (#145), which the earlier run never got to make: the harness
+	// lets the same call through once, without a hail.
+	Grants []OrderGrant `json:"grants,omitempty"`
+}
+
+// OrderGrant is a tool call allowed in advance (#145): the tool and its
+// input, as the tool_approval hail's context named them.
+type OrderGrant struct {
+	Tool  string          `json:"tool"`
+	Input json.RawMessage `json:"input"`
 }
 
 // MarshalJSON writes a nil Repos as [], which the schema requires.

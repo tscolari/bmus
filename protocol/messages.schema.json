@@ -400,7 +400,8 @@
         "used_turns": {"description": "Main-loop turns the bridge recorded for the order on its other beams, as used_tokens. Absent means 0.", "type": "integer", "minimum": 0},
         "dossier": {"description": "Crew dossier of learned conventions (markdown).", "type": "string"},
         "model": {"description": "Model to run the order on: the order's own, else the crew member's, else its division's default. Opaque to the bridge; the harness checks it when the order starts and fails the order if it is unknown. Absent means the harness's default.", "type": "string", "minLength": 1},
-        "handover": {"description": "Handover note of the checkpoint the order resumes from; each repo's bundle then carries that checkpoint's commits. Absent on a fresh order.", "type": "string"}
+        "handover": {"description": "Handover note of the checkpoint the order resumes from; each repo's bundle then carries that checkpoint's commits. Absent on a fresh order.", "type": "string"},
+        "grants": {"description": "Tool calls the captain allowed on a hail carried across a park (#145), which the order's earlier run never got to make: the harness lets the same call through once, without a hail. Absent when there are none.", "type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["tool", "input"], "properties": {"tool": {"type": "string", "minLength": 1}, "input": {"type": "object"}}}}
       }
     },
     "order_repo": {

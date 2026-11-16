@@ -322,6 +322,18 @@ export interface OrderBody {
   model?: string;
   /** Note of the checkpoint the order resumes from; each repo's bundle then carries that checkpoint's commits. Absent on a fresh order. */
   handover?: string;
+  /**
+   * Tool calls the captain allowed on a hail carried across a park (#145),
+   * which the earlier run never got to make: the harness lets the same call
+   * through once, without a hail.
+   */
+  grants?: OrderGrant[];
+}
+
+/** A tool call allowed in advance (#145), as the tool_approval hail's context named it. */
+export interface OrderGrant {
+  tool: string;
+  input: Record<string, unknown>;
 }
 
 /** One repo of an order. */

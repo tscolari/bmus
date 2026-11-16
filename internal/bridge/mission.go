@@ -111,19 +111,51 @@ type openHail struct {
 	// (#54), a budget hail budget-extend (#119), an order_reorder
 	// apply-reorder (#148).
 	Category string
-	// Carried: the hail was held by a park checkpoint when its beam went
-	// away, and stays open across the park (#145). The run it came from
-	// is gone, so its answer goes into the next run's handover note, or,
-	// once that run has started, to it as a correction.
-	Carried bool
+	// Question is the hail's, as the beam asked it: a carried hail (#145)
+	// is superseded by a new hail that asks the same.
+	Question string
+}
+
+// carriedHails are a mission's carried hails (#145): hails a park
+// checkpoint held when the beam went away. They stay open across the park
+// and never occupy the mission's open-hail slot: the run that asked is
+// gone. An answer goes into the next run's handover note (with a grant
+// for an allowed tool_approval), or, once that run has started, to it as
+// a correction. A new hail asking the same closes one as superseded. Only
+// recorded steps and messages fill it, so a replay rebuilds it.
+type carriedHails []openHail
+
+// take removes and returns the carried hail id, if there is one.
+func (c *carriedHails) take(id string) (openHail, bool) {
+	i := slices.IndexFunc(*c, func(h openHail) bool { return h.ID == id })
+	if i < 0 {
+		return openHail{}, false
+	}
+	h := (*c)[i]
+	*c = slices.Delete(*c, i, i+1)
+	return h, true
 }
 
 // carriedAnswer is the answer to a carried hail that came while the order
-// was parked (#145): it goes into the resumed run's handover note.
+// had no run (#145): it goes into the resumed run's handover note, and an
+// allowed tool_approval into its grants.
 type carriedAnswer struct {
 	HailID   string
 	Question string
 	Decision string
+	// Grant is the call an allowed tool_approval let through, if it was one.
+	Grant *comms.OrderGrant `json:",omitempty"`
+}
+
+// carriedGrants are the grants of answers.
+func carriedGrants(answers []carriedAnswer) []comms.OrderGrant {
+	var out []comms.OrderGrant
+	for _, a := range answers {
+		if a.Grant != nil {
+			out = append(out, *a.Grant)
+		}
+	}
+	return out
 }
 
 // carriedNote is a resumed run's handover note with the answers to its
@@ -207,8 +239,11 @@ func missionWorkflow(ctx dbos.Context, in MissionInput) (MissionResult, error) {
 
 // endMission is missionWorkflow up to telling the tour.
 func endMission(ctx dbos.Context, in MissionInput) (MissionResult, error) {
-	var held heldCorrections
-	res, crewID, err := runMission(ctx, in, &held)
+	var (
+		held        heldCorrections
+		carriedOpen carriedHails
+	)
+	res, crewID, err := runMission(ctx, in, &held, &carriedOpen)
 	if err != nil {
 		if ctx.Err() != nil {
 			return res, err
@@ -227,6 +262,18 @@ func endMission(ctx dbos.Context, in MissionInput) (MissionResult, error) {
 		// it never read holds the order failed under it. Tell its tour,
 		// as belayMission does (#113).
 		crewID = cmp.Or(crewID, assignee)
+	}
+	// Carried hails no run will ask again (#145). Only a mission that
+	// carried one runs the step, so missions from before replay as they ran.
+	if len(carriedOpen) > 0 {
+		if err := closeCarried(ctx, MissionInput{OrderID: in.OrderID, CrewID: crewID}, carriedOpen, res.Status); err != nil {
+			return res, err
+		}
+	}
+	if res.Status != MissionDone {
+		// The order brought no work back: nothing needs its latest landed
+		// checkpoint (#145). Idempotent, so a replay repeats it harmlessly.
+		daemonFrom(ctx).dropCheckpointRef(ctx, in.OrderID)
 	}
 	// Corrections held for a resume that never came (#167).
 	for _, h := range held {
@@ -408,7 +455,7 @@ func syntheticMessage(typ string, body any, crewID, orderID string) (comms.Messa
 // send-order again on the new crew member's beam. A resume unpark refuses
 // (a recall moved the order first) tells the resuming tour mission_parked,
 // so it doesn't wait on an order that is no longer its.
-func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (MissionResult, string, error) {
+func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections, carriedOpen *carriedHails) (MissionResult, string, error) {
 	d := daemonFrom(ctx)
 	cur := in
 	var (
@@ -427,29 +474,40 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 		// heldRefs are the hails the latest checkpoint pulled from the
 		// current run held at its park (#145).
 		heldRefs []string
-		// carried are answers to carried hails that came while parked,
-		// for the resumed run's handover note (#145).
+		// carried are answers to carried hails that came while the order
+		// had no run, for the resumed run's order (#145).
 		carried []carriedAnswer
 	)
 	// park parks the mission. A non-nil result is the mission's end: the
-	// backstop had failed the order. lost: the beam went away (or the run
-	// errored while parking), so a hail its latest pulled checkpoint
-	// parked on stays open (#145); a hail carried from an earlier run
-	// stays open on any park.
+	// backstop had failed the order. lost: the beam went away, so the
+	// hails its latest pulled checkpoint held at its park are carried
+	// (#145): the open one, and those queued behind it, which are recorded
+	// now.
 	park := func(reason string, stale, lost bool) (*MissionResult, error) {
 		var keep *openHail
-		if hail != nil && (hail.Carried || (lost && slices.Contains(heldRefs, hail.Ref))) {
+		if lost && hail != nil && slices.Contains(heldRefs, hail.Ref) {
 			keep = hail
 		}
 		res, err := parkMission(ctx, cur, reason, stale, keep)
 		if err != nil || res != nil {
 			return res, err
 		}
-		hail, queued, parking, recalling, parked = nil, nil, false, false, true
 		if keep != nil {
-			keep.Carried = true
-			hail = keep
+			*carriedOpen = append(*carriedOpen, *keep)
 		}
+		if lost {
+			for _, q := range queued {
+				if !slices.Contains(heldRefs, q.Ref) {
+					continue
+				}
+				h, err := carryQueued(ctx, cur, q)
+				if err != nil {
+					return nil, err
+				}
+				*carriedOpen = append(*carriedOpen, h)
+			}
+		}
+		hail, queued, parking, recalling, parked = nil, nil, false, false, true
 		return nil, nil
 	}
 	// recall recalls the order and parks the mission with no crew member,
@@ -480,7 +538,21 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 			dbos.WithWorkflowID(hailWorkflowID(id))); err != nil {
 			return err
 		}
-		hail = &openHail{ID: id, Ref: body.Ref, Category: body.Category}
+		hail = &openHail{ID: id, Ref: body.Ref, Category: body.Category, Question: body.Question}
+		// A carried hail the new one asks again is closed (#145): the
+		// captain sees one question.
+		for _, c := range *carriedOpen {
+			if c.Category != body.Category || c.Question != body.Question || c.ID == id {
+				continue
+			}
+			if err := storeStep(ctx, "supersede-carried", func(sc context.Context, d *Daemon) error {
+				return d.closeHailAs(sc, cur, &openHail{ID: c.ID}, ": superseded by hail "+id)
+			}); err != nil {
+				return err
+			}
+			carriedOpen.take(c.ID)
+			break
+		}
 		return nil
 	}
 	for {
@@ -522,8 +594,10 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 			// the order with it. send-order records 0 for a tour that ended
 			// while it retried (#195).
 			if !ship.TourEnded {
-				// Answers to carried hails go in the handover note (#145).
+				// Answers to carried hails go in the handover note, and
+				// allowed calls in its grants (#145).
 				ship.Handover = carriedNote(ship.Handover, carried)
+				ship.Grants = carriedGrants(carried)
 				id, err := dbos.RunAsStep(ctx, func(c context.Context) (uint64, error) {
 					return sendOrderStep(c, daemonFrom(c), cur, ship)
 				}, dbos.WithStepName("send-order"))
@@ -718,20 +792,17 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 					return failMission(ctx, cur, nil, body.Reason, body.Code)
 				}
 			}
-			if msg.Type == comms.TypeAnswer && hail != nil && hail.Carried {
-				// The captain answered a carried hail while the order has
-				// no run (#145): the resumed run's handover note takes it.
+			if msg.Type == comms.TypeAnswer {
 				var body comms.AnswerBody
-				if err := json.Unmarshal(msg.Body, &body); err == nil && body.HailID == hail.ID {
-					question, err := dbos.RunAsStep(ctx, func(c context.Context) (string, error) {
-						return carriedDecided(c, daemonFrom(c), cur, body)
-					}, append([]dbos.StepOption{dbos.WithStepName("carried-answer")}, storeRetries...)...)
-					if err != nil {
-						return MissionResult{}, cur.CrewID, err
+				if err := json.Unmarshal(msg.Body, &body); err == nil {
+					if _, ok := carriedOpen.take(body.HailID); ok {
+						a, err := takeCarriedAnswer(ctx, cur, body)
+						if err != nil {
+							return MissionResult{}, cur.CrewID, err
+						}
+						carried = append(carried, a)
+						continue
 					}
-					carried = append(carried, carriedAnswer{HailID: body.HailID, Question: question, Decision: body.Decision})
-					hail = nil
-					continue
 				}
 			}
 			d.logger.Info("mission: parked; dropping message", "order", in.OrderID, "type", msg.Type, "seq", msg.Seq)
@@ -795,35 +866,40 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 
 		case comms.TypeAnswer:
 			var body comms.AnswerBody
-			if err := json.Unmarshal(msg.Body, &body); err != nil || hail == nil || body.HailID != hail.ID {
-				d.logger.Warn("mission: ignoring answer for a hail it isn't waiting on", "order", in.OrderID, "hail", body.HailID, "err", err)
-				continue
+			uerr := json.Unmarshal(msg.Body, &body)
+			if uerr == nil {
+				if _, ok := carriedOpen.take(body.HailID); ok {
+					// The run that asked is gone (#145). With no order on
+					// the beam (the resume's send-order found the tour
+					// ended), the next send carries it; otherwise it goes
+					// to the resumed run as a correction naming the
+					// question, as a held correction does (#167, #190).
+					if !onBeam {
+						a, err := takeCarriedAnswer(ctx, cur, body)
+						if err != nil {
+							return MissionResult{}, cur.CrewID, err
+						}
+						carried = append(carried, a)
+						continue
+					}
+					if err := storeStep(ctx, "decide-hail", func(c context.Context, d *Daemon) error {
+						return decideHail(c, d, cur, body)
+					}); err != nil {
+						return MissionResult{}, cur.CrewID, err
+					}
+					if err := sendCorrection(ctx, cur, comms.CorrectionBody{HailID: body.HailID, Ref: in.OrderID, Note: body.Decision}); err != nil {
+						if ctx.Err() != nil {
+							return MissionResult{}, cur.CrewID, err
+						}
+						if err := logCorrectionDropped(ctx, cur.CrewID, in.OrderID, body.HailID, fmt.Sprintf("could not send it to %s: %v", cur.CrewID, err)); err != nil {
+							return MissionResult{}, cur.CrewID, err
+						}
+					}
+					continue
+				}
 			}
-			if hail.Carried {
-				// The run that asked is gone (#145): the answer goes to the
-				// resumed run as a correction naming the question, as a held
-				// correction does (#167, #190).
-				if err := storeStep(ctx, "decide-hail", func(c context.Context, d *Daemon) error {
-					return decideHail(c, d, cur, body)
-				}); err != nil {
-					return MissionResult{}, cur.CrewID, err
-				}
-				hail = nil
-				if err := sendCorrection(ctx, cur, comms.CorrectionBody{HailID: body.HailID, Ref: in.OrderID, Note: body.Decision}); err != nil {
-					if ctx.Err() != nil {
-						return MissionResult{}, cur.CrewID, err
-					}
-					if err := logCorrectionDropped(ctx, cur.CrewID, in.OrderID, body.HailID, fmt.Sprintf("could not send it to %s: %v", cur.CrewID, err)); err != nil {
-						return MissionResult{}, cur.CrewID, err
-					}
-				}
-				if len(queued) > 0 {
-					next := queued[0]
-					queued = queued[1:]
-					if err := raise(next); err != nil {
-						return MissionResult{}, cur.CrewID, err
-					}
-				}
+			if uerr != nil || hail == nil || body.HailID != hail.ID {
+				d.logger.Warn("mission: ignoring answer for a hail it isn't waiting on", "order", in.OrderID, "hail", body.HailID, "err", uerr)
 				continue
 			}
 			body.Ref = hail.Ref
@@ -944,19 +1020,15 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 					res *MissionResult
 					err error
 				)
-				var keep *openHail
-				if !recalled && hail != nil && hail.Carried {
-					keep = hail
-				}
 				if recalled {
 					res, err = recallOrder(ctx, cur, stopFor)
 				} else {
-					res, err = parkOrder(ctx, cur, stopFor, keep)
+					res, err = parkOrder(ctx, cur, stopFor, nil)
 				}
 				if err != nil || res != nil {
 					return deref(res), cur.CrewID, err
 				}
-				hail, queued, parking, recalling = keep, nil, false, false
+				hail, queued, parking, recalling = nil, nil, false, false
 			}
 			var (
 				err error
@@ -1044,7 +1116,7 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections) (Missi
 				if recalling {
 					res, err = recall(body.Reason, false)
 				} else {
-					res, err = park(body.Reason, false, true)
+					res, err = park(body.Reason, false, body.Code == CodeBeamLost)
 				}
 				if err != nil || res != nil {
 					return deref(res), cur.CrewID, err
@@ -1399,7 +1471,7 @@ func parkOrder(ctx dbos.Context, in MissionInput, reason string, keep *openHail)
 
 // park is the park step: it closes the order's open hail ("closed
 // unanswered: mission parked"), unless it is keep, a hail held by a park
-// checkpoint or carried from an earlier run (#145), and marks the order
+// checkpoint, which it carries instead (store.CarryHail, #145), and marks the order
 // parked, logging "order parked: <reason>" (store.ParkOrder; the entry's
 // payload names a kept hail as held_hail). Both writes are conditional, so
 // a re-run writes nothing.
@@ -1411,6 +1483,9 @@ func (d *Daemon) park(ctx context.Context, in MissionInput, reason, keep string)
 	payload := map[string]string{"reason": reason}
 	if found && h.ID == keep {
 		payload["held_hail"] = keep
+		if _, err := d.store.CarryHail(ctx, keep); err != nil {
+			return parkOutcome{}, err
+		}
 	} else if found {
 		if err := d.closeHailAs(ctx, in, &openHail{ID: h.ID}, ": mission parked"); err != nil {
 			return parkOutcome{}, err
@@ -1858,7 +1933,7 @@ func sendOrder(ctx context.Context, d *Daemon, in MissionInput, ship shipped) (u
 		Title: o.Title, Body: o.Body, Repos: ship.Repos,
 		BudgetTokens: uint64(max(limit.Tokens, 0)), BudgetTurns: uint64(max(limit.Turns, 0)),
 		UsedTokens: uint64(max(used.Tokens, 0)), UsedTurns: uint64(max(used.Turns, 0)),
-		Model: model, Handover: ship.Handover,
+		Model: model, Handover: ship.Handover, Grants: ship.Grants,
 	})
 	if err != nil {
 		return 0, err
@@ -1879,6 +1954,13 @@ func sendOrder(ctx context.Context, d *Daemon, in MissionInput, ship shipped) (u
 // bridge's question (budgetQuestion), its context's four counts and the
 // options extend and stop (#119).
 func recordHail(ctx context.Context, d *Daemon, in MissionInput, body comms.HailBody) (string, error) {
+	return recordHailAs(ctx, d, in, body, false)
+}
+
+// recordHailAs is recordHail, recording the hail carried (#145) when
+// carried: open beside the order's other hails, with nobody hailing on
+// its account.
+func recordHailAs(ctx context.Context, d *Daemon, in MissionInput, body comms.HailBody, carried bool) (string, error) {
 	if body.Category == comms.CategoryOrderSplit {
 		o, err := d.store.GetOrder(ctx, in.OrderID)
 		if err != nil {
@@ -1907,7 +1989,7 @@ func recordHail(ctx context.Context, d *Daemon, in MissionInput, body comms.Hail
 	}
 	return d.store.InsertHail(ctx, store.Hail{
 		OrderID: in.OrderID, CrewID: in.CrewID, Category: body.Category,
-		Question: body.Question, Options: body.Options, Context: body.Context,
+		Question: body.Question, Options: body.Options, Context: body.Context, Carried: carried,
 	}, entry)
 }
 
@@ -1937,18 +2019,60 @@ func decideHail(ctx context.Context, d *Daemon, in MissionInput, body comms.Answ
 	return d.store.MarkHailDecided(ctx, body.HailID, body.DecidedBy, body.Decision, body.Rationale, entry)
 }
 
-// carriedDecided is the carried-answer step (#145): decide-hail for an
-// answer to a carried hail that came while the order was parked, and the
-// hail's question, for the resumed run's handover note.
-func carriedDecided(ctx context.Context, d *Daemon, in MissionInput, body comms.AnswerBody) (string, error) {
-	if err := decideHail(ctx, d, in, body); err != nil {
-		return "", err
-	}
-	h, err := d.store.GetHail(ctx, body.HailID)
+// takeCarriedAnswer runs the carried-answer step (#145) for an answer to
+// a carried hail that came while the order had no run: decide-hail, and
+// the answer as the resumed run's order carries it (its handover note's
+// line, and a grant for a tool_approval answered with option 0, from the
+// hail's context).
+func takeCarriedAnswer(ctx dbos.Context, in MissionInput, body comms.AnswerBody) (carriedAnswer, error) {
+	return dbos.RunAsStep(ctx, func(c context.Context) (carriedAnswer, error) {
+		d := daemonFrom(c)
+		if err := decideHail(c, d, in, body); err != nil {
+			return carriedAnswer{}, err
+		}
+		h, err := d.store.GetHail(c, body.HailID)
+		if err != nil {
+			return carriedAnswer{}, err
+		}
+		a := carriedAnswer{HailID: body.HailID, Question: h.Question, Decision: body.Decision}
+		if h.Category == comms.CategoryToolApproval && body.Option != nil && *body.Option == 0 {
+			var call comms.OrderGrant
+			if json.Unmarshal(h.Context, &call) == nil && call.Tool != "" && len(call.Input) > 0 {
+				a.Grant = &call
+			}
+		}
+		return a, nil
+	}, append([]dbos.StepOption{dbos.WithStepName("carried-answer")}, storeRetries...)...)
+}
+
+// carryQueued records a hail queued behind the open one when its run's
+// park checkpoint held it too (#145): carried from the start
+// (record-carried-hail), with its hail workflow, so the captain can answer
+// it while the order has no run.
+func carryQueued(ctx dbos.Context, in MissionInput, body comms.HailBody) (openHail, error) {
+	id, err := dbos.RunAsStep(ctx, func(c context.Context) (string, error) {
+		return recordHailAs(c, daemonFrom(c), in, body, true)
+	}, append([]dbos.StepOption{dbos.WithStepName("record-carried-hail")}, storeRetries...)...)
 	if err != nil {
-		return "", err
+		return openHail{}, err
 	}
-	return h.Question, nil
+	if _, err := dbos.RunWorkflow(ctx, hailWorkflow, HailInput{HailID: id}, dbos.WithWorkflowID(hailWorkflowID(id))); err != nil {
+		return openHail{}, err
+	}
+	return openHail{ID: id, Ref: body.Ref, Category: body.Category, Question: body.Question}, nil
+}
+
+// closeCarried is the close-carried step (#145): every carried hail still
+// open when the mission ends is closed, "closed unanswered: order <status>".
+func closeCarried(ctx dbos.Context, in MissionInput, open carriedHails, status string) error {
+	return storeStep(ctx, "close-carried", func(c context.Context, d *Daemon) error {
+		for _, h := range open {
+			if err := d.closeHailAs(c, in, &openHail{ID: h.ID}, ": order "+status); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // Cargo bay file names in a checkpoint's directory, next to one

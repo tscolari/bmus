@@ -247,6 +247,10 @@ func (d *Daemon) jettisonRepo(ctx context.Context, repo string, batch []Jettison
 	if err != nil {
 		return nil, nil, 0, err
 	}
+	// The latest landed checkpoint (#145) of every order that has ended
+	// goes, with its branch or without: nothing reads it once the order
+	// ended. Best effort.
+	sweepCheckpointRefs(ctx, dir, all)
 	protected, err := protectedBranches(ctx, dir, repo, all)
 	if err != nil {
 		return nil, nil, 0, err
@@ -304,11 +308,6 @@ func (d *Daemon) jettisonRepo(ctx context.Context, repo string, batch []Jettison
 			}
 			return deleted, skipped, kept, d.logJettisoned(ctx, deleted, orders, err)
 		}
-	}
-	// The order's latest landed checkpoint (#145) goes with its branch;
-	// best effort, as nothing reads it once the order has ended.
-	for _, b := range deleted {
-		runGit(ctx, dir, "update-ref", "-d", checkpointRef(strings.TrimPrefix(b.Branch, "bmus/"))) //nolint:errcheck
 	}
 	deleted, restored, err := d.restoreBases(ctx, repo, dir, deleted, orders)
 	kept += restored
@@ -473,4 +472,26 @@ func (d *Daemon) branchJettisoned(ctx context.Context, id, repo string, revParse
 		return time.Time{}, false, nil
 	}
 	return d.jettisonedAt(ctx, id, repo)
+}
+
+// sweepCheckpointRefs deletes from the clone at dir the checkpointRef of
+// every order in all that has ended (#145), best effort.
+func sweepCheckpointRefs(ctx context.Context, dir string, all []store.Order) {
+	refs, err := runGit(ctx, dir, "for-each-ref", "--format=%(refname)", "refs/bmus/checkpoints/")
+	if err != nil {
+		return
+	}
+	ended := map[string]bool{}
+	for _, o := range all {
+		switch o.State {
+		case store.OrderDone, store.OrderFailed, store.OrderBelayed, store.OrderWithdrawn, store.OrderSplit:
+			ended[o.ID] = true
+		}
+	}
+	for line := range strings.Lines(refs) {
+		ref := strings.TrimSpace(line)
+		if ended[strings.TrimPrefix(ref, "refs/bmus/checkpoints/")] {
+			runGit(ctx, dir, "update-ref", "-d", ref) //nolint:errcheck // best effort
+		}
+	}
 }

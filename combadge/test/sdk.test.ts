@@ -3062,6 +3062,36 @@ describe("sdk harness automatic checkpoints (#145)", () => {
     await run.result;
   });
 
+  it("lets a resumed run re-issue a carried tool_approval the captain allowed, once and without a hail; unanswered, it hails", async () => {
+    const dir = tempDir();
+    let first: PermissionResult | null | undefined;
+    const run = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      // The model rewords the description; the grant matches all the same.
+      first = await agent.canUseTool("Bash", { ...DEPLOY, description: "Ship it" });
+      await agent.canUseTool("Bash", DEPLOY);
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { grants: [{ tool: "Bash", input: DEPLOY }] } });
+    const hail = await run.nth(0);
+    expect(first).toEqual({ behavior: "allow", updatedInput: { ...DEPLOY, description: "Ship it" } });
+    // Single use: the second call is a hail of its own.
+    expect(hail).toMatchObject({ type: "hail", body: { category: "tool_approval", question: "Run `make deploy`?" } });
+    run.answer(`sdk-${ORDER}-1`, "allow", 0);
+    await run.result;
+
+    // Without the grant (the carried hail unanswered), the re-issue hails.
+    const plain = start(async function* (agent) {
+      await agent.nextInput();
+      yield init;
+      await agent.canUseTool("Bash", DEPLOY);
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir) });
+    expect(await plain.nth(0)).toMatchObject({ type: "hail", body: { category: "tool_approval", question: "Run `make deploy`?" } });
+    plain.answer(`sdk-${ORDER}-1`, "allow", 0);
+    await plain.result;
+  });
+
   /**
    * A run whose agent takes a turn each time the test calls turn(), after
    * the turn's change to the repo. events are the cadence's (SdkDeps.onCadence).

@@ -285,6 +285,8 @@ func testParkCheckpointOutlivesBeam(t *testing.T, before bool) {
 	h, err := hd.d.store.GetHail(t.Context(), "H-0001")
 	require.NoError(t, err)
 	require.Equal(t, store.HailOpen, h.Status)
+	require.True(t, h.Carried)
+	require.Equal(t, store.OrderAway, hd.order(t, id).State)
 	require.Empty(t, orderTexts(hd.logEntries(t), id, "hail H-0001 closed"))
 
 	if before {
@@ -433,4 +435,107 @@ func TestPullWipOverCap(t *testing.T) {
 	// A later checkpoint without WIP leaves no stale copy.
 	require.NoError(t, d.pullWip(t.Context(), beam, in, 4, comms.WorkRepo{Name: "app"}, local))
 	require.NoFileExists(t, wipBundleOf(local))
+}
+
+// parkedWithCarried starts a holodeck bridge on script, waits for H-0001
+// and the park checkpoint holding it, then kills sorell's beam: the order
+// parks with H-0001 carried (#145).
+func parkedWithCarried(t *testing.T, script string) (*holodeckBridge, *hdaemon, string) {
+	t.Helper()
+	b := newHolodeckBridge(t, script)
+	hd := b.start(t)
+	c := hd.addCrew(t)
+	id := hd.createOrder(t)
+	hd.waitHail(t, "H-0001")
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		cps, err := hd.d.store.ListCheckpoints(t.Context(), id)
+		require.NoError(ct, err)
+		require.Len(ct, cps, 1)
+	}, 30*time.Second, 20*time.Millisecond)
+	require.NoError(t, b.h.Kill(c.CurrentBeam))
+	require.Equal(t, CrewTourResult{Ended: store.CrewSickbay}, tourResult(t, hd.d, tourWorkflowID("sorell", 0)))
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		require.NotNil(ct, hd.order(ct, id).ParkedAt)
+	}, 30*time.Second, 20*time.Millisecond)
+	h, err := hd.d.store.GetHail(t.Context(), "H-0001")
+	require.NoError(t, err)
+	require.Equal(t, store.HailOpen, h.Status)
+	require.True(t, h.Carried)
+	// Nobody hails on a carried hail's account.
+	require.Equal(t, store.OrderAway, hd.order(t, id).State)
+	return b, hd, id
+}
+
+// #145: the resumed run asks the carried hail's question again: the new
+// hail is raised at once, not queued behind the carried one, which closes
+// as superseded, so the captain answers once.
+func TestCarriedHailSupersededByResumedRun(t *testing.T) {
+	t.Parallel()
+	script := filepath.Join(t.TempDir(), "again.json")
+	require.NoError(t, os.WriteFile(script, []byte(`[{"at_pct": 10, "commit": "a change"},
+		{"at_pct": 20, "write": "notes/wip.txt"},
+		{"at_pct": 30, "hail": {"category": "clarifying_question", "question": "Which way?", "options": ["left", "right"]}, "park_after_ms": 200},
+		{"at_pct": 40, "hail": {"category": "clarifying_question", "question": "Which way?", "options": ["left", "right"]}},
+		{"at_pct": 100, "report": {"summary": "asked again"}}]`), 0o600))
+	_, hd, id := parkedWithCarried(t, script)
+	requireOutcome(t, OutcomeRequested)(hd.d.ReenergizeCrew(t.Context(), "sorell"))
+	hd.waitHail(t, "H-0002")
+	e := hd.waitLog(t, "hail H-0001 closed unanswered")
+	require.Equal(t, "hail H-0001 closed unanswered: superseded by hail H-0002", e.Text)
+	h, err := hd.d.store.GetHail(t.Context(), "H-0001")
+	require.NoError(t, err)
+	require.Equal(t, store.HailTimedOut, h.Status)
+	require.NoError(t, hd.d.AnswerHail(t.Context(), "H-0002", "left", nil))
+	res := missionResult(t, hd.d, id)
+	require.Equal(t, MissionDone, res.Status, "%+v", res)
+}
+
+// #145: a carried hail still open when the mission ends is closed with it.
+func TestCarriedHailClosedWhenOrderEnds(t *testing.T) {
+	t.Parallel()
+	_, hd, id := parkedWithCarried(t, parkScript(t))
+	require.NoError(t, hd.d.BelayOrder(t.Context(), id, "scrapped"))
+	require.Equal(t, MissionBelayed, missionResult(t, hd.d, id).Status)
+	e := hd.waitLog(t, "hail H-0001 closed unanswered")
+	require.Equal(t, "hail H-0001 closed unanswered: order belayed", e.Text)
+}
+
+// #145: jettison's sweep drops the landed checkpoint ref of every ended
+// order and keeps an open order's.
+func TestSweepCheckpointRefs(t *testing.T) {
+	t.Parallel()
+	up := testRepo(t)
+	head := up.rev(t, "main")
+	dir := t.TempDir()
+	gitT(t, dir, "init", "-q", "--bare")
+	gitT(t, dir, "fetch", "-q", up.url, "main:refs/heads/main")
+	for _, id := range []string{"ORD-0001", "ORD-0002", "ORD-0003"} {
+		gitT(t, dir, "update-ref", checkpointRef(id), head)
+	}
+	sweepCheckpointRefs(t.Context(), dir, []store.Order{
+		{ID: "ORD-0001", State: store.OrderFailed}, {ID: "ORD-0002", State: store.OrderAway}, {ID: "ORD-0003", State: store.OrderDone},
+	})
+	require.Equal(t, checkpointRef("ORD-0002"), gitT(t, dir, "for-each-ref", "--format=%(refname)", "refs/bmus/"))
+}
+
+// #145: a carried tool_approval the captain allows while the order has no
+// run becomes a grant in the resumed run's order, with the call its
+// context names.
+func TestCarriedToolApprovalBecomesGrant(t *testing.T) {
+	t.Parallel()
+	script := filepath.Join(t.TempDir(), "grant.json")
+	require.NoError(t, os.WriteFile(script, []byte(`[{"at_pct": 10, "commit": "a change"},
+		{"at_pct": 30, "hail": {"category": "tool_approval", "question": "Run `+"`make deploy`"+`?", "options": ["allow", "deny"],
+			"context": {"tool": "Bash", "input": {"command": "make deploy"}}}, "park_after_ms": 200},
+		{"at_pct": 40, "progress": "resumed"},
+		{"at_pct": 100, "report": {"summary": "deployed"}}]`), 0o600))
+	b, hd, id := parkedWithCarried(t, script)
+	allow := 0
+	require.NoError(t, hd.d.AnswerHail(t.Context(), "H-0001", "", &allow))
+	requireOutcome(t, OutcomeRequested)(hd.d.ReenergizeCrew(t.Context(), "sorell"))
+	require.Equal(t, MissionDone, missionResult(t, hd.d, id).Status)
+	steps := resumedSteps(t, b.stepLog, id)
+	require.NotEmpty(t, steps)
+	require.Equal(t, []any{map[string]any{"tool": "Bash", "input": map[string]any{"command": "make deploy"}}}, steps[0]["grants"])
+	require.Contains(t, steps[0]["handover"], `the captain answered hail H-0001, which the earlier session asked: "Run `+"`make deploy`"+`?". The answer: "allow".`)
 }
