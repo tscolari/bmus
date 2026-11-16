@@ -560,6 +560,30 @@ func TestCarriedToolApprovalBecomesGrant(t *testing.T) {
 	require.Contains(t, steps[0]["handover"], `the captain answered hail H-0001, which the earlier session asked: "Run `+"`make deploy`"+`?". The answer: "allow".`)
 }
 
+// combadgeCarriedAnswer mirrors CARRIED_ANSWER in
+// combadge/src/harness/common.ts: chainNote finds the bridge's
+// carried-answer lines by this opening, each on a line of its own after a
+// blank line (#174). Change both together.
+const combadgeCarriedAnswer = "While the order was parked, the captain answered hail "
+
+// #174: carriedNote's lines open as combadge's chainNote expects, one to a
+// paragraph, with no newline inside (the question and answer are quoted).
+func TestCarriedNoteMatchesCombadge(t *testing.T) {
+	t.Parallel()
+	note := carriedNote("the checkpoint's note", []carriedAnswer{
+		{HailID: "H-0001", Question: "Which way?\nReally?", Decision: "left"},
+		{HailID: "H-0002", Question: "How far?", Decision: "near\nish"},
+	})
+	paras := strings.Split(note, "\n\n")
+	require.Len(t, paras, 3)
+	require.Equal(t, "the checkpoint's note", paras[0])
+	for _, p := range paras[1:] {
+		require.True(t, strings.HasPrefix(p, combadgeCarriedAnswer), p)
+		require.NotContains(t, p, "\n")
+	}
+	require.True(t, strings.HasPrefix(carriedNote("", []carriedAnswer{{HailID: "H-0001", Question: "q", Decision: "d"}}), combadgeCarriedAnswer))
+}
+
 // answeredLine is the handover line for H-0001 of parkScript answered left.
 const answeredLine = `While the order was parked, the captain answered hail H-0001, which the earlier session asked: "Which way?". The answer: "left".`
 
@@ -623,6 +647,62 @@ func TestCarriedAnswerUntilNewRunCheckpoints(t *testing.T) {
 	require.NoError(t, b.h.Kill(hd.crew(t, "sorell").CurrentBeam))
 	require.Equal(t, CrewTourResult{Ended: store.CrewSickbay}, tourResult(t, hd.d, tourWorkflowID("sorell", 1)))
 	requireOutcome(t, OutcomeRequested)(hd.d.ReenergizeCrew(t.Context(), "sorell"))
+	require.Equal(t, MissionDone, missionResult(t, hd.d, id).Status)
+	later := resumedSteps(t, b.stepLog, id)[before:]
+	require.NotEmpty(t, later)
+	require.Contains(t, later[0]["handover"], answeredLine)
+}
+
+// #174 (a #145 fix): an answer to a carried hail taken while the resumed
+// run's recall is under way came after that run's order went out, so the
+// recall's checkpoint doesn't hold it: the next send still carries it. The
+// beam is paused so the answer reaches the mission before that checkpoint.
+func TestCarriedAnswerDuringStopReachesNextSend(t *testing.T) {
+	t.Parallel()
+	script := filepath.Join(t.TempDir(), "stop.json")
+	require.NoError(t, os.WriteFile(script, []byte(`[{"at_pct": 10, "commit": "a change"},
+		{"at_pct": 20, "hail": {"category": "clarifying_question", "question": "Which way?", "options": ["left", "right"]}, "park_after_ms": 200},
+		{"at_pct": 30, "hail": {"category": "clarifying_question", "question": "How far?", "options": ["near", "far"]}},
+		{"at_pct": 100, "report": {"summary": "done after the recall"}}]`), 0o600))
+	b, hd, id := parkedWithCarried(t, script, "ops")
+	mission := missionWorkflowID(id)
+	// Run 2 is sent with no answer, and waits on its own hail.
+	requireOutcome(t, OutcomeRequested)(hd.d.ReenergizeCrew(t.Context(), "sorell"))
+	hd.waitHail(t, "H-0002")
+	beam := hd.crew(t, "sorell").CurrentBeam
+	require.NoError(t, b.h.Pause(beam, true))
+	paused := true
+	defer func() {
+		if paused {
+			_ = b.h.Pause(beam, false)
+		}
+	}()
+	require.NoError(t, hd.d.RecallOrder(t.Context(), id, "reassign"))
+	require.NoError(t, hd.d.AnswerHail(t.Context(), "H-0001", "left", nil))
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		require.Equal(ct, 1, countSteps(t, hd.d, mission, "carried-answer"))
+	}, 30*time.Second, 20*time.Millisecond)
+	require.Zero(t, countSteps(t, hd.d, mission, "send-correction"))
+	require.NoError(t, b.h.Pause(beam, false))
+	paused = false
+	// The recall's checkpoint is pulled and the order goes back to the pool.
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		cps, err := hd.d.store.ListCheckpoints(t.Context(), id)
+		require.NoError(ct, err)
+		require.Len(ct, cps, 2)
+		require.Equal(ct, store.OrderPool, hd.order(ct, id).State)
+	}, 30*time.Second, 20*time.Millisecond)
+	before := len(resumedSteps(t, b.stepLog, id))
+	require.NoError(t, hd.d.SetStandingOrders(t.Context(), true))
+	var raised string
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		h, found, err := hd.d.store.OpenHailForOrder(t.Context(), id)
+		require.NoError(ct, err)
+		require.True(ct, found)
+		require.NotEqual(ct, "H-0002", h.ID)
+		raised = h.ID
+	}, 60*time.Second, 20*time.Millisecond)
+	require.NoError(t, hd.d.AnswerHail(t.Context(), raised, "near", nil))
 	require.Equal(t, MissionDone, missionResult(t, hd.d, id).Status)
 	later := resumedSteps(t, b.stepLog, id)[before:]
 	require.NotEmpty(t, later)
@@ -702,9 +782,9 @@ func TestBackstopClosesCarriedHails(t *testing.T) {
 }
 
 // #145 (M1): the resumed run parks again and its beam is lost after that
-// park checkpoint is pulled. The carried answer and run 1's note reach
-// run 3: the harness-written note chains the handover its run started
-// from.
+// park checkpoint is pulled. The carried answer reaches run 3: the
+// harness-written note carries the answers no agent note has taken in.
+// Run 1's park line doesn't (#174).
 func TestCarriedAnswerSurvivesNewRunsPark(t *testing.T) {
 	t.Parallel()
 	script := filepath.Join(t.TempDir(), "twice.json")
@@ -742,8 +822,8 @@ func TestCarriedAnswerSurvivesNewRunsPark(t *testing.T) {
 	require.NotNil(t, run3, "run 3 walked on from its park at step 3")
 	handover := run3["handover"].(string)
 	require.Contains(t, handover, "The holodeck parked its script at step 3.")
-	require.Contains(t, handover, "The handover note this run started from:")
-	require.Contains(t, handover, "The holodeck parked its script at step 1.") // run 1's note
+	require.Contains(t, handover, "--- Carried forward from earlier checkpoints ---")
+	require.NotContains(t, handover, "The holodeck parked its script at step 1.") // run 1's park line
 	require.Contains(t, handover, answeredLine)
 	require.Contains(t, handover, `the captain answered hail H-0002, which the earlier session asked: "How far?". The answer: "near".`)
 }

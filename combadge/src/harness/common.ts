@@ -16,7 +16,7 @@ import {
   type UsageBody,
   type WorkRepo,
 } from "../protocol.js";
-import { bundleWip, bundleWork, recordEmitted, snapshotNote, snapshotWip, type Snapshot } from "../repos.js";
+import { bundleWip, bundleWork, isSnapshotNoteLine, recordEmitted, snapshotNote, snapshotWip, type Snapshot } from "../repos.js";
 import type { Order } from "./types.js";
 
 /** Rejects with the signal's reason once it aborts, if p hasn't settled. */
@@ -93,19 +93,112 @@ export async function workKey(order: Order): Promise<string> {
   return keys.join(" ");
 }
 
+/** The opening of each line the bridge adds for a carried hail's answer (carriedNote in internal/bridge). */
+export const CARRIED_ANSWER = "While the order was parked, the captain answered hail ";
 /**
- * A harness-written checkpoint note (#145) chained with what the next run
- * needs from earlier ones: the latest note the agent wrote in this run, and
- * the handover note this run started from (which holds the notes before
- * it, the carried answers and the WIP lines). A later run gets only the
- * note of the checkpoint it resumes from.
+ * The most of the agent's note a harness-written note carries forward (#174).
+ * Undelivered answers are never cut: the order's hails bound them.
+ */
+export const CHAIN_MAX_BYTES = 8 * 1024;
+
+const CHAIN_BEGIN = "--- Carried forward from earlier checkpoints ---";
+const CHAIN_END = "--- End of what was carried forward ---";
+const CHAIN_CUT = "(Cut to stay under 8 KiB: ";
+const ANSWERS = "The captain's answers to hails carried from a park, which no handover note of the agent's has taken in yet:";
+const AGENT_THIS_RUN = "The agent's latest handover note, written in this run:";
+const AGENT_EARLIER = "The agent's latest handover note, written in an earlier run:";
+const NO_AGENT = "The agent has written no handover note yet.";
+const CUT_MARK = "[...]";
+
+/** What a handover note carries for the next harness note: the agent's latest note and the answers no agent note has taken in. */
+export interface Chained {
+  agent?: string;
+  answers: string[];
+}
+
+/**
+ * What the handover note a run started from carries forward (#174), from
+ * the note as the bridge sent it (Order.sentHandover: serve's WIP lines are
+ * not in it). Trailing lines opening with CARRIED_ANSWER are the bridge's.
+ * The rest is the checkpoint's note: a harness-written one (it has the
+ * CHAIN_BEGIN block) gives its block's agent note and answers, and its own
+ * text (park, stop and cadence lines) is dropped; any other is the agent's
+ * own note, without the snapshotNote lines its checkpoint added.
+ */
+export function chainedFrom(started: string | undefined): Chained {
+  const paras = (started ?? "").trim().split("\n\n");
+  const appended: string[] = [];
+  while (paras.length > 0 && isAnswer(paras[paras.length - 1]!)) appended.unshift(paras.pop()!.trim());
+  const lines = paras.join("\n\n").split("\n");
+  const begin = lines.indexOf(CHAIN_BEGIN);
+  const end = lines.lastIndexOf(CHAIN_END);
+  if (begin >= 0 && end > begin) {
+    const block = lines.slice(begin + 1, end);
+    let i = 0;
+    const answers: string[] = [];
+    while (i < block.length && block[i]!.startsWith(CHAIN_CUT)) i++;
+    if (block[i] === ANSWERS) for (i++; i < block.length && isAnswer(block[i]!); i++) answers.push(block[i]!.trim());
+    while (i < block.length && block[i]!.trim() === "") i++;
+    const header = block[i];
+    const agent = header === AGENT_THIS_RUN || header === AGENT_EARLIER ? block.slice(i + 1).join("\n").trim() : "";
+    return { ...(agent !== "" && { agent }), answers: [...answers, ...appended] };
+  }
+  const last = paras[paras.length - 1];
+  if (last !== undefined && last.split("\n").every(isSnapshotNoteLine)) paras.pop();
+  const agent = paras.join("\n\n").trim();
+  return { ...(agent !== "" && { agent }), answers: appended };
+}
+
+/**
+ * The agent's request_handover note as a checkpoint stores it (#174): a
+ * line equal to CHAIN_BEGIN or CHAIN_END, or opening with CARRIED_ANSWER,
+ * gets "> " before it, so a note quoting a harness note or an answer never
+ * reads as a harness note's block or as the bridge's answers (chainedFrom).
+ */
+export function agentNoteOf(note: string): string {
+  return note
+    .split("\n")
+    .map((l) => (l === CHAIN_BEGIN || l === CHAIN_END || l.startsWith(CARRIED_ANSWER) ? `> ${l}` : l))
+    .join("\n");
+}
+
+const isAnswer = (line: string) => line.startsWith(CARRIED_ANSWER) && !line.trim().includes("\n");
+const bytes = (s: string) => Buffer.byteLength(s, "utf8");
+
+/**
+ * A harness-written checkpoint note (#145): own, then what the next run
+ * needs from earlier checkpoints, between CHAIN_BEGIN and CHAIN_END (#174).
+ * That is the agent's latest note (agent, this run's request_handover note,
+ * else the newest one in started, the handover note the run started from as
+ * the bridge sent it) and the carried answers not yet delivered: those in
+ * started, unless this run's agent wrote a note, which came after them.
+ * Earlier park, stop, cadence, WIP and snapshot lines are not carried. The
+ * agent's note is cut from its end to CHAIN_MAX_BYTES, ending "[...]", and
+ * a cut line gives the bytes cut; the answers are never cut.
+ * A later run gets only the note of the checkpoint it resumes from.
  */
 export function chainNote(own: string, started: string | undefined, agent: string | undefined): string {
-  const parts = [own.trimEnd()];
-  if (agent !== undefined && agent.trim() !== "") parts.push(`The agent's latest handover note in this run:\n${agent.trim()}`);
-  if (started !== undefined && started.trim() !== "") parts.push(`The handover note this run started from:\n${started.trim()}`);
-  return parts.join("\n\n");
+  const thisRun = agent !== undefined && agent.trim() !== "";
+  const from = chainedFrom(started);
+  const note = thisRun ? agent.trim() : from.agent;
+  const answers = thisRun ? [] : [...new Set(from.answers)];
+  const header = thisRun ? AGENT_THIS_RUN : AGENT_EARLIER;
+  const render = (answers: string[], note: string | undefined, cut: number) =>
+    [
+      CHAIN_BEGIN,
+      ...(cut > 0 ? [`${CHAIN_CUT}${cut} bytes were cut from the end of the agent's note.)`] : []),
+      ...(answers.length > 0 ? [ANSWERS, ...answers, ""] : []),
+      ...(note === undefined ? [NO_AGENT] : [header, note]),
+      CHAIN_END,
+    ].join("\n");
+  if (note === undefined || bytes(note) <= CHAIN_MAX_BYTES) return `${own.trimEnd()}\n\n${render(answers, note, 0)}`;
+  const head = Buffer.from(note, "utf8").subarray(0, CHAIN_MAX_BYTES - bytes(` ${CUT_MARK}`)).toString("utf8").replace(/\uFFFD+$/, "").trimEnd();
+  const block = render(answers, `${head} ${CUT_MARK}`, bytes(note) - bytes(head));
+  return `${own.trimEnd()}\n\n${block}`;
 }
+
+/** The handover note the order's run started from, as the bridge sent it (#174): chainNote's `started`. */
+export const startedFrom = (order: Order): string | undefined => order.sentHandover ?? order.body.handover;
 
 /** note with notes, if any, after a blank line. */
 export function withNotes(note: string, notes: string[]): string {

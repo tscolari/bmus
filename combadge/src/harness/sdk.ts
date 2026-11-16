@@ -251,7 +251,7 @@ import {
   type UsageBody,
   USAGE_EVERY_TURNS,
 } from "../protocol.js";
-import { abortable, Budget, BudgetExceeded, bundleCheckpoint, checkpointFiles, chainNote, escalate, orderDir, Stopped, withNotes, workKey, type StopCommand } from "./common.js";
+import { abortable, agentNoteOf, Budget, BudgetExceeded, bundleCheckpoint, checkpointFiles, chainNote, escalate, orderDir, startedFrom, Stopped, withNotes, workKey, type StopCommand } from "./common.js";
 import { git, wipRef, type RepoCheckout } from "../repos.js";
 import type { Emit, Harness, HarnessOptions, HarnessReport, Inbound, Order, Role, SelfCheck } from "./types.js";
 
@@ -375,8 +375,8 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
       const state: RunState = { handovers: 0, handing: Promise.resolve(), findings: new Set(), since: {} };
       /** What a resumed run gets to read: the commits, the WIP and this note, not the transcript. */
       const WHERE_IT_STANDS = `The commits on bmus/${order.id} and the uncommitted work on ${wipRef(order.id)} (restored for the next run when it can be) show where the work stands; the session's transcript stays in the bridge's cargo bay.`;
-      /** A harness-written note, chained with the agent's latest and the run's starting handover (#145). */
-      const harnessNote = (own: string) => chainNote(own, order.body.handover, state.agentNote);
+      /** A harness-written note, chained with the agent's latest and the answers not yet taken in (#145, #174). */
+      const harnessNote = (own: string) => chainNote(own, startedFrom(order), state.agentNote);
       /** Hails that may park, held now, by ref, with their park timers. */
       const held = new Map<string, { call: Parked; timer: NodeJS.Timeout }>();
       /**
@@ -1641,8 +1641,9 @@ function combadgeServer(
         "request_handover",
         `Checkpoint the work for whoever continues it: bundles the commits on branch bmus/${order.id} (commit there first; other branches are not included) with a snapshot of the uncommitted changes, copies this session's transcript and stores the note.`,
         { note: z.string() },
-        async ({ note }) => {
+        async ({ note: written }) => {
           if (live.aborted) return dropped();
+          const note = agentNoteOf(written);
           try {
             const body = await checkpoint(state, order, dirs.workDir, (dir, since) => writeCheckpoint(dir, order, transcriptOf(state, dirs.repo), note, { since }));
             state.agentNote = note;

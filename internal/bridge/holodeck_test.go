@@ -360,6 +360,10 @@ func requireNoBackstop(t *testing.T, entries []store.LogEntry) {
 	}
 }
 
+// noChain is what a holodeck-written note carries forward when the agent
+// wrote no note and no answer is carried (#174).
+const noChain = "\n\n--- Carried forward from earlier checkpoints ---\nThe agent has written no handover note yet.\n--- End of what was carried forward ---"
+
 // requireCheckpointFiles checks a checkpoint row's files are in the cargo
 // bay under <home>/cargo/<order>/<beam>-<seq>/: the transcript, the note and
 // app's bundle, which carries bmus/<order> at commit.

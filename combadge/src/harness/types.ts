@@ -17,6 +17,14 @@ export interface Order {
    * carries on from it.
    */
   usage?: UsageBody;
+  /**
+   * The handover note as the bridge sent it (#174), before serve added its
+   * WIP lines to body.handover: harness-written notes chain from it
+   * (startedFrom, chainNote), so a start's WIP lines go no further.
+   * serve always sets it, "" when the bridge sent none; only a harness run
+   * without serve (a test) goes without it, and reads body.handover.
+   */
+  sentHandover?: string;
 }
 
 /**

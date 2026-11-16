@@ -388,12 +388,22 @@ export async function snapshotWip(checkout: RepoCheckout, orderId: string, opts:
 
 let snapshots = 0;
 
+const NO_SNAPSHOT = "no snapshot of uncommitted work: ";
+const LEFT_OUT = "left out of the snapshot of uncommitted work, over 100 MiB each: ";
+
 /** The lines a checkpoint's note gains for what its WIP snapshot left out (#145). */
 export function snapshotNote(name: string, snap: Snapshot): string[] {
   const lines: string[] = [];
-  if (snap.skipped !== undefined) lines.push(`Repo ${name}: no snapshot of uncommitted work: ${snap.skipped}.`);
-  if (snap.large.length > 0) lines.push(`Repo ${name}: left out of the snapshot of uncommitted work, over 100 MiB each: ${snap.large.join(", ")}.`);
+  if (snap.skipped !== undefined) lines.push(`Repo ${name}: ${NO_SNAPSHOT}${snap.skipped}.`);
+  if (snap.large.length > 0) lines.push(`Repo ${name}: ${LEFT_OUT}${snap.large.join(", ")}.`);
   return lines;
+}
+
+/** Whether line is one of snapshotNote's (#174): chainNote drops them from an earlier checkpoint's note. */
+export function isSnapshotNoteLine(line: string): boolean {
+  if (!line.startsWith("Repo ")) return false;
+  const at = line.indexOf(": ");
+  return at > 0 && (line.startsWith(NO_SNAPSHOT, at + 2) || line.startsWith(LEFT_OUT, at + 2));
 }
 
 /**
