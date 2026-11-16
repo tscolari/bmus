@@ -60,7 +60,12 @@ CREATE TABLE IF NOT EXISTS orders (
     -- 0 for unlimited, as budget_tokens. budget_extended counts the
     -- extensions the captain granted (#111).
     budget_turns    INTEGER NOT NULL DEFAULT 0,
-    budget_extended INTEGER NOT NULL DEFAULT 0
+    budget_extended INTEGER NOT NULL DEFAULT 0,
+    -- A campaign's orders (#180): kind is work or review, task the id of
+    -- the task workflow the order belongs to, '' outside a campaign. Older
+    -- databases are refused (requiredColumns).
+    kind            TEXT NOT NULL DEFAULT 'work',
+    task            TEXT NOT NULL DEFAULT ''
 );
 
 -- The repos an order works on (#51), in the order's list order (pos from
@@ -99,7 +104,8 @@ CREATE TABLE IF NOT EXISTS order_usage (
 
 -- A hail from a beam has an order and a crew member and no deliver_to. A
 -- hail a bridge workflow raises (#151) has neither: deliver_to is that
--- workflow's id. Older databases are refused (requiredColumns).
+-- workflow's id, and raise_key (#180) tells apart its raises of one
+-- category. Older databases are refused (requiredColumns).
 CREATE TABLE IF NOT EXISTS hails (
     id                TEXT PRIMARY KEY,
     order_id          TEXT REFERENCES orders(id),
@@ -129,7 +135,8 @@ CREATE TABLE IF NOT EXISTS hails (
     -- 1 for a hail carried across a park on beam loss (#145): it stays open
     -- while other hails of its order come and go, and its order isn't
     -- hailing on its account.
-    carried             INTEGER NOT NULL DEFAULT 0
+    carried             INTEGER NOT NULL DEFAULT 0,
+    raise_key           TEXT NOT NULL DEFAULT ''
 );
 
 -- The budget extensions the captain granted (#119), one per budget hail
@@ -249,6 +256,58 @@ CREATE INDEX IF NOT EXISTS orders_parent ON orders (parent_id, state);
 -- An order's dependents (#142): the cascade when it ends failed, belayed
 -- or withdrawn.
 CREATE INDEX IF NOT EXISTS order_after_after ON order_after (after_id);
--- One hail per bridge raiser and category (#151): a re-run of the raising
--- step finds the first.
-CREATE UNIQUE INDEX IF NOT EXISTS hails_deliver_to ON hails (deliver_to, category) WHERE deliver_to IS NOT NULL;
+-- One hail per bridge raiser, category and raise key (#151, #180): a
+-- re-run of the raising step finds the first.
+CREATE UNIQUE INDEX IF NOT EXISTS hails_raise ON hails (deliver_to, category, raise_key) WHERE deliver_to IS NOT NULL;
+-- A task's orders by kind, and an order by the key it was created under
+-- (#180, InsertOrderOnce).
+CREATE INDEX IF NOT EXISTS orders_task ON orders (task, kind);
+CREATE INDEX IF NOT EXISTS orders_created_by ON orders (created_by);
+
+-- Campaigns (#180, spec/campaigns-stage-3-plan-2026-11-16.md section 1).
+CREATE TABLE IF NOT EXISTS campaigns (
+    id              TEXT PRIMARY KEY,                -- C-0001
+    state           TEXT NOT NULL DEFAULT 'running', -- running, belaying, ended
+    land            TEXT NOT NULL DEFAULT 'push',    -- push; pr and merge are stage 5
+    repo            TEXT NOT NULL,
+    base_ref        TEXT NOT NULL,
+    division        TEXT NOT NULL DEFAULT '',        -- where work orders go
+    assignee        TEXT NOT NULL DEFAULT '',        -- or to whom
+    review_division TEXT NOT NULL DEFAULT 'science',
+    max_rounds      INTEGER NOT NULL DEFAULT 3,
+    created_at      TIMESTAMP NOT NULL,
+    ended_at        TIMESTAMP
+);
+
+-- A campaign's tasks, one per tracker item (#180).
+CREATE TABLE IF NOT EXISTS campaign_tasks (
+    campaign_id  TEXT NOT NULL REFERENCES campaigns(id),
+    ref          TEXT NOT NULL,                -- canonical tracker ref
+    workflow_id  TEXT NOT NULL UNIQUE,         -- campaign/<id>/task/<ref>
+    state        TEXT NOT NULL DEFAULT 'working',
+        -- working, reviewing, triage, fixing, landing, stalled, landed, dropped
+    round        INTEGER NOT NULL DEFAULT 1,
+    max_rounds   INTEGER NOT NULL,             -- the campaign's, raised by a retry past it
+    branch       TEXT NOT NULL,                -- where the land pushes
+    implementer  TEXT NOT NULL DEFAULT '',     -- round 1's assignee
+    head         TEXT NOT NULL DEFAULT '',     -- latest done work order
+    head_commit  TEXT NOT NULL DEFAULT '',
+    review_base  TEXT NOT NULL DEFAULT '',     -- the commit round 1 started from
+    open_order   TEXT NOT NULL DEFAULT '',
+    open_hail    TEXT NOT NULL DEFAULT '',
+    why          TEXT NOT NULL DEFAULT '',     -- the stall's reason, or the land's error
+    landed_at    TIMESTAMP,
+    PRIMARY KEY (campaign_id, ref)
+);
+-- One open task per tracker item, across campaigns.
+CREATE UNIQUE INDEX IF NOT EXISTS campaign_tasks_open ON campaign_tasks (ref)
+    WHERE state NOT IN ('landed', 'dropped');
+
+-- Who worked on a task (#180): written in the claim of each of its work
+-- orders, and kept when a recall clears the order's assignee. A crew
+-- member here never claims the task's review orders.
+CREATE TABLE IF NOT EXISTS task_workers (
+    task    TEXT NOT NULL,
+    crew_id TEXT NOT NULL REFERENCES crew(id),
+    PRIMARY KEY (task, crew_id)
+);
