@@ -143,7 +143,9 @@ export async function checkoutRepos(workDir: string, orderId: string, repos: rea
       const kept = new KeptWip(dir, orderId, notes);
       await kept.load();
       const wip = fresh ? await placeWip(dir, orderId, local, "checkout", existing, kept) : await placeWip(dir, orderId, shipped, "bundle", existing, kept);
-      if (!fresh && local !== undefined && (shipped === undefined || (await treeOf(dir, local)) !== (await treeOf(dir, shipped)))) {
+      // Not when the checkout's WIP is its live work tree (a kept checkout),
+      // nor when the shipped WIP is kept already: the shipped one stays.
+      if (!fresh && !existing && wip?.kept === undefined && local !== undefined && (shipped === undefined || (await treeOf(dir, local)) !== (await treeOf(dir, shipped)))) {
         // The bridge shipped older work than this beam last had (#145).
         await kept.set(local, `this beam's own uncommitted work (${short(local)}) differs from the shipped checkpoint's, which the bridge has as the newest`);
       }

@@ -340,6 +340,27 @@ describe("work in progress (#145)", () => {
     expect(note).toContain(`it is kept as ${KEPT} in ${got!.dir}`);
   });
 
+  it("keeps the shipped WIP, not the live work tree, when a kept checkout with changes gets an order the bridge shipped from elsewhere", async () => {
+    const dir = tempDir();
+    const c = await dirty(dir);
+    await bundleCheckpoint(path.join(dir, "cp"), order([c])); // this beam emitted WIP1
+    const other = path.join(dir, "other");
+    git(dir, "clone", "-q", "--branch", `bmus/${ORDER}`, c.dir, other);
+    fs.writeFileSync(path.join(other, "elsewhere.txt"), "elsewhere\n");
+    const wip2 = (await snapshotWip({ name: "app", dir: other, base_ref: "main", base_commit: c.base_commit }, ORDER)).commit!;
+    const shipped = path.join(dir, "work", ORDER, "in", "app.bundle");
+    fs.mkdirSync(path.dirname(shipped), { recursive: true });
+    git(other, "bundle", "create", "--quiet", shipped, `refs/heads/bmus/${ORDER}`, WIP);
+    fs.writeFileSync(path.join(c.dir, "later.txt"), "later\n"); // the kept checkout's own live changes
+    const before = git(c.dir, "status", "--porcelain");
+    const [got] = await checkoutRepos(path.join(dir, "work"), ORDER, [{ name: "app", base_ref: "main", bundle_path: shipped }]);
+    expect(got!.dir).toBe(c.dir);
+    expect(got!.wip).toMatchObject({ commit: wip2, from: "bundle", restored: false, kept: "the work tree already had uncommitted changes" });
+    expect(git(c.dir, "rev-parse", KEPT)).toBe(wip2);
+    expect(git(c.dir, "status", "--porcelain")).toBe(before);
+    expect(wipNote(ORDER, [got!])).toHaveLength(1);
+  });
+
   it("restores nothing when this beam's agent dropped the change the shipped checkpoint holds", async () => {
     const dir = tempDir();
     const c = await dirty(dir);
