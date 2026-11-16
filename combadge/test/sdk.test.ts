@@ -244,6 +244,22 @@ class Agent {
     return (await this.callTools([[name, args]]))[0]!;
   }
 
+  /** The in-process tools' descriptions, by name, as the CLI lists them. */
+  async toolDescriptions(): Promise<Record<string, string>> {
+    const server = this.options.mcpServers?.combadge;
+    if (!server || server.type !== "sdk") throw new Error("no combadge sdk server");
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    await server.instance.connect(a);
+    const client = new Client({ name: "fake-agent", version: "0" });
+    await client.connect(b);
+    try {
+      return Object.fromEntries((await client.listTools()).tools.map((t) => [t.name, t.description ?? ""]));
+    } finally {
+      await client.close();
+      await server.instance.close();
+    }
+  }
+
   /** Calls several tools at once over one MCP client. */
   async callTools(calls: [name: string, args: Record<string, unknown>][]) {
     const server = this.options.mcpServers?.combadge;
@@ -513,6 +529,46 @@ describe("sdk harness", () => {
       expect(await run.result).toEqual({ summary: "did it again", usage: { input_tokens: 120, output_tokens: 11 } });
       expect(run.options().systemPrompt).not.toMatchObject({ append: expect.stringContaining("verdict") });
     }
+  });
+
+  it("fails a review order with no base and round before the query starts, and treats review without kind as work (#181)", async () => {
+    const dir = tempDir();
+    const run = start(async function* () {
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { kind: "review" } });
+    await expect(run.result).rejects.toThrow(`order ${ORDER} is a review with no review base and round`);
+    expect(run.queries).toHaveLength(0);
+
+    // The prompt and the report tool decide on one value: without kind review both are work's.
+    const work = start(async function* (agent) {
+      yield init;
+      expect(await agent.callTool("report", { summary: "did it" })).toMatchObject({ content: [{ text: "report recorded; finish now" }] });
+      yield success;
+    }, { dir, repo: dir, claudePath: fakeClaude(dir), body: { review: { base: "abc", round: 1 } } });
+    await work.result;
+    expect(work.options().systemPrompt).toMatchObject({ append: expect.stringContaining("Commit your work on it") });
+  });
+
+  it("describes request_handover and report for the order's kind (#181)", async () => {
+    const dir = tempDir();
+    const descriptions = async (body: Partial<OrderBody>) => {
+      let got: Record<string, string> = {};
+      const run = start(async function* (agent) {
+        yield init;
+        got = await agent.toolDescriptions();
+        yield success;
+      }, { dir, repo: dir, claudePath: fakeClaude(dir), body });
+      await run.result;
+      return got;
+    };
+    const review = await descriptions({ kind: "review", review: { base: "abc", round: 1 } });
+    expect(review.request_handover).toContain("Checkpoint the review");
+    expect(review.request_handover).toContain("Commit nothing");
+    expect(review.request_handover).not.toContain("commit there first");
+    expect(review.report).toContain("verdict");
+    const work = await descriptions({});
+    expect(work.request_handover).toContain("commit there first");
+    expect(work.report).not.toContain("verdict");
   });
 
   it("gives a review order review instructions in place of the work lines, naming the base (#181)", async () => {

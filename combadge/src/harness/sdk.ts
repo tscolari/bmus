@@ -37,7 +37,10 @@
  *     anything else denies with the decision as the message.
  * - In-process tools (MCP server `combadge`, pre-allowed):
  *   - `progress(pct, note)` emits progress.
- *   - `report(summary, artifacts?)` records the order's report.
+ *   - `report(summary, artifacts?)` records the order's report. For a review
+ *     order (#181, reviewOf) it also takes `verdict` and refuses a call
+ *     without one; a work order's has no verdict field, and zod strips one.
+ *     A review order with no base and round fails before the query starts.
  *   - `tracker_comment({ref, body})` and `tracker_close({ref, reason?})`, for
  *     every role (#54): ask the bridge to comment on or close an item of its
  *     issue tracker, as a `tracker_comment` or `tracker_close` hail
@@ -235,6 +238,7 @@ import {
   MAX_VERDICT_PATH,
   MAX_VERDICT_TITLE,
   type Verdict,
+  type OrderReview,
   MAX_REORDER_CHANGES,
   MAX_REORDER_IDS,
   MAX_REORDER_ONTO,
@@ -721,6 +725,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
         if (order.repos.length !== 1) {
           throw new Error(`the sdk harness works in exactly one repo; order ${order.id} has ${order.repos.length}`);
         }
+        const review = reviewOf(order);
         const checkout = order.repos[0]!;
         const repo = checkout.dir;
         const claude = claudePath ?? findOnPath("claude", env.PATH);
@@ -730,7 +735,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
           pathToClaudeCodeExecutable: claude,
           permissionMode: "bypassPermissions",
           allowDangerouslySkipPermissions: true,
-          systemPrompt: { type: "preset", preset: "claude_code", append: instructions(order, checkout, opts.role) },
+          systemPrompt: { type: "preset", preset: "claude_code", append: instructions(order, checkout, review, opts.role) },
           hooks: {
             PreToolUse: [
               { hooks: [budgetPolicy, recordTranscript(state), gitPushPolicy] },
@@ -766,7 +771,7 @@ export function sdkHarness(opts: HarnessOptions, deps: Partial<SdkDeps> = {}): H
           const perQuery: Options = {
             abortController: q,
             canUseTool: canUseTool(hailIn(q), { take: takeIn(q), running: (id) => running.add(id) }, budgetGate(hailIn(q))),
-            mcpServers: { [MCP_SERVER]: combadgeServer(order, checkpointReady, emit, state, { repo, workDir }, q.signal, hailIn(q), opts.role) },
+            mcpServers: { [MCP_SERVER]: combadgeServer(order, checkpointReady, emit, state, { repo, workDir }, q.signal, hailIn(q), review, opts.role) },
             ...(resume !== undefined && { resume }),
           };
           const chain = () => q.abort(signal.reason);
@@ -1564,6 +1569,8 @@ function combadgeServer(
   live: AbortSignal,
   /** Raises the hails of split_order, reorder_orders and the tracker tools. */
   hails: Hail,
+  /** What a review order reviews (reviewOf); undefined for a work order. */
+  review: OrderReview | undefined,
   /** Command (--role command) gets split_order and reorder_orders. */
   role?: Role,
 ) {
@@ -1673,7 +1680,7 @@ function combadgeServer(
           return Promise.resolve(text("progress recorded"));
         },
       ),
-      order.body.kind === "review"
+      review
         ? tool(
             "report",
             "Record the review's final report: a summary of what you found and the verdict. " +
@@ -1699,7 +1706,10 @@ function combadgeServer(
           ),
       tool(
         "request_handover",
-        `Checkpoint the work for whoever continues it: bundles the commits on branch bmus/${order.id} (commit there first; other branches are not included) with a snapshot of the uncommitted changes, copies this session's transcript and stores the note.`,
+        review
+          ? "Checkpoint the review for whoever continues it: copies this session's transcript and stores the note, which should say what you have checked, what you found so far and what is left. " +
+              "Commit nothing for it: a review changes nothing."
+          : `Checkpoint the work for whoever continues it: bundles the commits on branch bmus/${order.id} (commit there first; other branches are not included) with a snapshot of the uncommitted changes, copies this session's transcript and stores the note.`,
         { note: z.string() },
         async ({ note: written }) => {
           if (live.aborted) return dropped();
@@ -1914,12 +1924,22 @@ function orderPrompt(order: Order): string {
   return `Order ${order.id}: ${order.body.title}\n\n${order.body.body}`;
 }
 
-function instructions(order: Order, checkout: RepoCheckout, role?: Role): string {
+/**
+ * What a review order reviews (#181), undefined for a work order. A review
+ * order without its base and round can't be reviewed: it throws, failing
+ * the run before the query starts.
+ */
+export function reviewOf(order: Order): OrderReview | undefined {
+  if (order.body.kind !== "review") return undefined;
+  if (!order.body.review) throw new Error(`order ${order.id} is a review with no review base and round`);
+  return order.body.review;
+}
+
+function instructions(order: Order, checkout: RepoCheckout, review: OrderReview | undefined, role?: Role): string {
   const handover = order.body.handover;
   const start = handover
     ? `already checked out at ${checkout.base_commit.slice(0, 12)}, the checkpoint this order resumes from (the work started from ${checkout.base_ref})`
     : `already checked out from ${checkout.base_ref} (${checkout.base_commit.slice(0, 12)})`;
-  const review = order.body.kind === "review" ? order.body.review : undefined;
   const lines = review
     ? [
         "You are a crew member reviewing another crew member's work for the captain, who is not watching this session.",
