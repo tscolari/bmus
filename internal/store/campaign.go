@@ -3,6 +3,9 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -174,4 +177,110 @@ func (s *Store) EligibleReviewers(ctx context.Context, task, division string) ([
 		ids = append(ids, id)
 	}
 	return ids, rows.Err()
+}
+
+// TaskWorkflowID is the id of campaign campaignID's task workflow for
+// tracker ref ref, campaign/<id>/task/<ref>: an order's Task and the
+// task's workflow_id.
+func TaskWorkflowID(campaignID, ref string) string {
+	return "campaign/" + campaignID + "/task/" + ref
+}
+
+// ParseTaskID splits a task workflow id (TaskWorkflowID) into its
+// campaign and ref. ok is false for an id of another shape.
+func ParseTaskID(task string) (campaignID, ref string, ok bool) {
+	rest, ok := strings.CutPrefix(task, "campaign/")
+	if !ok {
+		return "", "", false
+	}
+	campaignID, ref, ok = strings.Cut(rest, "/task/")
+	if !ok || campaignID == "" || ref == "" {
+		return "", "", false
+	}
+	return campaignID, ref, true
+}
+
+// CampaignOrderText names order o of a campaign task for a refusal (#182):
+// "ORD-0005 is campaign C-0001's work on o/r#12", or "review of" for a
+// review. A task id of another shape is named whole.
+func CampaignOrderText(o Order) string {
+	what := "work on"
+	if o.Kind == OrderKindReview {
+		what = "review of"
+	}
+	campaignID, ref, ok := ParseTaskID(o.Task)
+	if !ok {
+		return fmt.Sprintf("%s is the %s task %s", o.ID, what, o.Task)
+	}
+	return fmt.Sprintf("%s is campaign %s's %s %s", o.ID, campaignID, what, ref)
+}
+
+// ErrReviewBarred is returned, wrapped in a ReviewBarredError, by
+// RouteOrder for a review routed to a crew member who worked on its task
+// (#182).
+var ErrReviewBarred = errors.New("review barred")
+
+// ReviewBarredError is RouteOrder's refusal of review Order to Crew, who
+// claimed a work order in its task (task_workers). Ref is the task's
+// tracker ref.
+type ReviewBarredError struct {
+	Order, Ref, Crew string
+}
+
+func (e *ReviewBarredError) Error() string {
+	return fmt.Sprintf("%s reviews task %s, which %s worked on", e.Order, e.Ref, e.Crew)
+}
+
+// Is makes errors.Is(err, ErrReviewBarred) true.
+func (e *ReviewBarredError) Is(target error) bool { return target == ErrReviewBarred }
+
+// reviewBarred returns a ReviewBarredError when order o is a review and
+// crewID is in its task's task_workers, read in tx; nil otherwise. The
+// ref is the task's row's, else the one its id names, else the id.
+func reviewBarred(ctx context.Context, tx *sql.Tx, o Order, crewID string) error {
+	if o.Kind != OrderKindReview || crewID == "" {
+		return nil
+	}
+	var worked int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM task_workers WHERE task = ? AND crew_id = ?)`,
+		o.Task, crewID).Scan(&worked); err != nil || worked == 0 {
+		return err
+	}
+	ref := o.Task
+	if _, r, ok := ParseTaskID(o.Task); ok {
+		ref = r
+	}
+	err := tx.QueryRowContext(ctx, `SELECT ref FROM campaign_tasks WHERE workflow_id = ?`, o.Task).Scan(&ref)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	return &ReviewBarredError{Order: o.ID, Ref: ref, Crew: crewID}
+}
+
+// TaskHead is the head of a task that hasn't landed or been dropped: the
+// latest done work order, whose bmus/<Head> branch the land pushes.
+type TaskHead struct {
+	Ref  string
+	Repo string
+	Head string
+}
+
+// OpenTaskHeads returns the head of every task that has one and hasn't
+// landed or been dropped (#182), by head: jettison keeps their branches.
+func (s *Store) OpenTaskHeads(ctx context.Context) ([]TaskHead, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT t.ref, c.repo, t.head FROM campaign_tasks t JOIN campaigns c ON c.id = t.campaign_id
+		WHERE t.head <> '' AND t.state NOT IN (?, ?) ORDER BY t.head`, TaskLanded, TaskDropped)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TaskHead
+	for rows.Next() {
+		var h TaskHead
+		if err := rows.Scan(&h.Ref, &h.Repo, &h.Head); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
 }

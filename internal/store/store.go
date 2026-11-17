@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -277,6 +278,8 @@ var addedColumns = []struct{ table, column, def string }{
 	{"beams", "labels", `TEXT NOT NULL DEFAULT '{}'`},
 	{"orders", "budget_turns", `INTEGER NOT NULL DEFAULT 0`},
 	{"orders", "budget_extended", `INTEGER NOT NULL DEFAULT 0`},
+	{"orders", "round", `INTEGER NOT NULL DEFAULT 0`}, // #182
+	{"orders", "review_base", `TEXT NOT NULL DEFAULT ''`},
 }
 
 // requiredColumns are columns schema.sql gained that Open doesn't add to an
@@ -556,6 +559,13 @@ type Order struct {
 	// to, "" outside a campaign.
 	Kind string
 	Task string
+	// Round is the task's round the order belongs to, from 1, and 0
+	// outside a campaign; ReviewBase is a review's base, the commit the
+	// task's first work order started from, "" on any other order
+	// (#182). A review needs both; the order command carries them to
+	// its harness (comms.OrderReview).
+	Round      int
+	ReviewBase string
 }
 
 // Order kinds (orders.kind, #180). A fix order is work.
@@ -587,7 +597,7 @@ const orderCols = `id, title, body, division, priority, state, assignee, parent_
 	(SELECT COALESCE(SUM(u.input_tokens), 0) FROM order_usage u WHERE u.order_id = orders.id),
 	(SELECT COALESCE(SUM(u.output_tokens), 0) FROM order_usage u WHERE u.order_id = orders.id),
 	(SELECT COALESCE(SUM(u.turns), 0) FROM order_usage u WHERE u.order_id = orders.id),
-	COALESCE((SELECT a.division FROM crew a WHERE a.id = orders.assignee), ''), kind, task`
+	COALESCE((SELECT a.division FROM crew a WHERE a.id = orders.assignee), ''), kind, task, round, review_base`
 
 func scanOrder(row interface{ Scan(...any) error }) (Order, error) {
 	var (
@@ -599,7 +609,7 @@ func scanOrder(row interface{ Scan(...any) error }) (Order, error) {
 	err := row.Scan(&o.ID, &o.Title, &o.Body, &o.Division, &o.Priority, &o.State, &o.Assignee, &o.ParentID, &o.Branch,
 		&o.BudgetTokens, &o.BudgetTurns, &o.BudgetExtended, &o.CreatedBy, &o.Model, &o.Source, &parked, &pct, &o.ProgressNote, &o.OpenChildren,
 		&after, &waiting, &o.Used.InputTokens, &o.Used.OutputTokens, &o.Used.Turns, &o.AssigneeDivision,
-		&o.Kind, &o.Task)
+		&o.Kind, &o.Task, &o.Round, &o.ReviewBase)
 	o.After, o.WaitingOn = strings.Fields(after), strings.Fields(waiting)
 	if parked.Valid {
 		o.ParkedAt = &parked.Time
@@ -651,7 +661,8 @@ func (s *Store) orderRepos(ctx context.Context, ids []string) (map[string][]Orde
 // itself, or one that ended failed, belayed or withdrawn is refused
 // (ErrAfter, wrapped), and nothing is written. An empty Kind is work; a
 // kind other than work or review, or a review with no Task, is refused
-// (ErrOrderKind, wrapped, #180).
+// (ErrOrderKind, wrapped, #180). A review also needs its Round and
+// ReviewBase; a Round needs a Task and a ReviewBase a review (#182).
 func (s *Store) InsertOrder(ctx context.Context, o Order, entry LogEntry) (string, error) {
 	var id string
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
@@ -666,8 +677,13 @@ func (s *Store) InsertOrder(ctx context.Context, o Order, entry LogEntry) (strin
 }
 
 // ErrOrderKind is returned (wrapped) by InsertOrder for a kind other than
-// work or review, or a review with no task (#180).
+// work or review, or a review with no task (#180), and for a review with
+// no round or base, a round outside a campaign or a review base on a work
+// order (#182).
 var ErrOrderKind = errors.New("bad order kind")
+
+// commitIDRE is a full commit id, SHA-1 or SHA-256: a review's base.
+var commitIDRE = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
 
 // insertOrder is InsertOrder's work, in tx.
 func (s *Store) insertOrder(ctx context.Context, tx *sql.Tx, o Order, entry LogEntry) (string, error) {
@@ -676,11 +692,24 @@ func (s *Store) insertOrder(ctx context.Context, tx *sql.Tx, o Order, entry LogE
 		o.Kind = OrderKindWork
 	case OrderKindWork:
 	case OrderKindReview:
-		if o.Task == "" {
+		switch {
+		case o.Task == "":
 			return "", fmt.Errorf("%w: a review order belongs to a task", ErrOrderKind)
+		case o.Round < 1:
+			return "", fmt.Errorf("%w: a review order needs its round, from 1", ErrOrderKind)
+		case !commitIDRE.MatchString(o.ReviewBase):
+			return "", fmt.Errorf("%w: a review order needs its base, a full commit id", ErrOrderKind)
 		}
 	default:
 		return "", fmt.Errorf("%w: %q", ErrOrderKind, o.Kind)
+	}
+	switch {
+	case o.Round < 0:
+		return "", fmt.Errorf("%w: round %d is not from 1", ErrOrderKind, o.Round)
+	case o.Round > 0 && o.Task == "":
+		return "", fmt.Errorf("%w: only a campaign order has a round", ErrOrderKind)
+	case o.ReviewBase != "" && o.Kind != OrderKindReview:
+		return "", fmt.Errorf("%w: only a review order has a review base", ErrOrderKind)
 	}
 	if o.State == "" {
 		o.State = OrderPool
@@ -693,9 +722,10 @@ func (s *Store) insertOrder(ctx context.Context, tx *sql.Tx, o Order, entry LogE
 		return "", err
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO orders (id, title, body, division, priority, state, assignee, parent_id,
-		branch, budget_tokens, budget_turns, created_by, model, source, kind, task) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		branch, budget_tokens, budget_turns, created_by, model, source, kind, task, round, review_base)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, o.Title, o.Body, o.Division, o.Priority, o.State, o.Assignee, o.ParentID, o.Branch, o.BudgetTokens, o.BudgetTurns,
-		o.CreatedBy, o.Model, o.Source, o.Kind, o.Task)
+		o.CreatedBy, o.Model, o.Source, o.Kind, o.Task, o.Round, o.ReviewBase)
 	if err != nil {
 		return "", err
 	}
@@ -2122,6 +2152,8 @@ type RouteFunc func(o Order, assignee, division string, crew *Crew) (LogEntry, e
 // takes the new assignee and division from assignee and division (nil
 // keeps the order's, empty clears it), reads the new assignee's crew row,
 // and runs check, whose error rolls everything back and is returned as is.
+// A review routed to a crew member in its task's task_workers is refused
+// with a ReviewBarredError (#182), as the claims skip it.
 // Then, only while the order is unclaimed (pool or directed), it sets the
 // assignee, the division and the state (directed with an assignee, else
 // pool) and appends check's entry. parked_at is kept: a routed recalled
@@ -2164,6 +2196,9 @@ func (s *Store) RouteOrder(ctx context.Context, id string, assignee, division *s
 		}
 		entry, err := check(o, to, div, crew)
 		if err != nil {
+			return err
+		}
+		if err := reviewBarred(ctx, tx, o, to); err != nil {
 			return err
 		}
 		if to == o.Assignee && div == o.Division && state == o.State {
