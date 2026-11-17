@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"cmp"
 	"encoding/json"
 	"time"
 
@@ -73,6 +74,12 @@ type (
 		After          []string     `json:"after"`
 		WaitingOn      []string     `json:"waiting_on"`
 		ParkedAt       *time.Time   `json:"parked_at,omitempty"`
+		// Kind is work or review, and Task the task workflow's id, absent
+		// outside a campaign; Round is the task's round, absent outside
+		// one (#182).
+		Kind  string `json:"kind"`
+		Task  string `json:"task,omitempty"`
+		Round int    `json:"round,omitempty"`
 	}
 
 	// UsageView is an order's usage, summed over its beams (#120).
@@ -150,7 +157,8 @@ func (d *Daemon) orderView(o store.Order) OrderView {
 		Usage:          UsageView{InputTokens: o.Used.InputTokens, OutputTokens: o.Used.OutputTokens, Turns: o.Used.Turns},
 		CreatedBy:      o.CreatedBy, Model: o.Model,
 		Source: o.Source, ProgressPct: o.ProgressPct, ProgressNote: o.ProgressNote, OpenChildren: o.OpenChildren,
-		After: orEmpty(o.After), WaitingOn: orEmpty(o.WaitingOn), ParkedAt: utc(o.ParkedAt)}
+		After: orEmpty(o.After), WaitingOn: orEmpty(o.WaitingOn), ParkedAt: utc(o.ParkedAt),
+		Kind: cmp.Or(o.Kind, store.OrderKindWork), Task: o.Task, Round: o.Round}
 }
 
 func hailView(h store.Hail) HailView {

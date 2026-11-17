@@ -109,7 +109,8 @@ type JettisonResult struct {
 // is never before the order ended. A branch an open order's base_ref
 // resolves to in the clone stays (protectedBranches): a re-run of that
 // order's ship-repos resolves it again. So does the branch of an order an
-// open order's base_ref names as order:<id> (#143).
+// open order's base_ref names as order:<id> (#143), and the head of a
+// campaign task that hasn't landed or been dropped (#182).
 //
 // With yes, each repo's branches are deleted under its lock
 // (jettisonRepo). On an error the result holds the branches deleted
@@ -127,6 +128,10 @@ func (d *Daemon) Jettison(ctx context.Context, olderThan time.Duration, yes bool
 	orders := make(map[string]store.Order, len(all))
 	for _, o := range all {
 		orders[o.ID] = o
+	}
+	heads, err := d.store.OpenTaskHeads(ctx)
+	if err != nil {
+		return out, err
 	}
 	cutoff := time.Now().Add(-olderThan)
 	var found []JettisonBranch
@@ -147,7 +152,7 @@ func (d *Daemon) Jettison(ctx context.Context, olderThan time.Duration, yes bool
 			out.Skipped = append(out.Skipped, JettisonSkip{Repo: name, Reason: firstLine(err.Error())})
 			continue
 		}
-		protected, err := protectedBranches(ctx, dir, name, all)
+		protected, err := protectedBranches(ctx, dir, name, all, heads)
 		if err != nil {
 			return out, fmt.Errorf("repo %s: %w", name, err)
 		}
@@ -251,7 +256,11 @@ func (d *Daemon) jettisonRepo(ctx context.Context, repo string, batch []Jettison
 	// goes, with its branch or without: nothing reads it once the order
 	// ended. Best effort.
 	sweepCheckpointRefs(ctx, dir, all)
-	protected, err := protectedBranches(ctx, dir, repo, all)
+	heads, err := d.store.OpenTaskHeads(ctx)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	protected, err := protectedBranches(ctx, dir, repo, all, heads)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -319,7 +328,9 @@ func (d *Daemon) jettisonRepo(ctx context.Context, repo string, batch []Jettison
 // re-read and the delete may name a branch just deleted: each such branch
 // is created again at its old commit, whose objects are still in the
 // clone, and logged on its order as "branch bmus/<id> restored in repo
-// <name>: an open order names it as its base". It returns the branches
+// <name>: an open order names it as its base". A task's head the task
+// took meanwhile is restored the same way, logged "...: campaign task
+// o/r#12 holds it as its head" (#182). It returns the branches
 // still deleted and how many were restored. A restore that fails leaves
 // its branch deleted. A logging error is returned with the result.
 func (d *Daemon) restoreBases(ctx context.Context, repo, dir string, deleted []JettisonBranch, orders map[string]store.Order) ([]JettisonBranch, int, error) {
@@ -330,15 +341,25 @@ func (d *Daemon) restoreBases(ctx context.Context, repo, dir string, deleted []J
 	if err != nil {
 		return deleted, 0, err
 	}
-	named := map[string]bool{}
+	heads, err := d.store.OpenTaskHeads(ctx)
+	if err != nil {
+		return deleted, 0, err
+	}
+	// named is why each branch to restore is needed.
+	named := map[string]string{}
 	for _, o := range all {
 		if store.OrderEnded(o.State) {
 			continue
 		}
 		for _, r := range o.Repos {
 			if id, ok := orderBase(r.BaseRef); ok && r.Name == repo {
-				named[id] = true
+				named[id] = "an open order names it as its base"
 			}
+		}
+	}
+	for _, h := range heads {
+		if h.Repo == repo && named[h.Head] == "" {
+			named[h.Head] = "campaign task " + h.Ref + " holds it as its head"
 		}
 	}
 	var (
@@ -347,7 +368,8 @@ func (d *Daemon) restoreBases(ctx context.Context, repo, dir string, deleted []J
 		logErr   error
 	)
 	for _, b := range deleted {
-		if !named[b.Order] {
+		why := named[b.Order]
+		if why == "" {
 			gone = append(gone, b)
 			continue
 		}
@@ -358,7 +380,7 @@ func (d *Daemon) restoreBases(ctx context.Context, repo, dir string, deleted []J
 		}
 		restored++
 		if err := d.appendLog(ctx, logOrder, orders[b.Order].Assignee, b.Order,
-			fmt.Sprintf("branch %s restored in repo %s: an open order names it as its base", b.Branch, repo),
+			fmt.Sprintf("branch %s restored in repo %s: %s", b.Branch, repo, why),
 			map[string]string{"repo": repo, "branch": b.Branch, "commit": b.Commit}); err != nil && logErr == nil {
 			logErr = err
 		}
@@ -402,8 +424,16 @@ func refMissing(err error) bool {
 // would in the clone, after its ~, ^ and @{...} suffixes are stripped,
 // with `git rev-parse --symbolic-full-name`; one that resolves to nothing
 // protects nothing. A base_ref of order:<id> (#143) protects bmus/<id>.
-func protectedBranches(ctx context.Context, dir, repo string, orders []store.Order) (map[string]bool, error) {
+// So does the head of a campaign task on repo that hasn't landed or been
+// dropped (heads, store.OpenTaskHeads, #182): between a pass and the land
+// no open order names it, and the push needs its branch.
+func protectedBranches(ctx context.Context, dir, repo string, orders []store.Order, heads []store.TaskHead) (map[string]bool, error) {
 	out := map[string]bool{}
+	for _, h := range heads {
+		if h.Repo == repo {
+			out["refs/heads/"+orderBranch(h.Head)] = true
+		}
+	}
 	seen := map[string]bool{}
 	for _, o := range orders {
 		if store.OrderEnded(o.State) {

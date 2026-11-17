@@ -36,6 +36,9 @@ func splitCreatedBy(hailID string) string { return "hail:" + hailID }
 // child's division and priority are o's when it gives none, and its repos
 // are o's. why says what is wrong with a malformed split, which creates
 // nothing:
+//   - o has a task (#182): "ORD-0005 is campaign C-0001's work on o/r#12:
+//     a campaign order can't be split" (store.CampaignOrderText). A
+//     campaign order stays one order on the base its task gave it;
 //   - c isn't in the command division;
 //   - the options aren't [allow, deny] (option 0 must mean allow);
 //   - the context isn't one OrderSplitContext with no unknown fields, or
@@ -52,6 +55,9 @@ func splitCreatedBy(hailID string) string { return "hail:" + hailID }
 //
 // Every check is on the hail's stored context, the one the captain sees.
 func (d *Daemon) checkSplit(h store.Hail, o store.Order, c store.Crew) (children []store.Order, why string) {
+	if o.Task != "" {
+		return nil, store.CampaignOrderText(o) + ": a campaign order can't be split"
+	}
 	if c.Division != DivisionCommand {
 		return nil, fmt.Sprintf("only Command splits orders, and %s is not in the %s division", c.ID, DivisionCommand)
 	}

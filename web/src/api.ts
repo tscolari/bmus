@@ -71,6 +71,12 @@ export interface OrderView {
   readonly waiting_on: readonly string[];
   /** Set while its mission is parked, waiting for a resume (#167); absent otherwise. */
   readonly parked_at?: string;
+  /** work or review (#182). */
+  readonly kind: string;
+  /** The campaign task workflow's id, campaign/<id>/task/<ref>; absent outside a campaign. */
+  readonly task?: string;
+  /** The task's round, from 1; absent outside a campaign. */
+  readonly round?: number;
 }
 
 /** bridge.BudgetSource. */
