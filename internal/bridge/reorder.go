@@ -50,7 +50,9 @@ type reorderSource struct {
 // once, on the order: "order rebased onto order:ORD-0005 (was
 // order:ORD-0001)", or "order after: ORD-0002 (was ORD-0001)". An order
 // left with nothing to wait on wakes its assignee's tour or its division,
-// best effort, as RouteOrder does.
+// best effort, as RouteOrder does. An order with a task is refused first
+// (#182): "ORD-0005 is campaign C-0001's work on o/r#12: a campaign order
+// can't be reordered".
 func (d *Daemon) reorderOrder(ctx context.Context, id string, ch store.OrderChange, src reorderSource) (store.Order, error) {
 	o, err := d.store.GetOrder(ctx, id)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -58,6 +60,11 @@ func (d *Daemon) reorderOrder(ctx context.Context, id string, ch store.OrderChan
 	}
 	if err != nil {
 		return store.Order{}, err
+	}
+	if o.Task != "" {
+		// Before the base checks, which would refuse a bad base first;
+		// the store refuses it again in the change's transaction.
+		return store.Order{}, badRequest("%s: a campaign order can't be reordered", store.CampaignOrderText(o))
 	}
 	if ch.Base != nil {
 		repos, _, err := ch.Apply(o)

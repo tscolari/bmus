@@ -65,7 +65,13 @@ CREATE TABLE IF NOT EXISTS orders (
     -- the task workflow the order belongs to, '' outside a campaign. Older
     -- databases are refused (requiredColumns).
     kind            TEXT NOT NULL DEFAULT 'work',
-    task            TEXT NOT NULL DEFAULT ''
+    task            TEXT NOT NULL DEFAULT '',
+    -- The task's round a campaign order belongs to, from 1 (0 outside a
+    -- campaign), and a review's base: the commit the task's first work
+    -- order started from, '' on any other order (#182). The order command
+    -- carries both to a review's harness.
+    round           INTEGER NOT NULL DEFAULT 0,
+    review_base     TEXT NOT NULL DEFAULT ''
 );
 
 -- The repos an order works on (#51), in the order's list order (pos from

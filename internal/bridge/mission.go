@@ -419,7 +419,11 @@ func syntheticMessage(typ string, body any, crewID, orderID string) (comms.Messa
 //     children, and log the report with each repo's branch and commit,
 //     or, when the tour's backstop ended the order meanwhile, log that
 //     the work arrived late). An order settled split then takes a belay
-//     queued meanwhile (belayAfterSplit, #146). Returns done. A report
+//     queued meanwhile (belayAfterSplit, #146). Returns done. A review
+//     order's report needs a verdict comms.Verdict.Check takes, which the
+//     done entry carries; without one order-done writes nothing and
+//     order-failed fails the order as no_verdict, its work pulled all the
+//     same. A work order's verdict is dropped with a warning (#182). A report
 //     that beats a stand_down or a recall completes the order all the
 //     same.
 //   - error: code dismissed or budget_exceeded fails the order
@@ -1352,9 +1356,25 @@ func completeMission(ctx dbos.Context, in MissionInput, beam string, hail *openH
 			return MissionResult{}, err
 		}
 	}
-	payload := donePayload{Beam: beam, Summary: report.Summary, Repos: fetched, Artifacts: report.Artifacts, Usage: report.Usage}
 	done, err := dbos.RunAsStep(ctx, func(c context.Context) (doneOutcome, error) {
 		d := daemonFrom(c)
+		o, err := d.store.GetOrder(c, in.OrderID)
+		if err != nil {
+			return doneOutcome{}, fmt.Errorf("order %s: %w", in.OrderID, err)
+		}
+		payload := donePayload{Beam: beam, Summary: report.Summary, Repos: fetched, Artifacts: report.Artifacts, Usage: report.Usage}
+		review := o.Kind == store.OrderKindReview
+		switch {
+		case review:
+			// The verdict as decoded from the beam's bytes: one that
+			// didn't decode keeps its error for Check.
+			if why := verdictProblem(report.Verdict); why != "" {
+				return doneOutcome{NoVerdict: why}, nil
+			}
+			payload.Verdict = report.Verdict
+		case report.Verdict != nil:
+			d.logger.Warn("mission: a work order's report carried a verdict; dropped", "order", in.OrderID)
+		}
 		if err := d.closeHail(c, in, hail); err != nil {
 			return doneOutcome{}, err
 		}
@@ -1382,10 +1402,17 @@ func completeMission(ctx dbos.Context, in MissionInput, beam string, hail *openH
 			return doneOutcome{}, err
 		}
 		current, err := d.settleReport(c, in.OrderID, state, entry, late)
-		return doneOutcome{Split: state == store.OrderSplit && current == store.OrderSplit}, err
+		return doneOutcome{Split: state == store.OrderSplit && current == store.OrderSplit, Review: review}, err
 	}, append([]dbos.StepOption{dbos.WithStepName("order-done")}, storeRetries...)...)
 	if err != nil {
 		return MissionResult{}, err
+	}
+	if done.NoVerdict != "" {
+		// The work was pulled as usual; the review's order fails.
+		return failMissionResult(ctx, in, hail, "the review reported no valid verdict: "+done.NoVerdict, CodeNoVerdict)
+	}
+	if !done.Review {
+		report.Verdict = nil
 	}
 	if done.Split {
 		if err := belayAfterSplit(ctx, in); err != nil {
@@ -1399,6 +1426,33 @@ func completeMission(ctx dbos.Context, in MissionInput, beam string, hail *openH
 // recorded before #146 has "{}": not split.
 type doneOutcome struct {
 	Split bool `json:"split,omitempty"` // the order is split (this step, or its earlier run, settled it so)
+	// Review: the order is a review, whose valid verdict the done entry
+	// carries (#182). A work order's report loses any verdict.
+	Review bool `json:"review,omitempty"`
+	// NoVerdict is why a review's report has no valid verdict: the step
+	// wrote nothing, and the mission fails the order as no_verdict.
+	NoVerdict string `json:"no_verdict,omitempty"`
+}
+
+// CodeNoVerdict: a review order's report had no verdict, or one that
+// fails comms.Verdict.Check (#182). The order fails after its work is
+// pulled.
+const CodeNoVerdict = "no_verdict"
+
+// maxVerdictProblem caps verdictProblem's text: Check quotes a bad
+// severity whole.
+const maxVerdictProblem = 500
+
+// verdictProblem is why v is no valid verdict, "" for one Check takes.
+// The text is one line, clipped: Check's errors quote the agent's text.
+func verdictProblem(v *comms.Verdict) string {
+	if v == nil {
+		return "the report has no verdict"
+	}
+	if err := v.Check(); err != nil {
+		return clip(oneLine(err.Error()), maxVerdictProblem)
+	}
+	return ""
 }
 
 // belayAfterSplit takes a belay the captain queued while the mission was
@@ -1934,7 +1988,8 @@ func tourOver(c store.Crew, in MissionInput) bool {
 // resolved on every send: a resumed order's re-send resolves it for its new
 // crew member. The budget is resolved the same way (resolveBudget), and the
 // order carries its current limit and the usage recorded on the order's
-// other beams (budgetFor, #118). A re-run sends again under a new command id, which serve
+// other beams (budgetFor, #118). An order with a task carries its kind, and
+// a review its base and round (orderKind, #182). A re-run sends again under a new command id, which serve
 // ignores for an order it is running or has finished.
 func sendOrder(ctx context.Context, d *Daemon, in MissionInput, ship shipped) (uint64, error) {
 	o, err := d.store.GetOrder(ctx, in.OrderID)
@@ -1952,17 +2007,33 @@ func sendOrder(ctx context.Context, d *Daemon, in MissionInput, ship shipped) (u
 		return 0, fmt.Errorf("order %s usage: %w", in.OrderID, err)
 	}
 	limit, used := budgetFor(o, budget, usage, c.CurrentBeam)
+	kind, review := orderKind(o)
 	msg, err := comms.NewMessage(comms.TypeOrder, comms.OrderBody{
 		Title: o.Title, Body: o.Body, Repos: ship.Repos,
 		BudgetTokens: uint64(max(limit.Tokens, 0)), BudgetTurns: uint64(max(limit.Turns, 0)),
 		UsedTokens: uint64(max(used.Tokens, 0)), UsedTurns: uint64(max(used.Turns, 0)),
 		Model: model, Handover: ship.Handover, Grants: ship.Grants,
+		Kind: kind, Review: review,
 	})
 	if err != nil {
 		return 0, err
 	}
 	msg.Order = in.OrderID
 	return d.SendCommand(in.CrewID, msg)
+}
+
+// orderKind is the kind and review an order command carries for order o
+// (#182): none outside a campaign, the kind for an order with a task, and
+// a review's base and round, from its row, which the task workflow wrote
+// when it created the review.
+func orderKind(o store.Order) (string, *comms.OrderReview) {
+	if o.Task == "" {
+		return "", nil
+	}
+	if o.Kind != store.OrderKindReview {
+		return comms.OrderKindWork, nil
+	}
+	return comms.OrderKindReview, &comms.OrderReview{Base: o.ReviewBase, Round: o.Round}
 }
 
 // recordHail records an open hail for the order, sets the crew member

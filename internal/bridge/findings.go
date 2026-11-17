@@ -130,10 +130,20 @@ type filedFinding struct {
 // startFindings is the end of every mission (#155): a count-findings step,
 // and, when the order has any findings, findings/<order> started as a
 // child the mission never awaits. A replay, or a findings workflow already
-// started, starts nothing new.
+// started, starts nothing new. A review order's count is 0 (#182): its
+// task workflow starts findings/<order> once it has triaged the verdict,
+// so the reviewer's own findings are filed with the verdict's.
 func startFindings(ctx dbos.Context, orderID string) error {
 	n, err := dbos.RunAsStep(ctx, func(c context.Context) (int, error) {
-		return daemonFrom(c).store.CountFindings(c, orderID)
+		d := daemonFrom(c)
+		o, err := d.store.GetOrder(c, orderID)
+		if err != nil {
+			return 0, fmt.Errorf("order %s: %w", orderID, err)
+		}
+		if o.Kind == store.OrderKindReview {
+			return 0, nil
+		}
+		return d.store.CountFindings(c, orderID)
 	}, append([]dbos.StepOption{dbos.WithStepName("count-findings")}, storeRetries...)...)
 	if err != nil || n == 0 {
 		return err

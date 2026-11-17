@@ -128,7 +128,7 @@ func TestRPCCommands(t *testing.T) {
 	require.NoError(t, call(t, home, "order.list", nil, &orders))
 	require.Len(t, orders.Orders, 1)
 	o := orders.Orders[0]
-	require.Equal(t, OrderView{ID: "ORD-0001", Title: "survey", Body: "look around", Division: "science", State: o.State,
+	require.Equal(t, OrderView{ID: "ORD-0001", Kind: store.OrderKindWork, Title: "survey", Body: "look around", Division: "science", State: o.State,
 		Priority: store.PriorityYellow, Assignee: "sorell", Repos: []OrderRepo{{Name: "app", BaseRef: "main"}}, BudgetTokens: 1000,
 		BudgetTurns: 40, LimitTokens: 1000, LimitTurns: 40, BudgetSource: BudgetSource{Tokens: SourceOrder, Turns: SourceOrder}, CreatedBy: "captain", Model: "model-x",
 		After: []string{}, WaitingOn: []string{}}, o)

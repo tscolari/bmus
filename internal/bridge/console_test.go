@@ -517,7 +517,7 @@ func TestConsoleActions(t *testing.T) {
 	var ov OrderView
 	status, _ = post("/api/orders", `{"title":"survey","assignee":"sorell","priority":1,"repos":[{"name":"app","base_ref":"main"}]}`, &ov)
 	require.Equal(t, http.StatusCreated, status)
-	require.Equal(t, OrderView{ID: ov.ID, Title: "survey", State: ov.State, Priority: store.PriorityYellow, Assignee: "sorell",
+	require.Equal(t, OrderView{ID: ov.ID, Kind: store.OrderKindWork, Title: "survey", State: ov.State, Priority: store.PriorityYellow, Assignee: "sorell",
 		Repos: []OrderRepo{{Name: "app", BaseRef: "main"}}, BudgetSource: BudgetSource{Tokens: SourceDefault, Turns: SourceDefault},
 		CreatedBy: "captain", After: []string{}, WaitingOn: []string{}}, ov)
 	require.Equal(t, ov.ID, untilLog("order created: survey").OrderID)

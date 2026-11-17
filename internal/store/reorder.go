@@ -108,9 +108,13 @@ func (s *Store) StartedWhy(ctx context.Context, o Order) (string, error) {
 // startedWhy says why order o, read through q, can't be reordered (#148):
 // it ended, it was split, a crew member claimed it, or it was recalled and
 // keeps a parked mission or a checkpoint, whose work is built on its
-// current base. "" for an order no crew member has started.
+// current base. "" for an order no crew member has started. A campaign
+// order is never reordered (#182): it stays one order on the base its task
+// gave it.
 func startedWhy(ctx context.Context, q queryRower, o Order) (string, error) {
 	switch {
+	case o.Task != "":
+		return CampaignOrderText(o) + ": a campaign order can't be reordered", nil
 	case slices.Contains(endedStates, o.State):
 		return fmt.Sprintf("order %s ended %s", o.ID, o.State), nil
 	case o.State == OrderSplit:

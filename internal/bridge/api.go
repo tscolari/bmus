@@ -179,6 +179,9 @@ func (d *Daemon) CreateOrder(ctx context.Context, o store.Order) (string, error)
 	if errors.Is(err, store.ErrAfter) {
 		return "", badRequest("%s", strings.TrimSuffix(err.Error(), ": "+store.ErrAfter.Error()))
 	}
+	if errors.Is(err, store.ErrOrderKind) {
+		return "", badRequest("%s", err.Error())
+	}
 	if err != nil {
 		return "", fmt.Errorf("create order: %w", err)
 	}
@@ -679,7 +682,9 @@ func (d *Daemon) withdrawOrder(ctx context.Context, id, reason string) ([]string
 // moving an order directed to a crew member in sickbay to a division takes
 // an empty assignee. Without one it goes to the division's pool. The
 // division must be empty or in the roster (checkDivision), and the order
-// must keep an assignee or a division. The route logs "order routed to
+// must keep an assignee or a division. A review routed to a crew member
+// who worked on its task is a bad request, "ORD-0009 reviews task o/r#12,
+// which sorell worked on" (store.ReviewBarredError, #182). The route logs "order routed to
 // ..."; one that changes nothing writes and logs nothing. A claimed or
 // settled order is a bad request ("too late to route"), and a missing one
 // ErrNotFound. A routed recalled order keeps its parked mission, which its
@@ -715,6 +720,9 @@ func (d *Daemon) RouteOrder(ctx context.Context, id string, assignee, division *
 		})
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("order %s: %w", id, ErrNotFound)
+	}
+	if errors.Is(err, store.ErrReviewBarred) {
+		return badRequest("%s", err.Error())
 	}
 	if err != nil {
 		return err

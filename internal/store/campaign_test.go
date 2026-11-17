@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -136,12 +137,17 @@ func TestInsertOrderOnce(t *testing.T) {
 	require.Equal(t, id, entries[0].OrderID)
 
 	review := Order{Title: "Review o/r#12 (round 1)", Division: "science", CreatedBy: "campaign:C-0001:o/r#12:r1:review",
-		Kind: OrderKindReview, Task: o.Task}
+		Kind: OrderKindReview, Task: o.Task, Round: 1, ReviewBase: testBase}
 	rid, created, err := s.InsertOrderOnce(ctx, review, testEntry)
 	require.NoError(t, err)
 	require.True(t, created)
 	require.NotEqual(t, id, rid)
-	require.Equal(t, OrderKindReview, getT(t, s, rid).Kind)
+	gotReview := getT(t, s, rid)
+	require.Equal(t, OrderKindReview, gotReview.Kind)
+	require.Equal(t, 1, gotReview.Round)
+	require.Equal(t, testBase, gotReview.ReviewBase)
+	require.Zero(t, got.Round)
+	require.Empty(t, got.ReviewBase)
 
 	_, _, err = s.InsertOrderOnce(ctx, Order{Title: "x"}, testEntry)
 	require.ErrorContains(t, err, "needs createdBy")
@@ -149,6 +155,20 @@ func TestInsertOrderOnce(t *testing.T) {
 	require.ErrorIs(t, err, ErrOrderKind)
 	_, err = s.InsertOrder(ctx, Order{Title: "x", Kind: OrderKindReview}, testEntry)
 	require.ErrorIs(t, err, ErrOrderKind)
+	// #182: a review needs its round and base; a round needs a task, and a
+	// review base a review.
+	for _, bad := range []Order{
+		{Title: "x", Kind: OrderKindReview, Task: o.Task, ReviewBase: testBase},
+		{Title: "x", Kind: OrderKindReview, Task: o.Task, Round: 1},
+		{Title: "x", Kind: OrderKindReview, Task: o.Task, Round: 1, ReviewBase: "main"},
+		{Title: "x", Kind: OrderKindReview, Task: o.Task, Round: 1, ReviewBase: testBase[:12]},
+		{Title: "x", Task: o.Task, Round: -1},
+		{Title: "x", Round: 1},
+		{Title: "x", Task: o.Task, Round: 1, ReviewBase: testBase},
+	} {
+		_, err = s.InsertOrder(ctx, bad, testEntry)
+		require.ErrorIs(t, err, ErrOrderKind, "%+v", bad)
+	}
 	all, err := s.ListOrders(ctx)
 	require.NoError(t, err)
 	require.Len(t, all, 2, "the refusals wrote nothing")
@@ -428,7 +448,7 @@ func TestClaimReviewBarred(t *testing.T) {
 	done(work)
 
 	// Round 1's review in the pool: sorell skips it, tuvok takes it.
-	review1 := insertT(t, s, Order{Title: "Review o/r#12 (round 1)", Division: "science", Kind: OrderKindReview, Task: task})
+	review1 := insertT(t, s, Order{Title: "Review o/r#12 (round 1)", Division: "science", Kind: OrderKindReview, Task: task, Round: 1, ReviewBase: testBase})
 	_, found = claimPool(t, s, "sorell", "science")
 	require.False(t, found, "sorell worked on the task")
 	got, found = claimPool(t, s, "tuvok", "science")
@@ -438,7 +458,7 @@ func TestClaimReviewBarred(t *testing.T) {
 	done(review1)
 
 	// Directed to sorell, the review is skipped; directed to spock, taken.
-	directed := insertT(t, s, Order{Title: "Review o/r#12 (directed)", Assignee: "sorell", Kind: OrderKindReview, Task: task})
+	directed := insertT(t, s, Order{Title: "Review o/r#12 (directed)", Assignee: "sorell", Kind: OrderKindReview, Task: task, Round: 1, ReviewBase: testBase})
 	_, found = claimDirected(t, s, "sorell")
 	require.False(t, found, "sorell's directed claim skips its task's review")
 	_, err = s.db.ExecContext(ctx, `UPDATE orders SET assignee = 'spock' WHERE id = ?`, directed)
@@ -449,7 +469,7 @@ func TestClaimReviewBarred(t *testing.T) {
 	done(directed)
 
 	// Another task's review is sorell's to claim.
-	elsewhere := insertT(t, s, Order{Title: "Review o/r#13", Division: "science", Kind: OrderKindReview, Task: "campaign/C-0001/task/o/r#13"})
+	elsewhere := insertT(t, s, Order{Title: "Review o/r#13", Division: "science", Kind: OrderKindReview, Task: "campaign/C-0001/task/o/r#13", Round: 1, ReviewBase: testBase})
 	got, found = claimPool(t, s, "sorell", "science")
 	require.True(t, found)
 	require.Equal(t, elsewhere, got)
@@ -464,7 +484,7 @@ func TestClaimReviewBarred(t *testing.T) {
 	require.Equal(t, fix, got)
 	require.Equal(t, []string{"sorell", "tuvok"}, workers(t, s, task))
 	done(fix)
-	review2 := insertT(t, s, Order{Title: "Review o/r#12 (round 2)", Division: "science", Kind: OrderKindReview, Task: task})
+	review2 := insertT(t, s, Order{Title: "Review o/r#12 (round 2)", Division: "science", Kind: OrderKindReview, Task: task, Round: 2, ReviewBase: testBase})
 	for _, c := range []string{"sorell", "tuvok"} {
 		_, found = claimPool(t, s, c, "science")
 		require.False(t, found, c)
@@ -481,7 +501,8 @@ func TestClaimReviewBarred(t *testing.T) {
 	require.True(t, found)
 	done(w)
 	for round := range 2 {
-		r := insertT(t, s, Order{Title: "Review o/r#14", Division: "science", Kind: OrderKindReview, Task: task2})
+		r := insertT(t, s, Order{Title: "Review o/r#14", Division: "science", Kind: OrderKindReview, Task: task2, Round: round + 1,
+			ReviewBase: testBase})
 		got, found = claimPool(t, s, "tuvok", "science")
 		require.True(t, found, "round %d", round+1)
 		require.Equal(t, r, got)
@@ -584,4 +605,113 @@ func TestSetTask(t *testing.T) {
 
 	_, err = s.SetTask(ctx, CampaignTask{CampaignID: "C-0001", Ref: "o/r#99"}, LogEntry{Text: "x"})
 	require.ErrorIs(t, err, sql.ErrNoRows)
+}
+
+// testBase is a review's base in tests: a full commit id.
+const testBase = "8b1d0e2c4a55f00dfeedfacecafebeef01234567"
+
+// A campaign order stays whole (#182): a route of a review to a crew
+// member in task_workers is refused, naming the task by its row's ref,
+// while one to another crew member goes through; a reorder of any order
+// with a task is refused and writes nothing.
+func TestCampaignOrderRefusals(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := openTest(t)
+	insertCampaign(t, s, "C-0001", "o/r#12")
+	task := TaskWorkflowID("C-0001", "o/r#12")
+	for _, c := range []string{"sorell", "tuvok"} {
+		require.NoError(t, s.InsertCrew(ctx, Crew{ID: c, Name: c, Division: "science"}, testEntry))
+	}
+	work := insertT(t, s, Order{Title: "Implement o/r#12", Assignee: "sorell", Task: task, Round: 1,
+		Repos: []OrderRepo{{Name: "app", BaseRef: "main"}}})
+	_, found := claimDirected(t, s, "sorell")
+	require.True(t, found)
+	review := insertT(t, s, Order{Title: "Review o/r#12 (round 1)", Division: "science", Kind: OrderKindReview, Task: task,
+		Round: 1, ReviewBase: testBase, Repos: []OrderRepo{{Name: "app", BaseRef: "order:" + work}}})
+	last, err := s.LastLogID(ctx)
+	require.NoError(t, err)
+
+	str := func(v string) *string { return &v }
+	route := func(o Order, to, div string, c *Crew) (LogEntry, error) {
+		return LogEntry{Kind: "order", Text: "routed"}, nil
+	}
+	_, routed, err := s.RouteOrder(ctx, review, str("sorell"), nil, route)
+	require.ErrorIs(t, err, ErrReviewBarred)
+	require.EqualError(t, err, review+" reviews task o/r#12, which sorell worked on")
+	require.False(t, routed)
+	o, routed, err := s.RouteOrder(ctx, review, str("tuvok"), nil, route)
+	require.NoError(t, err)
+	require.True(t, routed)
+	require.Equal(t, "tuvok", o.Assignee)
+	// Back to the pool needs no check.
+	_, routed, err = s.RouteOrder(ctx, review, str(""), nil, route)
+	require.NoError(t, err)
+	require.True(t, routed)
+
+	base := "main"
+	_, _, err = s.ReorderOrder(ctx, review, OrderChange{Base: &base}, func(_, _ Order) (LogEntry, error) {
+		return LogEntry{Kind: "order", Text: "reordered"}, nil
+	})
+	require.ErrorIs(t, err, ErrReorder)
+	require.ErrorContains(t, err, review+" is campaign C-0001's review of o/r#12: a campaign order can't be reordered")
+	pooled := insertT(t, s, Order{Title: "Fix o/r#12 (round 2)", Division: "science", Task: task, Round: 2,
+		Repos: []OrderRepo{{Name: "app", BaseRef: "main"}}})
+	why, err := s.StartedWhy(ctx, getT(t, s, pooled))
+	require.NoError(t, err)
+	require.Equal(t, pooled+" is campaign C-0001's work on o/r#12: a campaign order can't be reordered", why)
+	_, _, err = s.ReorderOrder(ctx, pooled, OrderChange{AfterAdd: []string{work}}, func(_, _ Order) (LogEntry, error) {
+		return LogEntry{Kind: "order", Text: "reordered"}, nil
+	})
+	require.ErrorIs(t, err, ErrReorder)
+	require.Empty(t, getT(t, s, pooled).After)
+
+	entries, err := s.ListLog(ctx, last)
+	require.NoError(t, err)
+	var texts []string
+	for _, e := range entries {
+		texts = append(texts, e.Text)
+	}
+	require.Equal(t, []string{"routed", "routed"}, texts[:2], "the refusals logged nothing")
+	require.Len(t, texts, 3) // and the fix order's creation
+}
+
+// TaskWorkflowID and ParseTaskID agree, and an id of another shape names
+// itself in CampaignOrderText.
+func TestTaskIDs(t *testing.T) {
+	t.Parallel()
+	id := TaskWorkflowID("C-0001", "o/r#12")
+	require.Equal(t, "campaign/C-0001/task/o/r#12", id)
+	c, ref, ok := ParseTaskID(id)
+	require.True(t, ok)
+	require.Equal(t, []string{"C-0001", "o/r#12"}, []string{c, ref})
+	for _, bad := range []string{"", "campaign/", "campaign/C-0001", "campaign//task/x", "campaign/C-0001/task/", "other/C/task/x"} {
+		_, _, ok := ParseTaskID(bad)
+		require.False(t, ok, bad)
+	}
+	require.Equal(t, "ORD-0001 is the work on task t", CampaignOrderText(Order{ID: "ORD-0001", Task: "t"}))
+	require.Equal(t, "ORD-0002 is campaign C-0001's review of o/r#12",
+		CampaignOrderText(Order{ID: "ORD-0002", Task: id, Kind: OrderKindReview}))
+}
+
+// OpenTaskHeads lists the head of each task that has one and hasn't landed
+// or been dropped, with its campaign's repo.
+func TestOpenTaskHeads(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := openTest(t)
+	for i, state := range []string{TaskReviewing, TaskStalled, TaskLanded, TaskDropped, TaskWorking} {
+		id := fmt.Sprintf("C-%04d", i+1)
+		ref := fmt.Sprintf("o/r#%d", i+1)
+		insertCampaign(t, s, id, ref)
+		head := fmt.Sprintf("ORD-%04d", i+1)
+		if i == 4 {
+			head = "" // no head yet
+		}
+		_, err := s.db.ExecContext(ctx, `UPDATE campaign_tasks SET state = ?, head = ? WHERE campaign_id = ?`, state, head, id)
+		require.NoError(t, err)
+	}
+	heads, err := s.OpenTaskHeads(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []TaskHead{{Ref: "o/r#1", Repo: "app", Head: "ORD-0001"}, {Ref: "o/r#2", Repo: "app", Head: "ORD-0002"}}, heads)
 }

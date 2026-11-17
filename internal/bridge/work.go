@@ -556,4 +556,7 @@ type donePayload struct {
 	Repos     []landedRepo `json:"repos"`
 	Artifacts []string     `json:"artifacts,omitempty"`
 	Usage     comms.Usage  `json:"usage"`
+	// Verdict is a review's verdict, one Check took (#182); absent on a
+	// work order's entry.
+	Verdict *comms.Verdict `json:"verdict,omitempty"`
 }
