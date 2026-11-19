@@ -300,6 +300,9 @@ type taskRun struct {
 	// consent: a land, or a retry of a push, the captain decided on a
 	// stall, which needs no campaign_land.
 	consent bool
+	// pushStalled: the stall being raised came from land-push, after a
+	// land with consent, so the captain's retry of it is consent too.
+	pushStalled bool
 	// filed holds the reviews whose findings workflow started.
 	filed map[string]bool
 	// result is the task's end.
@@ -1286,6 +1289,8 @@ func (r *taskRun) fileReviewFindings(id string) error {
 // hail closed undecided then; one closed undecided otherwise stalls the
 // task again.
 func (r *taskRun) stall(code, reason, order string, phase taskPhase, keyKind string) (taskPhase, error) {
+	fromPush := r.pushStalled
+	r.pushStalled = false
 	// A campaign being belayed drops its task with no stall hail.
 	belaying, err := r.belaying()
 	if err != nil {
@@ -1376,9 +1381,11 @@ func (r *taskRun) stall(code, reason, order string, phase taskPhase, keyKind str
 			return phaseWork, nil
 		}
 		if phase == phaseLand {
-			// A retry of the push: the captain's is the land's consent,
-			// and Command's asks the captain again (campaign_land).
-			r.consent = hl.DecidedBy == comms.DecidedByCaptain
+			// A retry of a push that failed after a consented land: the
+			// captain's keeps that consent, and Command's asks the captain
+			// again (campaign_land). A stall before the push (the land
+			// context, the branch) had no consent, and its retry asks.
+			r.consent = fromPush && hl.DecidedBy == comms.DecidedByCaptain
 		}
 		if order != "" {
 			// A fresh order under the key's next attempt; a stall before
@@ -1439,9 +1446,12 @@ type landResult struct {
 	Drop    bool   `json:",omitempty"`
 	DropWhy string `json:",omitempty"`
 	// StallCode and StallWhy: the push was rejected (push_rejected) or
-	// out of retries (push_failed).
+	// out of retries (push_failed), or the land couldn't be asked for
+	// (push_failed). FromPush marks a stall of land-push itself, which
+	// came after the land's consent.
 	StallCode string `json:",omitempty"`
 	StallWhy  string `json:",omitempty"`
+	FromPush  bool   `json:",omitempty"`
 }
 
 // land lands the task's head (landTask) and acts on the outcome: landed
@@ -1468,14 +1478,17 @@ func (r *taskRun) land() (taskPhase, error) {
 		r.t.Round++
 		return phaseWork, nil
 	}
+	r.pushStalled = res.FromPush
 	return r.stall(res.StallCode, res.StallWhy, r.t.Head, phaseLand, "land")
 }
 
 // landTask lands the task's head, r.t.Head at r.t.HeadCommit, on
 // r.t.Branch (section 7). A campaign being belayed drops the task first
-// (check-campaign). Without consent (a pass, or land decided by Command
+// (check-campaign), and again after the land hail's land, which the
+// belay may have crossed. Without consent (a pass, or land decided by Command
 // or a timeout on a stall) the task asks the captain (askLand); with it
-// (the captain's land on a stall, or a captain's retry of a push) the
+// (the captain's land on a stall, or a captain's retry of a stall from
+// land-push) the
 // push runs at once. land-push pushes (landPush), and land-done sets the
 // task landed with landed_at and logs it. Push mode writes nothing to
 // the tracker: the issue stays open for the human who merges.
@@ -1495,6 +1508,9 @@ func (r *taskRun) landTask(consent bool) (landResult, error) {
 			return campaignBranch(c, id, ref)
 		}, dbos.WithStepName("land-branch"))
 		if err != nil {
+			if r.ctx.Err() != nil {
+				return landResult{}, err
+			}
 			return landResult{StallCode: stallPushFailed, StallWhy: "no land branch: " + oneLine(stepError(err))}, nil
 		}
 		if err := r.setTask("task-branch", func(t *store.CampaignTask) { t.Branch = branch }, "", "", nil); err != nil {
@@ -1505,6 +1521,10 @@ func (r *taskRun) landTask(consent bool) (landResult, error) {
 		res, ok, err := r.askLand()
 		if err != nil || !ok {
 			return res, err
+		}
+		// The campaign may have been belayed while the hail was open.
+		if belaying, err := r.belaying(); err != nil || belaying {
+			return landResult{Drop: belaying, DropWhy: "campaign belayed"}, err
 		}
 	} else if err := r.setTask("task-landing", func(t *store.CampaignTask) {
 		t.State, t.OpenOrder, t.OpenHail, t.Why = store.TaskLanding, "", "", ""
@@ -1520,10 +1540,10 @@ func (r *taskRun) landTask(consent bool) (landResult, error) {
 		if r.ctx.Err() != nil {
 			return landResult{}, err
 		}
-		return landResult{StallCode: stallPushFailed, StallWhy: "land-push: " + oneLine(stepError(err))}, nil
+		return landResult{StallCode: stallPushFailed, StallWhy: "land-push: " + oneLine(stepError(err)), FromPush: true}, nil
 	}
 	if pushed.Code != "" {
-		return landResult{StallCode: pushed.Code, StallWhy: pushed.Why}, nil
+		return landResult{StallCode: pushed.Code, StallWhy: pushed.Why, FromPush: true}, nil
 	}
 	t := r.t
 	text := fmt.Sprintf("%s landed on %s at %s", r.in.Ref, oneLine(branch), shortCommit(commit))
@@ -1697,7 +1717,14 @@ type landPushed struct {
 // branch exists and has moved) stalls push_rejected at once; a refusal
 // (the order, its branch in the clone, the branch name) stalls
 // push_failed at once, and so does a transient error out of tries.
+//
+// A head whose done entry holds work on any repo other than the
+// campaign's alone is refused (push_failed): ls-remote checks only the
+// campaign's repo, and PushOrder would push every repo in the entry.
 func (d *Daemon) landPush(ctx context.Context, repo, head, commit, branch string) (landPushed, error) {
+	if why, err := d.landRepoCheck(ctx, repo, head); err != nil || why != "" {
+		return landPushed{Code: stallPushFailed, Why: why}, err
+	}
 	wait := d.landBackoff
 	for try := 1; ; try++ {
 		at, err := d.remoteBranch(ctx, repo, branch)
@@ -1735,8 +1762,35 @@ func (d *Daemon) landPush(ctx context.Context, repo, head, commit, branch string
 	}
 }
 
+// landRepoCheck is why head order's work can't be landed on repo, ""
+// when its done entry holds work on repo and no other.
+func (d *Daemon) landRepoCheck(ctx context.Context, repo, head string) (string, error) {
+	e, err := d.store.LastOrderLog(ctx, head, logDone)
+	if err != nil {
+		return "", fmt.Errorf("order %s's done entry: %w", head, err)
+	}
+	var p donePayload
+	if err := json.Unmarshal(e.Payload, &p); err != nil {
+		return "", fmt.Errorf("order %s's done entry: %w", head, err)
+	}
+	if len(p.Repos) != 1 || p.Repos[0].Name != repo {
+		names := make([]string, len(p.Repos))
+		for i, l := range p.Repos {
+			names[i] = l.Name
+		}
+		return fmt.Sprintf("%s holds work on repos [%s]; a campaign lands work on repo %s alone", head,
+			strings.Join(names, ", "), repo), nil
+	}
+	return "", nil
+}
+
 // remoteBranch is the commit refs/heads/<branch> is at on repo's
 // registered URL (`git ls-remote`), "" when the branch doesn't exist.
+// ls-remote applies the captain's url.*.insteadOf, as a push does, but
+// not url.*.pushInsteadOf: with a pushInsteadOf for the URL it reads
+// where the bridge fetches, which may differ from where PushOrder
+// pushes. Then a replay can push again, and a non-forced push of the
+// same commit changes nothing.
 func (d *Daemon) remoteBranch(ctx context.Context, repo, branch string) (string, error) {
 	url, ok := d.repos[repo]
 	if !ok {

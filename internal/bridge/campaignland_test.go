@@ -258,6 +258,17 @@ func TestCampaignLandBelayed(t *testing.T) {
 		require.Equal(t, TaskResult{State: store.TaskDropped, Why: "campaign belayed"}, g.result())
 		require.Empty(t, g.remoteAt(testBranch))
 	})
+	t.Run("land hail answered land", func(t *testing.T) {
+		t.Parallel()
+		g := newCampaignRig(t, campaignOpts{})
+		work, _ := g.pass()
+		h, _ := g.landHail()
+		g.belayCampaign()
+		g.answer(h.ID, "land")
+		require.Equal(t, TaskResult{State: store.TaskDropped, Why: "campaign belayed"}, g.result())
+		require.Empty(t, g.remoteAt(testBranch))
+		require.Empty(t, g.pushes(work.ID))
+	})
 	t.Run("land on a stall", func(t *testing.T) {
 		t.Parallel()
 		g := newCampaignRig(t, campaignOpts{maxRounds: 1})
@@ -287,4 +298,81 @@ func TestCampaignRestartDuringLand(t *testing.T) {
 	require.Equal(t, []string{"repo app pushed to " + testBranch + " at " + c1[:12]}, g.pushes(work.ID))
 	require.Equal(t, []string{"r1:work", "r1:review"}, g.taskOrders())
 	require.Equal(t, []string{"land-1"}, g.landHails())
+}
+
+// A stall before the push had no land consent: after Command's land on a
+// stall, a land context git can't read stalls push_failed, and the
+// captain's retry of it asks with campaign_land before anything is
+// pushed. Command's retry of a push_rejected stall asks again under
+// land-2 and pushes nothing.
+func TestCampaignLandRetryConsent(t *testing.T) {
+	t.Parallel()
+	t.Run("land-context stall", func(t *testing.T) {
+		t.Parallel()
+		g := newCampaignRig(t, campaignOpts{maxRounds: 1})
+		work, c1, _, h := g.blockAtMaxRounds()
+		away := g.clone + ".away"
+		require.NoError(t, os.Rename(g.clone, away))
+		g.decideAs(h.ID, "land", comms.DecidedByCommand)
+		sh, c := g.stallHail()
+		require.Equal(t, stallPushFailed, c.Code)
+		require.Contains(t, c.Reason, "land-context: ")
+		require.NoError(t, os.Rename(away, g.clone))
+		g.answer(sh.ID, "retry")
+		lh, _ := g.landHail()
+		require.Equal(t, "land-1", lh.RaiseKey)
+		require.Empty(t, g.remoteAt(testBranch), "nothing pushed before the captain answers campaign_land")
+		require.Empty(t, g.pushes(work.ID))
+		g.answer(lh.ID, "land")
+		require.Equal(t, store.TaskLanded, g.result().State)
+		require.Equal(t, c1, g.remoteAt(testBranch))
+	})
+	t.Run("command retry of push_rejected", func(t *testing.T) {
+		t.Parallel()
+		g := newCampaignRig(t, campaignOpts{})
+		work, _ := g.pass()
+		h, _ := g.landHail()
+		other := g.commit("ORD-9999", g.base)
+		gitT(t, g.clone, "push", "-q", g.remote, other+":refs/heads/"+testBranch)
+		g.answer(h.ID, "land")
+		sh, c := g.stallHail()
+		require.Equal(t, stallPushRejected, c.Code)
+		g.decideAs(sh.ID, "retry", comms.DecidedByCommand)
+		require.EventuallyWithT(t, func(c *assert.CollectT) {
+			require.Equal(c, []string{"land-1", "land-2"}, g.landHails())
+		}, 30*time.Second, 20*time.Millisecond)
+		g.waitHail(regs.CategoryCampaignLand)
+		require.Equal(t, other, g.remoteAt(testBranch))
+		require.Len(t, g.pushes(work.ID), 1, "the rejected push alone")
+		require.Equal(t, store.TaskLanding, g.row().State)
+	})
+}
+
+// A head whose done entry holds work on another repo too is refused
+// before anything is pushed: push_failed, naming the repos.
+func TestCampaignLandOtherRepos(t *testing.T) {
+	t.Parallel()
+	g := newCampaignRig(t, campaignOpts{})
+	work := g.waitOrder("r1:work")
+	g.claim(work.ID, "sorell")
+	c1 := g.commit(work.ID, g.base)
+	ctx := t.Context()
+	_, err := g.d.store.AppendLog(ctx, store.LogEntry{Kind: logOrder, OrderID: work.ID,
+		Text:    "repo app shipped to the beam at " + g.base[:12] + " (main)",
+		Payload: mustJSON(t, map[string]string{"repo": "app", "base_ref": "main", "commit": g.base, "from": "main"})})
+	require.NoError(t, err)
+	p := donePayload{Summary: "summary", Repos: []landedRepo{{Name: "app", Branch: orderBranch(work.ID), Commit: c1},
+		{Name: "lib", Branch: orderBranch(work.ID), Commit: c1}}}
+	_, settled, err := g.d.store.SettleOrder(ctx, work.ID, store.OrderDone,
+		store.LogEntry{Kind: logDone, CrewID: "sorell", OrderID: work.ID, Text: "done", Payload: mustJSON(t, p)}, nil)
+	require.NoError(t, err)
+	require.True(t, settled)
+	g.reviewDone(g.waitOrder("r1:review").ID, "tuvok", c1, verdictOf())
+	h, _ := g.landHail()
+	g.answer(h.ID, "land")
+	_, c := g.stallHail()
+	require.Equal(t, stallPushFailed, c.Code)
+	require.Contains(t, c.Reason, work.ID+" holds work on repos [app, lib]; a campaign lands work on repo app alone")
+	require.Empty(t, g.remoteAt(testBranch))
+	require.Empty(t, g.pushes(work.ID))
 }
