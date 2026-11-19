@@ -250,7 +250,7 @@ func (b *holodeckBridge) start(t *testing.T) *hdaemon {
 	case err := <-done:
 		cancel()
 		t.Fatalf("Run returned before ready: %v", err)
-	case <-time.After(20 * time.Second):
+	case <-time.After(daemonReadyTimeout):
 		cancel()
 		t.Fatal("daemon not ready")
 	}
@@ -1038,3 +1038,9 @@ func TestMissionWorkComesBack(t *testing.T) {
 	require.Equal(t, "holodeck work committed (app: bmus/"+id+" at "+commit[:12]+")", done[0].Text)
 	requireNoBackstop(t, hd.logEntries(t))
 }
+
+// daemonReadyTimeout bounds a test's wait for Run to report ready. DBOS
+// applies its SQLite migrations at every start, one statement at a time,
+// and on a CI runner busy with -race and parallel tests that alone has
+// taken 18 seconds.
+const daemonReadyTimeout = 60 * time.Second
