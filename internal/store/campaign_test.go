@@ -820,3 +820,76 @@ func TestCampaignWrites(t *testing.T) {
 	require.Len(t, entries, 1)
 	require.Equal(t, review, entries[0].OrderID)
 }
+
+// InsertCampaign (#186) inserts the campaign and its task under the next
+// id, with one entry, and refuses an id that isn't the next and a ref in
+// another open task, writing nothing. A ref whose task was dropped may
+// start again. BelayCampaign sets a running campaign belaying once and
+// refuses an ended one.
+func TestInsertAndBelayCampaign(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := openTest(t)
+	id, err := s.NextCampaignID(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "C-0001", id)
+	c := Campaign{ID: id, Land: "push", Repo: "app", BaseRef: "main", Assignee: "sorell", ReviewDivision: "science", MaxRounds: 2}
+	task := CampaignTask{Ref: "o/r#12", MaxRounds: 2, Branch: "campaign/C-0001/o-r-12"}
+	require.NoError(t, s.InsertCampaign(ctx, c, task, LogEntry{Text: "campaign C-0001 started"}))
+	got, err := s.GetCampaign(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, []any{CampaignRunning, "push", "app", "main", "", "sorell", "science", 2},
+		[]any{got.State, got.Land, got.Repo, got.BaseRef, got.Division, got.Assignee, got.ReviewDivision, got.MaxRounds})
+	tk, err := s.GetTask(ctx, id, "o/r#12")
+	require.NoError(t, err)
+	require.Equal(t, []any{TaskWorkflowID(id, "o/r#12"), TaskWorking, 1, 2, "campaign/C-0001/o-r-12"},
+		[]any{tk.WorkflowID, tk.State, tk.Round, tk.MaxRounds, tk.Branch})
+	entries, err := s.ListLog(ctx, 0)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, LogKindCampaign, entries[0].Kind)
+	require.JSONEq(t, `{"campaign":"C-0001","ref":"o/r#12"}`, string(entries[0].Payload))
+
+	open, err := s.OpenTaskOf(ctx, "o/r#12")
+	require.NoError(t, err)
+	require.Equal(t, "C-0001", open)
+	c.ID = "C-0002"
+	var ote *OpenTaskError
+	require.ErrorAs(t, s.InsertCampaign(ctx, c, task, LogEntry{Text: "again"}), &ote)
+	require.Equal(t, "o/r#12 is already in campaign C-0001's open task", ote.Error())
+	c.ID = "C-0005"
+	require.ErrorIs(t, s.InsertCampaign(ctx, c, CampaignTask{Ref: "o/r#13", MaxRounds: 2, Branch: "b"}, LogEntry{Text: "x"}),
+		ErrCampaignID)
+	all, err := s.ListCampaigns(ctx)
+	require.NoError(t, err)
+	require.Len(t, all, 1)
+	entries, err = s.ListLog(ctx, 0)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+
+	wrote, err := s.BelayCampaign(ctx, id, LogEntry{Text: "belayed"})
+	require.NoError(t, err)
+	require.True(t, wrote)
+	wrote, err = s.BelayCampaign(ctx, id, LogEntry{Text: "belayed again"})
+	require.NoError(t, err)
+	require.False(t, wrote)
+	got, err = s.GetCampaign(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, CampaignBelaying, got.State)
+	tk.State = TaskDropped
+	_, err = s.SetTask(ctx, tk, LogEntry{})
+	require.NoError(t, err)
+	_, err = s.EndCampaign(ctx, id, LogEntry{Text: "ended"})
+	require.NoError(t, err)
+	_, err = s.BelayCampaign(ctx, id, LogEntry{Text: "too late"})
+	require.ErrorIs(t, err, ErrCampaignEnded)
+	_, err = s.BelayCampaign(ctx, "C-0009", LogEntry{Text: "none"})
+	require.ErrorIs(t, err, sql.ErrNoRows)
+
+	// The dropped task's ref may start again, under the next id.
+	c.ID = "C-0002"
+	require.NoError(t, s.InsertCampaign(ctx, c, task, LogEntry{Text: "campaign C-0002 started"}))
+	all, err = s.ListCampaigns(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{"C-0001", "C-0002"}, []string{all[0].ID, all[1].ID})
+}
