@@ -74,13 +74,15 @@ func neverAutoAnswered() []tableCase {
 	command := func(name string, h Hail, r Reply) { cases = append(cases, tableCase{name, h, r, RouteCommand, nil}) }
 
 	// Every captain_only category, offering an option Command could pick.
-	for _, cat := range []string{"order_split", "tracker_close", "tracker_comment", "order_reorder"} {
+	for _, cat := range []string{"order_split", "tracker_close", "tracker_comment", "order_reorder", CategoryCampaignStalled} {
 		captain(cat, Hail{Category: cat, Question: "Go ahead?", Options: []string{"approve", "reject"}})
 	}
 	// Fixed to the captain whatever regs.yaml says (#119, #152): no config
 	// lists them.
 	captain("budget", Hail{Category: CategoryBudget, Question: "Extend or stop?", Options: []string{"extend", "stop"}})
 	captain("tracker_review", Hail{Category: CategoryTrackerReview, Question: "Review 5 issues?", Options: []string{"keep", "discard"}})
+	captain("campaign_land", Hail{Category: CategoryCampaignLand, Question: "Land o/r#12 of campaign C-0001?",
+		Options: []string{"land", "retry", "drop"}})
 
 	// The tags, through every spelling found.
 	for _, c := range [][2]string{
@@ -711,10 +713,10 @@ func TestNeverAutoAnswered(t *testing.T) {
 	}
 }
 
-// A budget hail (#119) and a tracker_review hail (#152) are the captain's
-// whatever regs.yaml says: with no rule for them, with a captain_only rule
-// for them dropped or added, under an auto_allow that allows any command,
-// and unchecked. auto_allow can't name them, and no answer passes
+// A budget hail (#119), a tracker_review hail (#152) and a campaign_land
+// hail (#183) are the captain's whatever regs.yaml says: with no rule for
+// them, with a captain_only rule for them dropped or added, under an
+// auto_allow that allows any command, and unchecked. auto_allow can't name them, and no answer passes
 // CheckAnswer.
 func TestFixedToCaptain(t *testing.T) {
 	t.Parallel()
@@ -723,6 +725,9 @@ func TestFixedToCaptain(t *testing.T) {
 			Options: []string{"extend", "stop"}},
 		{Category: CategoryTrackerReview, Question: "Review 5 issues filed from ORD-0001's findings: keep or discard?",
 			Options: []string{"keep", "discard"}},
+		{Category: CategoryCampaignLand, Question: "Land o/r#12 of campaign C-0001: push ORD-0011 (3f2a9c1e0b7d) to " +
+			"campaign/C-0001/o-r-12 on repo app, 4 commits over 8b1d0e2c4a55, passed review in round 2?",
+			Options: []string{"land", "retry", "drop"}},
 	} {
 		t.Run(h.Category, func(t *testing.T) {
 			t.Parallel()
@@ -756,6 +761,8 @@ func TestFixedToCaptain(t *testing.T) {
 	require.Empty(t, CaptainFixed(CategoryToolApproval))
 	require.Empty(t, CaptainFixed("tracker_create"))
 	require.Empty(t, CaptainFixed("findings_triage"))
+	require.Empty(t, CaptainFixed(CategoryCampaignTriage))
+	require.Empty(t, CaptainFixed(CategoryCampaignStalled))
 }
 
 // The default lists what #148 requires under captain_only.
@@ -774,8 +781,17 @@ func TestDefaultCaptainOnly(t *testing.T) {
 		`category "tracker_close"`,
 		`category "tracker_comment"`,
 		`category "order_reorder"`,
+		`category "campaign_stalled"`,
 		`option "(?i)delete|destroy|force"`,
 	})
+	// Earlier rules keep their numbers: campaign_stalled comes after
+	// order_reorder (#183).
+	require.Equal(t, `category "order_reorder"`, got[7])
+	require.Equal(t, `category "campaign_stalled"`, got[8])
+	// campaign_triage goes to Command unless listed, and campaign_land is
+	// fixed to the captain anyway.
+	require.NotContains(t, got, `category "campaign_triage"`)
+	require.NotContains(t, got, `category "campaign_land"`)
 	// No code raises tracker_create, and findings_triage listed here would
 	// turn triage off (#152).
 	require.NotContains(t, got, `category "tracker_create"`)

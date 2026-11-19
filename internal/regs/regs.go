@@ -54,6 +54,19 @@ const CategoryBudget = "budget"
 // closes issues, so it is fixed to the captain (CaptainFixed).
 const CategoryTrackerReview = "tracker_review"
 
+// Campaign hails (#183, spec/campaigns-stage-3-plan-2026-11-16.md section
+// 4), raised by a campaign's task workflow. CategoryCampaignTriage asks
+// whether to file, fix or drop a review's medium findings, and goes to
+// Command unless regs.yaml lists it. CategoryCampaignStalled asks what to
+// do with a stalled task; the default regs.yaml lists it under
+// captain_only. CategoryCampaignLand asks to push a task's branch, and
+// is fixed to the captain (CaptainFixed).
+const (
+	CategoryCampaignTriage  = "campaign_triage"
+	CategoryCampaignStalled = "campaign_stalled"
+	CategoryCampaignLand    = "campaign_land"
+)
+
 // captainFixed are the categories only the captain answers, whatever
 // regs.yaml says, with why. Classify routes them to the captain before any
 // rule, and CheckAnswer rejects every answer to them; the hail workflow
@@ -62,6 +75,7 @@ const CategoryTrackerReview = "tracker_review"
 var captainFixed = map[string]string{
 	CategoryBudget:        "category budget is fixed to the captain",
 	CategoryTrackerReview: "category tracker_review is fixed to the captain",
+	CategoryCampaignLand:  "category campaign_land is fixed to the captain",
 }
 
 // CaptainFixed reports why hails of category are fixed to the captain
