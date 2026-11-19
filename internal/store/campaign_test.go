@@ -714,4 +714,109 @@ func TestOpenTaskHeads(t *testing.T) {
 	heads, err := s.OpenTaskHeads(ctx)
 	require.NoError(t, err)
 	require.Equal(t, []TaskHead{{Ref: "o/r#1", Repo: "app", Head: "ORD-0001"}, {Ref: "o/r#2", Repo: "app", Head: "ORD-0002"}}, heads)
+
+	// The open work order of a task counts as a head between its end and
+	// check-head (#184); an open review doesn't, nor a dropped task's.
+	work, err := s.InsertOrder(ctx, Order{Title: "w", Division: "eng", State: OrderDone, Task: "campaign/C-0005/task/o/r#5", Round: 1},
+		LogEntry{Kind: "order"})
+	require.NoError(t, err)
+	review, err := s.InsertOrder(ctx, Order{Title: "r", Division: "science", Kind: OrderKindReview, Task: "campaign/C-0001/task/o/r#1",
+		Round: 1, ReviewBase: testBase}, LogEntry{Kind: "order"})
+	require.NoError(t, err)
+	for _, u := range []struct{ id, order string }{{"C-0005", work}, {"C-0001", review}, {"C-0004", work}} {
+		_, err := s.db.ExecContext(ctx, `UPDATE campaign_tasks SET open_order = ? WHERE campaign_id = ?`, u.order, u.id)
+		require.NoError(t, err)
+	}
+	heads, err = s.OpenTaskHeads(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "ORD-0001", work)
+	require.Equal(t, []TaskHead{{Ref: "o/r#1", Repo: "app", Head: "ORD-0001"}, {Ref: "o/r#5", Repo: "app", Head: work},
+		{Ref: "o/r#2", Repo: "app", Head: "ORD-0002"}}, heads)
+}
+
+// The campaign reads and writes of #184: a campaign and its tasks,
+// OpenCampaigns leaving out an ended one, EndCampaign once, SetTask with
+// no text writing the row alone, TaskOrderIDs by kind, and
+// AddVerdictFindings writing each key once and its entries only with a
+// row.
+func TestCampaignWrites(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s := openTest(t)
+	insertCampaign(t, s, "C-0001", "o/r#12")
+	insertCampaign(t, s, "C-0002", "")
+	_, err := s.db.ExecContext(ctx, `UPDATE campaigns SET state = ? WHERE id = 'C-0002'`, CampaignEnded)
+	require.NoError(t, err)
+	cs, err := s.OpenCampaigns(ctx)
+	require.NoError(t, err)
+	require.Len(t, cs, 1)
+	require.Equal(t, []any{"C-0001", CampaignRunning, "app", "main", "science", 3}, []any{cs[0].ID, cs[0].State, cs[0].Repo,
+		cs[0].BaseRef, cs[0].ReviewDivision, cs[0].MaxRounds})
+	tasks, err := s.CampaignTasks(ctx, "C-0001")
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	require.Equal(t, "o/r#12", tasks[0].Ref)
+
+	last, err := s.LastLogID(ctx)
+	require.NoError(t, err)
+	next := tasks[0]
+	next.OpenHail = "H-0001"
+	wrote, err := s.SetTask(ctx, next, LogEntry{})
+	require.NoError(t, err)
+	require.True(t, wrote)
+	got, err := s.GetTask(ctx, "C-0001", "o/r#12")
+	require.NoError(t, err)
+	require.Equal(t, "H-0001", got.OpenHail)
+	entries, err := s.ListLog(ctx, last)
+	require.NoError(t, err)
+	require.Empty(t, entries, "no text, no entry")
+
+	for i := range 2 {
+		wrote, err := s.EndCampaign(ctx, "C-0001", LogEntry{Text: "campaign C-0001 ended: o/r#12 landed"})
+		require.NoError(t, err)
+		require.Equal(t, i == 0, wrote)
+	}
+	c, err := s.GetCampaign(ctx, "C-0001")
+	require.NoError(t, err)
+	require.Equal(t, CampaignEnded, c.State)
+	require.NotNil(t, c.EndedAt)
+	entries, err = s.ListLog(ctx, last)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, LogKindCampaign, entries[0].Kind)
+	require.JSONEq(t, `{"campaign":"C-0001"}`, string(entries[0].Payload))
+	_, err = s.EndCampaign(ctx, "C-0009", LogEntry{Text: "x"})
+	require.ErrorIs(t, err, sql.ErrNoRows)
+
+	task := "campaign/C-0001/task/o/r#12"
+	work, err := s.InsertOrder(ctx, Order{Title: "w", Division: "eng", Task: task, Round: 1}, LogEntry{Kind: "order"})
+	require.NoError(t, err)
+	review, err := s.InsertOrder(ctx, Order{Title: "r", Division: "science", Kind: OrderKindReview, Task: task, Round: 1,
+		ReviewBase: testBase}, LogEntry{Kind: "order"})
+	require.NoError(t, err)
+	ids, err := s.TaskOrderIDs(ctx, task, "")
+	require.NoError(t, err)
+	require.Equal(t, []string{work, review}, ids)
+	ids, err = s.TaskOrderIDs(ctx, task, OrderKindReview)
+	require.NoError(t, err)
+	require.Equal(t, []string{review}, ids)
+
+	last, err = s.LastLogID(ctx)
+	require.NoError(t, err)
+	fs := []Finding{{Key: VerdictFindingKey(1), Title: "Leak", Body: "x.go:3\n\nbody", Severity: "medium"},
+		{Key: VerdictFindingKey(4), Title: "Later", Severity: "low"}}
+	for i := range 2 {
+		n, err := s.AddVerdictFindings(ctx, review, "tuvok", fs, LogEntry{Kind: "order", Text: "verdict findings"})
+		require.NoError(t, err)
+		require.Equal(t, 2*(1-i), n)
+	}
+	rows, err := s.OrderFindings(ctx, review)
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	require.Equal(t, []any{"verdict.1", "tuvok", "Leak", "medium", FindingNew}, []any{rows[0].Key, rows[0].CrewID, rows[0].Title,
+		rows[0].Severity, rows[0].State})
+	entries, err = s.ListLog(ctx, last)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, review, entries[0].OrderID)
 }

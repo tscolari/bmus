@@ -383,3 +383,44 @@ func deref(p *string) string {
 	}
 	return *p
 }
+
+// VerdictFindingKey is the findings key of a review verdict's nth finding,
+// from 1 (#184): verdict.1, verdict.2. A finding key from a beam can't
+// hold a dot, so these never meet one.
+func VerdictFindingKey(n int) string { return fmt.Sprintf("verdict.%d", n) }
+
+// AddVerdictFindings writes fs as review order id's findings, filed by
+// crewID, state new, received now, and appends entries, in one
+// transaction (#184): the task workflow's lows and filed mediums of the
+// review's verdict, keyed VerdictFindingKey. A key the order already has
+// is left as it is (INSERT OR IGNORE), so a re-run of the step writes
+// nothing twice; entries are written only when a row was.
+func (s *Store) AddVerdictFindings(ctx context.Context, id, crewID string, fs []Finding, entries ...LogEntry) (int, error) {
+	n := 0
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		now := time.Now().UTC()
+		for _, f := range fs {
+			res, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO findings (order_id, key, crew_id, title, body, severity, received_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?)`, id, f.Key, crewID, f.Title, f.Body, f.Severity, now)
+			if err != nil {
+				return err
+			}
+			added, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			n += int(added)
+		}
+		if n == 0 {
+			return nil
+		}
+		for _, e := range entries {
+			e.OrderID = id
+			if _, err := s.appendLog(ctx, tx, e); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return n, err
+}

@@ -364,7 +364,7 @@ func startDaemonConfig(t *testing.T, cfg Config) running {
 	case err := <-done:
 		cancel()
 		t.Fatalf("Run returned before ready: %v", err)
-	case <-time.After(20 * time.Second):
+	case <-time.After(daemonReadyTimeout):
 		cancel()
 		t.Fatal("daemon not ready")
 	}

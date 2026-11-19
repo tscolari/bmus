@@ -200,8 +200,11 @@ type Config struct {
 	// retries.
 	copyRetries []dbos.StepOption
 	// trackerRetries, if set, replaces the package's trackerRetries for
-	// list-backlog and file-finding (#155).
+	// list-backlog and file-finding (#155), and a campaign's order steps
+	// (#184).
 	trackerRetries []dbos.StepOption
+	// taskRecheck, if set, replaces defaultTaskRecheck (#184).
+	taskRecheck time.Duration
 }
 
 // MaxHailParkAfter is the longest Config.HailParkAfter: combadge serve's
@@ -360,6 +363,9 @@ type Daemon struct {
 	// trackerRetries are the retries of list-backlog and file-finding:
 	// Config.trackerRetries, or the package's trackerRetries.
 	trackerRetries []dbos.StepOption
+	// taskRecheck is how often a campaign task rereads what it waits on
+	// without a message (#184).
+	taskRecheck time.Duration
 }
 
 // daemonKey is the context key under which the Daemon travels to workflows.
@@ -529,6 +535,7 @@ func Run(ctx context.Context, cfg Config) (err error) {
 		loginWait:         cmp.Or(cfg.loginWait, defaultLoginWait),
 		copyRetries:       cfg.copyRetries,
 		trackerRetries:    cfg.trackerRetries,
+		taskRecheck:       cmp.Or(cfg.taskRecheck, defaultTaskRecheck),
 		maxBundleBytes:    cmp.Or(cfg.MaxBundleBytes, DefaultMaxBundleBytes),
 		divisions:         maps.Clone(cfg.Divisions), limits: roster.Transporter,
 		standingOrdersDefault: cfg.StandingOrders, wakeSend: cfg.wakeSend,
@@ -591,6 +598,10 @@ func Run(ctx context.Context, cfg Config) (err error) {
 	if err := d.register(); err != nil {
 		return err
 	}
+	// Every order of a campaign task that ends wakes its task workflow
+	// (#184), from here on.
+	st.SetTaskHook(d.notifyTask)
+	defer st.SetTaskHook(nil)
 	if cfg.registerExtra != nil {
 		cfg.registerExtra(d.dbos)
 	}
@@ -609,6 +620,10 @@ func Run(ctx context.Context, cfg Config) (err error) {
 		return err
 	}
 	if err := d.attachCrewTours(ctx); err != nil {
+		return err
+	}
+	// A running campaign inserted but never started starts now (#184).
+	if err := d.attachCampaigns(ctx); err != nil {
 		return err
 	}
 
@@ -736,6 +751,14 @@ func (d *Daemon) register() error {
 	dbos.RegisterWorkflow(ctx, findingsWorkflow,
 		dbos.WithWorkflowName(findingsWorkflowName),
 		// Triage may wait on Command through many restarts.
+		dbos.WithMaxRecoveryAttempts(-1))
+	dbos.RegisterWorkflow(ctx, campaignWorkflow,
+		dbos.WithWorkflowName(campaignWorkflowName),
+		// A campaign waits on its task through many restarts (#184).
+		dbos.WithMaxRecoveryAttempts(-1))
+	dbos.RegisterWorkflow(ctx, campaignTaskWorkflow,
+		dbos.WithWorkflowName(campaignTaskWorkflowName),
+		// A task waits on orders and hails through many restarts.
 		dbos.WithMaxRecoveryAttempts(-1))
 
 	// The queue's limits are persisted in the system database. The roster

@@ -110,7 +110,9 @@ func sameTask(a, b CampaignTask) bool {
 // appends entry, in one transaction (#180): every column but the
 // workflow id takes t's value. entry is logged with kind LogKindCampaign
 // and its payload gains campaign, ref and round, as written;
-// entry.OrderID names the order concerned, if any. A row that already
+// entry.OrderID names the order concerned, if any. An entry with no text
+// is not logged (#184: the stall's hail id joins the row after the stall
+// was logged). A row that already
 // holds t's values is left alone and nothing is logged, so a re-run of
 // the step that moved the task writes nothing. It reports whether it
 // wrote. A missing task returns sql.ErrNoRows. The task workflow must be
@@ -137,6 +139,9 @@ func (s *Store) SetTask(ctx context.Context, t CampaignTask, entry LogEntry) (wr
 			return err
 		}
 		wrote = true
+		if entry.Text == "" {
+			return nil
+		}
 		entry.Kind = LogKindCampaign
 		for _, f := range []struct {
 			key   string
@@ -267,9 +272,16 @@ type TaskHead struct {
 
 // OpenTaskHeads returns the head of every task that has one and hasn't
 // landed or been dropped (#182), by head: jettison keeps their branches.
+// A task's open work order counts as a head too (#184): the task holds it
+// as its open order from its creation until check-head makes it the
+// head, so its branch is kept between the order's end and that step.
 func (s *Store) OpenTaskHeads(ctx context.Context) ([]TaskHead, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT t.ref, c.repo, t.head FROM campaign_tasks t JOIN campaigns c ON c.id = t.campaign_id
-		WHERE t.head <> '' AND t.state NOT IN (?, ?) ORDER BY t.head`, TaskLanded, TaskDropped)
+		WHERE t.head <> '' AND t.state NOT IN (?, ?)
+		UNION SELECT t.ref, c.repo, t.open_order FROM campaign_tasks t JOIN campaigns c ON c.id = t.campaign_id
+		JOIN orders o ON o.id = t.open_order
+		WHERE o.kind = ? AND t.state NOT IN (?, ?)
+		ORDER BY 3, 1`, TaskLanded, TaskDropped, OrderKindWork, TaskLanded, TaskDropped)
 	if err != nil {
 		return nil, err
 	}
@@ -283,4 +295,138 @@ func (s *Store) OpenTaskHeads(ctx context.Context) ([]TaskHead, error) {
 		out = append(out, h)
 	}
 	return out, rows.Err()
+}
+
+// Campaign states (campaigns.state, #180).
+const (
+	CampaignRunning  = "running"
+	CampaignBelaying = "belaying"
+	CampaignEnded    = "ended"
+)
+
+// Campaign is a row of the campaigns table (#180).
+type Campaign struct {
+	ID    string
+	State string
+	Land  string
+	Repo  string
+	// BaseRef is where round 1's work starts.
+	BaseRef string
+	// Division and Assignee are where round 1's work order goes: to
+	// Assignee when set, else to Division's pool.
+	Division       string
+	Assignee       string
+	ReviewDivision string
+	MaxRounds      int
+	CreatedAt      time.Time
+	EndedAt        *time.Time
+}
+
+const campaignCols = `id, state, land, repo, base_ref, division, assignee, review_division, max_rounds, created_at, ended_at`
+
+func scanCampaign(row interface{ Scan(...any) error }) (Campaign, error) {
+	var (
+		c     Campaign
+		ended sql.NullTime
+	)
+	err := row.Scan(&c.ID, &c.State, &c.Land, &c.Repo, &c.BaseRef, &c.Division, &c.Assignee, &c.ReviewDivision, &c.MaxRounds,
+		&c.CreatedAt, &ended)
+	if ended.Valid {
+		c.EndedAt = &ended.Time
+	}
+	return c, err
+}
+
+// GetCampaign returns campaign id, or sql.ErrNoRows.
+func (s *Store) GetCampaign(ctx context.Context, id string) (Campaign, error) {
+	return scanCampaign(s.db.QueryRowContext(ctx, `SELECT `+campaignCols+` FROM campaigns WHERE id = ?`, id))
+}
+
+// OpenCampaigns returns the campaigns that haven't ended (running or
+// belaying), by id: the bridge starts the workflow of each at startup
+// (#184).
+func (s *Store) OpenCampaigns(ctx context.Context) ([]Campaign, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+campaignCols+` FROM campaigns WHERE state <> ? ORDER BY id`, CampaignEnded)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Campaign
+	for rows.Next() {
+		c, err := scanCampaign(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// CampaignTasks returns campaign id's tasks, by ref.
+func (s *Store) CampaignTasks(ctx context.Context, id string) ([]CampaignTask, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+taskCols+` FROM campaign_tasks WHERE campaign_id = ? ORDER BY ref`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CampaignTask
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// EndCampaign sets campaign id ended, with ended_at now, and appends
+// entry with kind LogKindCampaign and the campaign in its payload, in one
+// transaction (#184). A campaign already ended is left alone and nothing
+// is logged, so a re-run of the step writes nothing. It reports whether
+// it wrote; a missing campaign returns sql.ErrNoRows.
+func (s *Store) EndCampaign(ctx context.Context, id string, entry LogEntry) (bool, error) {
+	wrote := false
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		var state string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM campaigns WHERE id = ?`, id).Scan(&state); err != nil {
+			return err
+		}
+		if state == CampaignEnded {
+			return nil
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE campaigns SET state = ?, ended_at = ? WHERE id = ?`,
+			CampaignEnded, time.Now().UTC(), id); err != nil {
+			return err
+		}
+		wrote = true
+		entry.Kind = LogKindCampaign
+		var err error
+		if entry.Payload, err = withField(entry.Payload, "campaign", id); err != nil {
+			return err
+		}
+		_, err = s.appendLog(ctx, tx, entry)
+		return err
+	})
+	return wrote, err
+}
+
+// TaskOrderIDs returns the orders of task (its workflow id) of kind,
+// every kind when kind is "", in creation order.
+func (s *Store) TaskOrderIDs(ctx context.Context, task, kind string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM orders WHERE task = ? AND (? = '' OR kind = ?) ORDER BY rowid`,
+		task, kind, kind)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
