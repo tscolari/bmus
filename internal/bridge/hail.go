@@ -318,6 +318,11 @@ func (d *Daemon) classifyHail(ctx context.Context, id string) (hailRouting, erro
 		// nothing, and its issues keep bmus:unreviewed.
 		r.RemindEvery, r.Timeout = 0, 0
 	}
+	if h.Category == regs.CategoryCampaignLand {
+		// The task waits on the captain's land (#183): reminders, and no
+		// timeout.
+		r.Timeout = 0
+	}
 	if w := d.regs.CommandMayAnswer.CountermandWindow; w != nil && !r.Advisory {
 		r.CountermandWindow = *w
 	}
@@ -801,9 +806,18 @@ func (d *Daemon) decideCommand(ctx context.Context, id, crew string, r hailRouti
 	if reply.Option != nil {
 		body.Decision = h.Options[*reply.Option]
 	}
+	if isCampaignHail(h) {
+		// Checked against the hail's context and stored in normal form
+		// (#183); a reply that doesn't fit goes to the captain.
+		dec, opt, err := checkCampaignAnswer(h, reply.Answer, reply.Option)
+		if err != nil {
+			return commandOutcome{Why: clip("Command's answer does not fit the hail: "+oneLine(err.Error()), maxCommandRationale)}, nil
+		}
+		body.Decision, body.Option = dec, opt
+	}
 	conf := reply.Confidence
 	decided, err := d.decideOpen(ctx, h, body, store.HailDecision{Route: regs.RouteCommand, Confidence: &conf},
-		"hail "+id+" decided by Command: "+body.Decision, r.CountermandWindow)
+		"hail "+id+" decided by Command: "+oneLine(body.Decision), r.CountermandWindow)
 	return commandOutcome{Decided: decided, Closed: err == nil && !decided}, err
 }
 
@@ -1019,19 +1033,21 @@ func (d *Daemon) notifyRaiser(tx *sql.Tx, id string) error {
 	return nil
 }
 
-// raiseBridgeHail raises hail h from the bridge workflow ctx runs (#152):
-// a raise-hail step records it with deliver_to the workflow's id
-// (store.InsertBridgeHail, entry its log entry), then it starts hail/<id>
-// as a child it never awaits, as the mission does. A replay, or a re-run
-// of the step, raises nothing new: one hail per raiser and category. A
-// second raise of the same category returns the first hail's id, which
-// may already be closed; starting its workflow again starts nothing.
-func raiseBridgeHail(ctx dbos.Context, h store.Hail, entry store.LogEntry) (string, error) {
+// raiseBridgeHail raises hail h under raise key key from the bridge
+// workflow ctx runs (#152, #183): a raise-hail step records it with
+// deliver_to the workflow's id and raise_key key (store.InsertBridgeHail,
+// entry its log entry), then it starts hail/<id> as a child it never
+// awaits, as the mission does. A replay, or a re-run of the step, raises
+// nothing new: one hail per raiser, category and key. A second raise of
+// the same category and key returns the first hail's id, which may
+// already be closed; starting its workflow again starts nothing. Another
+// key raises a new hail. Stage 2's raisers pass no key.
+func raiseBridgeHail(ctx dbos.Context, key string, h store.Hail, entry store.LogEntry) (string, error) {
 	wf, err := dbos.GetWorkflowID(ctx)
 	if err != nil {
 		return "", err
 	}
-	h.DeliverTo = wf
+	h.DeliverTo, h.RaiseKey = wf, key
 	id, err := dbos.RunAsStep(ctx, func(c context.Context) (string, error) {
 		return daemonFrom(c).store.InsertBridgeHail(c, h, entry)
 	}, append([]dbos.StepOption{dbos.WithStepName("raise-hail")}, storeRetries...)...)

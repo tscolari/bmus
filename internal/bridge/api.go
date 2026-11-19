@@ -218,7 +218,9 @@ func (d *Daemon) CreateOrder(ctx context.Context, o store.Order) (string, error)
 // stored in normal form, option 1 when it discards anything, else 0
 // (checkReviewAnswer, #156); option 0 alone keeps every issue and option 1
 // discards every one. A findings_triage hail is Command's alone and is
-// refused.
+// refused. A campaign hail's decision is checked against its context and
+// options and stored in normal form with its option (checkCampaignAnswer,
+// #183).
 func (d *Daemon) AnswerHail(ctx context.Context, hailID, decision string, option *int) error {
 	h, err := d.store.GetHail(ctx, hailID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -249,6 +251,13 @@ func (d *Daemon) AnswerHail(ctx context.Context, hailID, decision string, option
 		// Checked against the review's context, and stored in normal
 		// form with its option (#156). An option alone is its text.
 		if decision, option, err = d.checkReviewAnswer(h, decision, written); err != nil {
+			return err
+		}
+	}
+	if isCampaignHail(h) {
+		// Checked against the hail's context and options, and stored in
+		// normal form with its option (#183).
+		if decision, option, err = checkCampaignAnswer(h, decision, written); err != nil {
 			return err
 		}
 	}
@@ -310,6 +319,8 @@ func (d *Daemon) AnswerHail(ctx context.Context, hailID, decision string, option
 //
 // A bridge-raised hail (#152) has no order or agent to correct: the row and
 // its log entry are written and nothing is sent, the raiser included. A
+// campaign hail's countermand is checked and stored in normal form as
+// AnswerHail's answer is (checkCampaignAnswer, #183). A
 // raiser that acts on a countermandable decision must sleep past
 // countermand_until and re-read the row before acting
 // (spec/campaigns-stage-2-plan-2026-11-14.md section 2); awaitBridgeHail
@@ -325,16 +336,23 @@ func (d *Daemon) CountermandHail(ctx context.Context, hailID, decision string, o
 	if h.Status == store.HailOpen {
 		return false, badRequest("hail %s is open: answer it (`bmus hails answer`)", hailID)
 	}
+	written := option
 	if option != nil {
 		if *option < 0 || *option >= len(h.Options) {
 			return false, badRequest("hail %s: option %d out of range (%d options)", hailID, *option, len(h.Options))
 		}
 		if decision == "" {
-			decision = h.Options[*option]
+			decision, written = h.Options[*option], nil
 		}
 	}
 	if decision == "" {
 		return false, badRequest("a decision or an option is required")
+	}
+	if isCampaignHail(h) {
+		// The task acts on the countermand as on any decision (#183).
+		if decision, option, err = checkCampaignAnswer(h, decision, written); err != nil {
+			return false, err
+		}
 	}
 	note := decision
 	if reason != "" {
@@ -354,7 +372,7 @@ func (d *Daemon) CountermandHail(ctx context.Context, hailID, decision string, o
 	if reason != "" {
 		payload["rationale"] = reason
 	}
-	entry, err := logEntry(logHail, h.CrewID, h.OrderID, "hail "+hailID+" countermanded: "+why, payload)
+	entry, err := logEntry(logHail, h.CrewID, h.OrderID, "hail "+hailID+" countermanded: "+oneLine(why), payload)
 	if err != nil {
 		return false, err
 	}

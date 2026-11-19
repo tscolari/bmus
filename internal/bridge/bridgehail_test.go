@@ -30,13 +30,14 @@ type raiserInput struct {
 	Question string
 	Options  []string        `json:",omitempty"`
 	Context  json.RawMessage `json:",omitempty"`
+	Key      string          `json:",omitempty"` // the raise key
 }
 
 // testRaiser stands in for a bridge workflow that raises a hail (#152):
 // it raises in (raiseBridgeHail) and returns the hail's row once it closed
 // (awaitBridgeHail). Registered by registerRaiser.
 func testRaiser(ctx dbos.Context, in raiserInput) (store.Hail, error) {
-	id, err := raiseBridgeHail(ctx, store.Hail{Category: in.Category, Question: in.Question, Options: in.Options,
+	id, err := raiseBridgeHail(ctx, in.Key, store.Hail{Category: in.Category, Question: in.Question, Options: in.Options,
 		Context: in.Context}, store.LogEntry{Kind: logHail, Text: "raised " + in.Category})
 	if err != nil {
 		return store.Hail{}, err
@@ -54,6 +55,7 @@ func recvClosed(ctx dbos.Context, _ string) (string, error) {
 func registerRaiser(ctx dbos.Context) {
 	dbos.RegisterWorkflow(ctx, testRaiser, dbos.WithWorkflowName("test-raiser"))
 	dbos.RegisterWorkflow(ctx, recvClosed, dbos.WithWorkflowName("test-recv-closed"))
+	dbos.RegisterWorkflow(ctx, campaignRaiser, dbos.WithWorkflowName("test-campaign-raiser"))
 }
 
 // raise starts testRaiser as raiser/<name> with in.

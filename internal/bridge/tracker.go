@@ -372,7 +372,7 @@ type trackerCall struct {
 // Only a store error in tracker-window or tracker-record fails the
 // mission.
 func runTrackerRequest(ctx dbos.Context, in MissionInput, hailID string) (trackerOutcome, error) {
-	if err := awaitCountermandWindow(ctx, hailID, "tracker-window"); err != nil {
+	if err := awaitCountermandWindow(ctx, hailID, "tracker-window", false); err != nil {
 		return trackerOutcome{}, err
 	}
 	call, err := dbos.RunAsStep(ctx, func(c context.Context) (trackerCall, error) {
@@ -393,18 +393,24 @@ func runTrackerRequest(ctx dbos.Context, in MissionInput, hailID string) (tracke
 }
 
 // awaitCountermandWindow waits out hail hailID's countermand window, if
-// it has one, before the mission carries out what the hail allowed: step
+// it has one, before the workflow carries out what the hail decided: step
 // step reads the hail's countermand_until, then a durable sleep waits
-// until a moment past it, at most the tour's settle wait. The step that
-// follows must refuse a window still open after that (a longer one).
-func awaitCountermandWindow(ctx dbos.Context, hailID, step string) error {
+// until a moment past it. A mission's wait is capped at the tour's settle
+// wait, and the step that follows must refuse a window still open after
+// that (a longer one). uncapped waits the whole window, for a campaign,
+// which isn't bound to a tour (#183): the row read after it is final.
+func awaitCountermandWindow(ctx dbos.Context, hailID, step string, uncapped bool) error {
 	wait, err := dbos.RunAsStep(ctx, func(c context.Context) (time.Duration, error) {
 		h, err := daemonFrom(c).store.GetHail(c, hailID)
 		if err != nil || h.CountermandUntil == nil {
 			return 0, err
 		}
+		left := max(time.Until(*h.CountermandUntil), 0)
+		if uncapped {
+			return left, nil
+		}
 		// Capped so the mission settles within its tour's settle wait.
-		return min(max(time.Until(*h.CountermandUntil), 0), daemonFrom(c).settleTimeout), nil
+		return min(left, daemonFrom(c).settleTimeout), nil
 	}, append([]dbos.StepOption{dbos.WithStepName(step)}, storeRetries...)...)
 	if err != nil || wait <= 0 {
 		return err
