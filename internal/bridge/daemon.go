@@ -205,6 +205,8 @@ type Config struct {
 	trackerRetries []dbos.StepOption
 	// taskRecheck, if set, replaces defaultTaskRecheck (#184).
 	taskRecheck time.Duration
+	// landBackoff, if set, replaces defaultLandBackoff (#185).
+	landBackoff time.Duration
 }
 
 // MaxHailParkAfter is the longest Config.HailParkAfter: combadge serve's
@@ -366,6 +368,9 @@ type Daemon struct {
 	// taskRecheck is how often a campaign task rereads what it waits on
 	// without a message (#184).
 	taskRecheck time.Duration
+	// landBackoff is land-push's first wait before a retry, doubled on
+	// each (#185).
+	landBackoff time.Duration
 }
 
 // daemonKey is the context key under which the Daemon travels to workflows.
@@ -536,6 +541,7 @@ func Run(ctx context.Context, cfg Config) (err error) {
 		copyRetries:       cfg.copyRetries,
 		trackerRetries:    cfg.trackerRetries,
 		taskRecheck:       cmp.Or(cfg.taskRecheck, defaultTaskRecheck),
+		landBackoff:       cmp.Or(cfg.landBackoff, defaultLandBackoff),
 		maxBundleBytes:    cmp.Or(cfg.MaxBundleBytes, DefaultMaxBundleBytes),
 		divisions:         maps.Clone(cfg.Divisions), limits: roster.Transporter,
 		standingOrdersDefault: cfg.StandingOrders, wakeSend: cfg.wakeSend,

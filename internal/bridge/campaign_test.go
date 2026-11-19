@@ -23,20 +23,24 @@ import (
 // campaignRig is a bridge on fake beams whose tours never get past
 // provisioning, holding campaign C-0001 for tracker item #1 on repo app
 // from main: work for sorell (division eng), reviews in science, up to
-// maxRounds rounds. The test plays the crew through the store: it claims
-// orders, settles them and writes their work into the bridge's clone.
+// maxRounds rounds, landing on campaign/C-0001/1. Repo app's registered
+// URL is a bare repository (remote). The test plays the crew through the
+// store: it claims orders, settles them and writes their work into the
+// bridge's clone.
 type campaignRig struct {
-	t     *testing.T
-	home  string
-	cfg   Config
-	r     running
-	d     *Daemon
-	up    upstream
-	fake  *trackertest.Fake
-	clone string
-	ref   string
-	task  string
-	base  string
+	t    *testing.T
+	home string
+	cfg  Config
+	r    running
+	d    *Daemon
+	up   upstream
+	// remote is repo app's registered URL, a bare clone of up.
+	remote string
+	fake   *trackertest.Fake
+	clone  string
+	ref    string
+	task   string
+	base   string
 	// stopped is set once the running bridge was stopped by restart.
 	stopped *bool
 }
@@ -65,6 +69,8 @@ func newCampaignRig(t *testing.T, o campaignOpts) *campaignRig {
 	g.ref = g.fake.Add(tracker.Item{Title: "Fix the flake", Body: "It flakes."})
 	g.task = store.TaskWorkflowID(testCampaign, g.ref)
 	g.base = g.up.rev(t, "main")
+	g.remote = filepath.Join(t.TempDir(), "app.git")
+	gitT(t, "", "clone", "-q", "--bare", g.up.url, g.remote)
 
 	st, err := store.Open(t.Context(), filepath.Join(g.home, store.DBFile))
 	require.NoError(t, err)
@@ -88,11 +94,12 @@ func newCampaignRig(t *testing.T, o campaignOpts) *campaignRig {
 
 	g.cfg = testConfig(g.home)
 	g.cfg.Transporter = &fakeProvider{blockProvision: true}
-	g.cfg.Repos = map[string]string{"app": g.up.url}
+	g.cfg.Repos = map[string]string{"app": g.remote}
 	g.cfg.Divisions = map[string]DivisionConfig{"eng": {}, "science": {}, DivisionCommand: {}}
 	g.cfg.Tracker = g.fake
 	g.cfg.StandingOrders = true
 	g.cfg.taskRecheck = 300 * time.Millisecond
+	g.cfg.landBackoff = 10 * time.Millisecond
 	g.cfg.trackerRetries = []dbos.StepOption{dbos.WithStepMaxRetries(2), dbos.WithStepBaseInterval(10 * time.Millisecond),
 		dbos.WithStepMaxInterval(50 * time.Millisecond)}
 	if o.regs != nil {
@@ -100,7 +107,7 @@ func newCampaignRig(t *testing.T, o campaignOpts) *campaignRig {
 	}
 	g.clone = filepath.Join(g.home, "repos", "app")
 	gitT(t, "", "init", "-q", "--bare", g.clone)
-	gitT(t, g.clone, "fetch", "-q", g.up.url, "+refs/heads/*:refs/remotes/origin/*")
+	gitT(t, g.clone, "fetch", "-q", g.remote, "+refs/heads/*:refs/remotes/origin/*")
 	g.start()
 	return g
 }
@@ -320,6 +327,45 @@ func (g *campaignRig) answer(id, decision string) {
 	require.NoError(g.t, g.d.AnswerHail(g.t.Context(), id, decision, nil))
 }
 
+// landHail waits for the task's campaign_land hail and returns it with
+// its context.
+func (g *campaignRig) landHail() (store.Hail, CampaignLandContext) {
+	g.t.Helper()
+	h := g.waitHail(regs.CategoryCampaignLand)
+	var c CampaignLandContext
+	require.NoError(g.t, json.Unmarshal(h.Context, &c))
+	return h, c
+}
+
+// land answers the task's land hail land as the captain and returns the
+// task's result, once the campaign has ended too.
+func (g *campaignRig) land() TaskResult {
+	g.t.Helper()
+	h, _ := g.landHail()
+	g.answer(h.ID, "land")
+	return g.result()
+}
+
+// remoteAt is the commit branch is at on the remote, "" with no branch.
+func (g *campaignRig) remoteAt(branch string) string {
+	g.t.Helper()
+	return gitT(g.t, g.remote, "for-each-ref", "--format=%(objectname)", "refs/heads/"+branch)
+}
+
+// pushes are the texts of order id's push entries.
+func (g *campaignRig) pushes(id string) []string {
+	g.t.Helper()
+	entries, err := g.d.store.ListLog(g.t.Context(), 0)
+	require.NoError(g.t, err)
+	var out []string
+	for _, e := range entries {
+		if e.OrderID == id && e.Kind == logOrder && strings.Contains(e.Text, "push") {
+			out = append(out, e.Text)
+		}
+	}
+	return out
+}
+
 // result waits for the task workflow and the campaign's to end, and
 // returns the task's result.
 func (g *campaignRig) result() TaskResult {
@@ -369,10 +415,11 @@ func verdictOf(fs ...comms.VerdictFinding) comms.Verdict {
 // A task's rounds on fake beams: round 1's work goes to sorell; its
 // review sits in the science pool, tuvok blocks it with one high and
 // files a low, and its own finding and its commit are noted; the fix goes
-// to sorell on round 1's head and its review passes. The task waits to
-// land (#185), and the campaign ends. Every order was created once under
-// its key, the low and the reviewer's own finding reach the tracker, and
-// sorell alone is in task_workers.
+// to sorell on round 1's head and its review passes. The captain lands
+// it from campaign_land, the remote's branch is at the fix's commit, the
+// task is landed and the campaign ends. Every order was created once
+// under its key, the low and the reviewer's own finding reach the
+// tracker, the issue stays open, and sorell alone is in task_workers.
 func TestCampaignTaskRounds(t *testing.T) {
 	t.Parallel()
 	g := newCampaignRig(t, campaignOpts{})
@@ -416,10 +463,30 @@ func TestCampaignTaskRounds(t *testing.T) {
 	require.Contains(t, review2.Body, "summary of "+review.ID)
 	g.reviewDone(review2.ID, "tuvok", c2, verdictOf())
 
-	require.Equal(t, TaskResult{State: store.TaskLanding, Why: "landing comes with #185"}, g.result())
+	lh, lc := g.landHail()
+	require.Equal(t, []any{"land-1", campaignLandOptions}, []any{lh.RaiseKey, lh.Options})
+	require.Equal(t, "Land "+g.ref+" of campaign C-0001: push "+fix.ID+" ("+c2[:12]+") to campaign/C-0001/1 on repo app, "+
+		"2 commits over "+g.base[:12]+", passed review in round 2?", lh.Question)
+	require.Equal(t, []any{"app", "campaign/C-0001/1", fix.ID, c2, g.base, 2, 2, review2.ID, "summary of " + review2.ID, true,
+		"Fix the flake"}, []any{lc.Repo, lc.Branch, lc.Head, lc.HeadCommit, lc.ReviewBase, lc.CommitCount, lc.Rounds, lc.Review,
+		lc.ReviewSummary, lc.Passed, lc.IssueTitle})
+	require.Equal(t, []CampaignCommit{{SHA: c2, Subject: "work of " + fix.ID}, {SHA: c1, Subject: "work of " + work.ID}},
+		lc.Commits)
+	require.Equal(t, store.TaskLanding, g.row().State)
+	require.Empty(t, g.remoteAt("campaign/C-0001/1"))
+	g.answer(lh.ID, "land")
+
+	require.Equal(t, TaskResult{State: store.TaskLanded}, g.result())
 	tk = g.row()
-	require.Equal(t, []any{store.TaskLanding, fix.ID, c2, 2, "", ""},
-		[]any{tk.State, tk.Head, tk.HeadCommit, tk.Round, tk.OpenOrder, tk.OpenHail})
+	require.Equal(t, []any{store.TaskLanded, fix.ID, c2, 2, "", "", ""},
+		[]any{tk.State, tk.Head, tk.HeadCommit, tk.Round, tk.OpenOrder, tk.OpenHail, tk.Why})
+	require.NotNil(t, tk.LandedAt)
+	require.Equal(t, c2, g.remoteAt("campaign/C-0001/1"))
+	gitT(t, g.remote, "merge-base", "--is-ancestor", c1, "campaign/C-0001/1")
+	require.Equal(t, []string{"repo app pushed to campaign/C-0001/1 at " + c2[:12]}, g.pushes(fix.ID))
+	issue, err := g.fake.Get(ctx, g.ref)
+	require.NoError(t, err)
+	require.Equal(t, tracker.StateOpen, issue.State, "push mode leaves the issue open")
 	require.Equal(t, []string{"r1:work", "r1:review", "r2:fix", "r2:review"}, g.taskOrders())
 
 	texts := g.texts()
@@ -431,8 +498,9 @@ func TestCampaignTaskRounds(t *testing.T) {
 		g.ref + " round 1: review " + review.ID + " blocked (1 high, 0 medium); filed 1, dropped 0",
 		g.ref + " round 2: fix " + fix.ID + " created",
 		g.ref + " round 2: review " + review2.ID + " passed",
-		g.ref + " round 2: " + fix.ID + " (" + c2[:12] + ") waits to land on campaign/C-0001/1 after its review passed",
-		"campaign C-0001 ended: " + g.ref + " landing",
+		g.ref + " round 2: " + fix.ID + " (" + c2[:12] + ") waits to land on campaign/C-0001/1: " + lh.ID,
+		g.ref + " landed on campaign/C-0001/1 at " + c2[:12],
+		"campaign C-0001 ended: " + g.ref + " landed",
 	} {
 		require.Contains(t, texts, want)
 	}
@@ -624,7 +692,7 @@ func TestCampaignMaxRoundsRetry(t *testing.T) {
 	require.Equal(t, []any{2, 2}, []any{tk.Round, tk.MaxRounds})
 	c2 := g.work(fix.ID, "sorell", c1)
 	g.reviewDone(g.waitOrder("r2:review").ID, "tuvok", c2, verdictOf())
-	require.Equal(t, store.TaskLanding, g.result().State)
+	require.Equal(t, store.TaskLanded, g.land().State)
 }
 
 // drop on a stall ends the task dropped and the campaign with it; a
@@ -695,7 +763,7 @@ func TestCampaignRestartDuringReview(t *testing.T) {
 	g.restart()
 	requirePending(t, g.d, g.task)
 	g.reviewDone(review.ID, "tuvok", c1, verdictOf())
-	require.Equal(t, store.TaskLanding, g.result().State)
+	require.Equal(t, store.TaskLanded, g.land().State)
 	require.Equal(t, []string{"r1:work", "r1:review"}, g.taskOrders())
 }
 
@@ -871,6 +939,6 @@ func TestCampaignUnreadableDecisions(t *testing.T) {
 	g.reviewDone(review.ID, "tuvok", c1, verdictOf(comms.VerdictFinding{Severity: comms.SeverityMedium, Title: "Medium"}))
 	tr := g.waitHail(regs.CategoryCampaignTriage)
 	g.forceDecision(tr.ID, `{"fix": [9]}`)
-	require.Equal(t, store.TaskLanding, g.result().State, "the medium filed, nothing blocks")
+	require.Equal(t, store.TaskLanded, g.land().State, "the medium filed, nothing blocks")
 	require.Contains(t, g.texts(), g.ref+" round 1: review "+review.ID+" passed; filed 1, dropped 0")
 }

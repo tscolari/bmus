@@ -113,7 +113,7 @@ func TestCampaignHailBuilders(t *testing.T) {
 		commits = append(commits, CampaignCommit{SHA: headCommit, Subject: strings.Repeat("s", 300) + "\nforce"})
 	}
 	land, err := campaignLandHail(CampaignLandContext{CampaignHailTask: campaignTask, Repo: "app", Branch: "campaign/C-0001/o-r-12",
-		Head: "ORD-0011", HeadCommit: headCommit, ReviewBase: baseCommit, Commits: commits[:4], Rounds: 2, Review: "ORD-0012",
+		Head: "ORD-0011", HeadCommit: headCommit, ReviewBase: baseCommit, Commits: commits[:4], Rounds: 2, Review: "ORD-0012", Passed: true,
 		ReviewSummary: hostile})
 	require.NoError(t, err)
 	require.Equal(t, "Land o/r#12 of campaign C-0001: push ORD-0011 (3f2a9c1e0b7d) to campaign/C-0001/o-r-12 on repo app, "+
@@ -127,7 +127,7 @@ func TestCampaignHailBuilders(t *testing.T) {
 	require.Equal(t, "land-1", campaignLandKey(1))
 
 	many, err := campaignLandHail(CampaignLandContext{CampaignHailTask: campaignTask, Repo: "app", Branch: "b", Head: "ORD-0011",
-		HeadCommit: headCommit, ReviewBase: baseCommit, Commits: commits, CommitCount: 75, Rounds: 1, Review: "ORD-0012"})
+		HeadCommit: headCommit, ReviewBase: baseCommit, Commits: commits, CommitCount: 75, Rounds: 1, Review: "ORD-0012", Passed: true})
 	require.NoError(t, err)
 	require.Contains(t, many.Question, ", 75 commits over ")
 	require.NoError(t, json.Unmarshal(many.Context, &lc))
@@ -156,11 +156,21 @@ func TestCampaignHailBuilders(t *testing.T) {
 		Head: "ORD-0010"}, nil)
 	require.ErrorContains(t, err, "full commit id")
 	_, err = campaignLandHail(CampaignLandContext{CampaignHailTask: campaignTask, Repo: "app", Branch: "b", Head: "ORD-0011",
-		HeadCommit: headCommit, ReviewBase: "8b1d0e2c4a55", Rounds: 1, Review: "ORD-0012"})
+		HeadCommit: headCommit, ReviewBase: "8b1d0e2c4a55", Rounds: 1, Review: "ORD-0012", Passed: true})
 	require.ErrorContains(t, err, "full commit ids")
 	_, err = campaignLandHail(CampaignLandContext{CampaignHailTask: campaignTask, Repo: "app", Head: "ORD-0011",
-		HeadCommit: headCommit, ReviewBase: baseCommit, Rounds: 1, Review: "ORD-0012"})
+		HeadCommit: headCommit, ReviewBase: baseCommit, Rounds: 1, Review: "ORD-0012", Passed: true})
 	require.ErrorContains(t, err, "needs its repo, branch")
+	_, err = campaignLandHail(CampaignLandContext{CampaignHailTask: campaignTask, Repo: "app", Branch: "b", Head: "ORD-0011",
+		HeadCommit: headCommit, ReviewBase: baseCommit, Rounds: 1, Passed: true})
+	require.ErrorContains(t, err, "once passed, its review")
+
+	// A land Command decided on a stall: no passing review, maybe none.
+	unpassed, err := campaignLandHail(CampaignLandContext{CampaignHailTask: campaignTask, Repo: "app", Branch: "b",
+		Head: "ORD-0011", HeadCommit: headCommit, ReviewBase: baseCommit, Commits: commits[:1], Rounds: 2})
+	require.NoError(t, err)
+	require.Equal(t, "Land o/r#12 of campaign C-0001: push ORD-0011 (3f2a9c1e0b7d) to b on repo app, "+
+		"1 commit over 8b1d0e2c4a55, in round 2 with no passing review?", unpassed.Question)
 }
 
 // Every triage form, its normal form and option, the normal form parsing
@@ -280,7 +290,7 @@ func TestCheckCampaignAnswer(t *testing.T) {
 	require.NoError(t, err)
 	st.ID, st.DeliverTo = "H-0002", tr.DeliverTo
 	land, err := campaignLandHail(CampaignLandContext{CampaignHailTask: campaignTask, Repo: "app", Branch: "b", Head: "ORD-0011",
-		HeadCommit: headCommit, ReviewBase: baseCommit, Rounds: 1, Review: "ORD-0012"})
+		HeadCommit: headCommit, ReviewBase: baseCommit, Rounds: 1, Review: "ORD-0012", Passed: true})
 	require.NoError(t, err)
 	land.ID, land.DeliverTo = "H-0003", tr.DeliverTo
 	require.True(t, isCampaignHail(tr) && isCampaignHail(st) && isCampaignHail(land))
@@ -405,7 +415,7 @@ func TestCampaignQuestionsLeaveOutRef(t *testing.T) {
 			require.True(t, ok, "%s %s: %s", ref, h.Category, why)
 		}
 		land, err := campaignLandHail(CampaignLandContext{CampaignHailTask: task, Repo: "app", Branch: "campaign/C-0001/x",
-			Head: "ORD-0011", HeadCommit: headCommit, ReviewBase: baseCommit, Rounds: 1, Review: "ORD-0012"})
+			Head: "ORD-0011", HeadCommit: headCommit, ReviewBase: baseCommit, Rounds: 1, Review: "ORD-0012", Passed: true})
 		require.NoError(t, err)
 		require.Contains(t, land.Question, ref)
 		route, _, rule := cfg.Classify(regsHail(land, store.Order{}))
@@ -579,7 +589,7 @@ func TestCampaignLandCaptain(t *testing.T) {
 	hd.addCommand(t)
 
 	land, err := campaignLandHail(CampaignLandContext{CampaignHailTask: campaignTask, Repo: "app", Branch: "campaign/C-0001/o-r-12",
-		Head: "ORD-0011", HeadCommit: headCommit, ReviewBase: baseCommit, Rounds: 2, Review: "ORD-0012"})
+		Head: "ORD-0011", HeadCommit: headCommit, ReviewBase: baseCommit, Rounds: 2, Review: "ORD-0012", Passed: true})
 	require.NoError(t, err)
 	run := raiseCampaign(t, hd.d, "land", raiserInputOf(land, campaignLandKey(1)))
 	id := waitOpenHail(t, hd, regs.CategoryCampaignLand)

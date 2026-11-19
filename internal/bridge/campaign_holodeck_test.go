@@ -25,8 +25,8 @@ import (
 // rest, under an 8s countermand window. Round 1's decision is acted on
 // only after the window: the fix order carries the second medium alone.
 // The captain countermands round 2's to file inside its window, and the
-// task acts on the countermand: nothing blocks, and the task waits to
-// land. The filed mediums and the lows are written as findings.
+// task acts on the countermand: nothing blocks, and the captain lands
+// the task. The filed mediums and the lows are written as findings.
 func TestCampaignTriageByCommand(t *testing.T) {
 	t.Parallel()
 	const window = 8 * time.Second
@@ -119,11 +119,28 @@ func TestCampaignTriageByCommand(t *testing.T) {
 	_, err = hd.d.CountermandHail(ctx, h2.ID, "file", nil, "file them all")
 	require.NoError(t, err)
 
+	var land store.Hail
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		hails, err := hd.d.store.ListHails(ctx, store.HailOpen)
+		require.NoError(c, err)
+		land = store.Hail{}
+		for _, x := range hails {
+			if x.Category == regs.CategoryCampaignLand {
+				land = x
+			}
+		}
+		require.NotEmpty(c, land.ID)
+	}, 120*time.Second, 50*time.Millisecond)
+	require.NoError(t, hd.d.AnswerHail(ctx, land.ID, "land", nil))
+
 	wh, err := dbos.RetrieveWorkflow[TaskResult](hd.d.dbos, task)
 	require.NoError(t, err)
 	res, err := wh.GetResult(dbos.WithHandleTimeout(120 * time.Second))
 	require.NoError(t, err)
-	require.Equal(t, store.TaskLanding, res.State)
+	require.Equal(t, store.TaskLanded, res.State)
+	tk, err := hd.d.store.GetTask(ctx, testCampaign, ref)
+	require.NoError(t, err)
+	require.Equal(t, tk.HeadCommit, gitT(t, b.repo.url, "rev-parse", "refs/heads/campaign/C-0001/1"))
 	require.Equal(t, "file", hd.hail(t, h2.ID).Decision)
 
 	review1, review2 := byKey("r1:review"), byKey("r2:review")
