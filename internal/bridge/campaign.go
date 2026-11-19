@@ -213,12 +213,15 @@ func awaitTask(ctx dbos.Context, campaignID, ref string) (string, error) {
 	told := false
 	for {
 		st, err := dbos.RunAsStep(ctx, func(c context.Context) (campaignTaskCheck, error) {
+			// Liveness first, then the row: a task that isn't live has
+			// made its last write, so the row read after is final. The
+			// other order can read a row the task is about to change.
 			d := daemonFrom(c)
-			t, err := d.store.GetTask(c, campaignID, ref)
+			live, _, err := workflowLive(d, task)
 			if err != nil {
 				return campaignTaskCheck{}, err
 			}
-			live, _, err := workflowLive(d, task)
+			t, err := d.store.GetTask(c, campaignID, ref)
 			return campaignTaskCheck{State: t.State, Live: live}, err
 		}, append([]dbos.StepOption{dbos.WithStepName("check-task")}, storeRetries...)...)
 		if err != nil || !st.Live {
