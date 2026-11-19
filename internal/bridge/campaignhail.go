@@ -156,7 +156,10 @@ type CampaignCommit struct {
 
 // CampaignLandContext is a campaign_land hail's context: where the head
 // goes, the commits over the review base (at most maxCampaignCommits of
-// CommitCount), the rounds the task took and the passing review.
+// CommitCount), the rounds the task took and the last review. Passed says
+// that review passed; a land Command decided on a stall (#185) can come
+// after a review that blocked or failed, or before any, with Review
+// empty.
 type CampaignLandContext struct {
 	CampaignHailTask
 	Repo          string           `json:"repo"`
@@ -169,6 +172,7 @@ type CampaignLandContext struct {
 	Rounds        int              `json:"rounds"`
 	Review        string           `json:"review"`
 	ReviewSummary string           `json:"review_summary"`
+	Passed        bool             `json:"passed"`
 }
 
 // commitIDRE is a full commit id.
@@ -291,15 +295,16 @@ func campaignStalledHail(c CampaignStalledContext, blocking []comms.VerdictFindi
 //
 // The question: "Land o/r#12 of campaign C-0001: push ORD-0011
 // (3f2a9c1e0b7d) to campaign/C-0001/o-r-12 on repo app, 4 commits over
-// 8b1d0e2c4a55, passed review in round 2?" It names the ref and the
+// 8b1d0e2c4a55, passed review in round 2?" Without Passed it ends "in
+// round 2 with no passing review?". It names the ref and the
 // branch, free text that could fit a captain_only rule, and that changes
 // nothing: the category is fixed to the captain (regs.CaptainFixed).
 func campaignLandHail(c CampaignLandContext) (store.Hail, error) {
 	if err := c.check(); err != nil {
 		return store.Hail{}, err
 	}
-	if c.Repo == "" || c.Branch == "" || c.Head == "" || c.Review == "" || c.Rounds < 1 {
-		return store.Hail{}, errors.New("a campaign_land hail needs its repo, branch, head, review and rounds")
+	if c.Repo == "" || c.Branch == "" || c.Head == "" || c.Passed && c.Review == "" || c.Rounds < 1 {
+		return store.Hail{}, errors.New("a campaign_land hail needs its repo, branch, head, rounds and, once passed, its review")
 	}
 	if !commitIDRE.MatchString(c.HeadCommit) || !commitIDRE.MatchString(c.ReviewBase) {
 		return store.Hail{}, fmt.Errorf("head commit %q and review base %q must be full commit ids", c.HeadCommit, c.ReviewBase)
@@ -316,9 +321,13 @@ func campaignLandHail(c CampaignLandContext) (store.Hail, error) {
 	if err != nil {
 		return store.Hail{}, err
 	}
-	q := fmt.Sprintf("Land %s of campaign %s: push %s (%s) to %s on repo %s, %d %s over %s, passed review in round %d?",
+	how := fmt.Sprintf("passed review in round %d", c.Rounds)
+	if !c.Passed {
+		how = fmt.Sprintf("in round %d with no passing review", c.Rounds)
+	}
+	q := fmt.Sprintf("Land %s of campaign %s: push %s (%s) to %s on repo %s, %d %s over %s, %s?",
 		oneLine(c.Task), oneLine(c.Campaign), oneLine(c.Head), shortCommit(c.HeadCommit), oneLine(c.Branch), oneLine(c.Repo),
-		c.CommitCount, plural(c.CommitCount, "commit"), shortCommit(c.ReviewBase), c.Rounds)
+		c.CommitCount, plural(c.CommitCount, "commit"), shortCommit(c.ReviewBase), how)
 	return store.Hail{Category: regs.CategoryCampaignLand, Question: q, Options: campaignLandOptions, Context: raw}, nil
 }
 

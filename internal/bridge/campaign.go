@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -296,7 +297,8 @@ type taskRun struct {
 	headSummary string
 	// note is the captain's note the next order carries.
 	note string
-	// consent: a land the captain decided, which needs no campaign_land.
+	// consent: a land, or a retry of a push, the captain decided on a
+	// stall, which needs no campaign_land.
 	consent bool
 	// filed holds the reviews whose findings workflow started.
 	filed map[string]bool
@@ -1277,8 +1279,9 @@ func (r *taskRun) fileReviewFindings(id string) error {
 // is raised under stall-<n> and its decision, once final, acted on.
 // retry repeats what stalled (phase, with keyKind's next attempt); after
 // max_rounds it raises the task's max_rounds by one and starts the next
-// fix round. land lands the head as it is, with the captain's consent
-// when the captain decided. drop drops the task. A campaign being belayed
+// fix round, and a retry of the push pushes again, at once when the
+// captain decided. land lands the head as it is, with the captain's
+// consent when the captain decided. drop drops the task. A campaign being belayed
 // drops the task instead of stalling it (check-campaign), and so does a
 // hail closed undecided then; one closed undecided otherwise stalls the
 // task again.
@@ -1372,6 +1375,11 @@ func (r *taskRun) stall(code, reason, order string, phase taskPhase, keyKind str
 			r.t.Round++
 			return phaseWork, nil
 		}
+		if phase == phaseLand {
+			// A retry of the push: the captain's is the land's consent,
+			// and Command's asks the captain again (campaign_land).
+			r.consent = hl.DecidedBy == comms.DecidedByCaptain
+		}
 		if order != "" {
 			// A fresh order under the key's next attempt; a stall before
 			// any order was created (no reviewer, the tracker) keeps it.
@@ -1383,6 +1391,40 @@ func (r *taskRun) stall(code, reason, order string, phase taskPhase, keyKind str
 
 // ---- landing and dropping ----
 
+// Land stall codes (section 7).
+const (
+	stallPushRejected = "push_rejected"
+	stallPushFailed   = "push_failed"
+)
+
+// landPushTries is how many times land-push tries a push that fails
+// transiently: once and 3 retries.
+const landPushTries = 4
+
+// defaultLandBackoff is land-push's first wait before a retry, doubled
+// on each.
+const defaultLandBackoff = 5 * time.Second
+
+// campaignBranch is campaign id's default land branch for tracker item
+// ref (section 7, decision 6): campaign/<id>/<slug>, where the slug is
+// ref with every character outside [A-Za-z0-9._-] turned into "-"
+// (campaign/C-0001/o-r-12 for o/r#12). A name git wouldn't take as a
+// branch (checkBranchName) is refused.
+func campaignBranch(ctx context.Context, id, ref string) (string, error) {
+	slug := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			return r
+		}
+		return '-'
+	}, ref)
+	branch := "campaign/" + id + "/" + slug
+	if err := checkBranchName(ctx, branch); err != nil {
+		return "", err
+	}
+	return branch, nil
+}
+
 // landResult is what landing a task came to (landTask). Exactly one of
 // its outcomes is set.
 type landResult struct {
@@ -1392,15 +1434,14 @@ type landResult struct {
 	// empty) as its one blocking finding.
 	Retry bool   `json:",omitempty"`
 	Note  string `json:",omitempty"`
-	// Drop: campaign_land dropped the task.
-	Drop bool `json:",omitempty"`
+	// Drop: campaign_land dropped the task, or the campaign is being
+	// belayed; DropWhy says which.
+	Drop    bool   `json:",omitempty"`
+	DropWhy string `json:",omitempty"`
 	// StallCode and StallWhy: the push was rejected (push_rejected) or
 	// out of retries (push_failed).
 	StallCode string `json:",omitempty"`
 	StallWhy  string `json:",omitempty"`
-	// Pending: landing isn't built yet (#185). The task stays landing and
-	// its workflow ends.
-	Pending bool `json:",omitempty"`
 }
 
 // land lands the task's head (landTask) and acts on the outcome: landed
@@ -1418,11 +1459,8 @@ func (r *taskRun) land() (taskPhase, error) {
 	case res.Landed:
 		r.result = TaskResult{State: store.TaskLanded}
 		return phaseEnd, nil
-	case res.Pending:
-		r.result = TaskResult{State: store.TaskLanding, Why: "landing comes with #185"}
-		return phaseEnd, nil
 	case res.Drop:
-		return r.drop("dropped at landing")
+		return r.drop(res.DropWhy)
 	case res.Retry:
 		title := "The captain asked for another round"
 		r.last = &lastReview{Round: r.t.Round, Blocking: []comms.VerdictFinding{{Severity: comms.SeverityHigh, Title: title,
@@ -1434,37 +1472,289 @@ func (r *taskRun) land() (taskPhase, error) {
 }
 
 // landTask lands the task's head, r.t.Head at r.t.HeadCommit, on
-// r.t.Branch (section 7). It is #185's to build:
-//
-//   - Without consent (a pass, or land decided by Command or a timeout),
-//     a land-context step reads the commits over the review base and the
-//     passing review's summary (r.last's, or the round's review), and the
-//     task raises campaign_land under campaignLandKey(r.lands+1)
-//     (campaignLandHail, raiseCampaignHail) with the task's open_hail
-//     set. Its decision: land pushes, retry returns Retry with the
-//     note, drop returns Drop. A hail closed undecided drops the task
-//     when the campaign is being belayed (r.belaying).
-//   - With consent (the captain's land on a stall), the push runs at
-//     once.
-//   - The push is one step, land-push: ls-remote first, then
-//     PushOrder(ctx, head, branch, false), retried inside the step;
-//     ErrPushRejected returns StallCode push_rejected, other errors past
-//     the retries push_failed. land-done then sets the task landed with
-//     landed_at and logs "o/r#12 landed on <branch> at <commit>", and
-//     landTask returns Landed.
-//
-// Until then it sets the task landing (land-pending), logs that the head
-// waits to land, and returns Pending: the task workflow ends there and
-// its campaign with it.
+// r.t.Branch (section 7). A campaign being belayed drops the task first
+// (check-campaign). Without consent (a pass, or land decided by Command
+// or a timeout on a stall) the task asks the captain (askLand); with it
+// (the captain's land on a stall, or a captain's retry of a push) the
+// push runs at once. land-push pushes (landPush), and land-done sets the
+// task landed with landed_at and logs it. Push mode writes nothing to
+// the tracker: the issue stays open for the human who merges.
 func (r *taskRun) landTask(consent bool) (landResult, error) {
-	how := "after its review passed"
-	if consent {
-		how = "as the captain decided"
+	belaying, err := r.belaying()
+	if err != nil {
+		return landResult{}, err
 	}
-	err := r.setTask("land-pending", func(t *store.CampaignTask) {
+	if belaying {
+		return landResult{Drop: true, DropWhy: "campaign belayed"}, nil
+	}
+	if r.t.Branch == "" {
+		// campaign.run (#186) sets the branch at insert; a row without one
+		// lands on the default.
+		ref, id := r.in.Ref, r.c.ID
+		branch, err := dbos.RunAsStep(r.ctx, func(c context.Context) (string, error) {
+			return campaignBranch(c, id, ref)
+		}, dbos.WithStepName("land-branch"))
+		if err != nil {
+			return landResult{StallCode: stallPushFailed, StallWhy: "no land branch: " + oneLine(stepError(err))}, nil
+		}
+		if err := r.setTask("task-branch", func(t *store.CampaignTask) { t.Branch = branch }, "", "", nil); err != nil {
+			return landResult{}, err
+		}
+	}
+	if !consent {
+		res, ok, err := r.askLand()
+		if err != nil || !ok {
+			return res, err
+		}
+	} else if err := r.setTask("task-landing", func(t *store.CampaignTask) {
 		t.State, t.OpenOrder, t.OpenHail, t.Why = store.TaskLanding, "", "", ""
-	}, r.t.Head, r.roundText(fmt.Sprintf("%s (%s) waits to land on %s %s", r.t.Head, shortCommit(r.t.HeadCommit), r.t.Branch, how)), nil)
-	return landResult{Pending: true}, err
+	}, r.t.Head, r.roundText(fmt.Sprintf("%s (%s) lands on %s as the captain decided", r.t.Head, shortCommit(r.t.HeadCommit),
+		oneLine(r.t.Branch))), nil); err != nil {
+		return landResult{}, err
+	}
+	head, commit, repo, branch := r.t.Head, r.t.HeadCommit, r.c.Repo, r.t.Branch
+	pushed, err := dbos.RunAsStep(r.ctx, func(c context.Context) (landPushed, error) {
+		return daemonFrom(c).landPush(c, repo, head, commit, branch)
+	}, dbos.WithStepName("land-push"), dbos.WithStepMaxRetries(0))
+	if err != nil {
+		if r.ctx.Err() != nil {
+			return landResult{}, err
+		}
+		return landResult{StallCode: stallPushFailed, StallWhy: "land-push: " + oneLine(stepError(err))}, nil
+	}
+	if pushed.Code != "" {
+		return landResult{StallCode: pushed.Code, StallWhy: pushed.Why}, nil
+	}
+	t := r.t
+	text := fmt.Sprintf("%s landed on %s at %s", r.in.Ref, oneLine(branch), shortCommit(commit))
+	landed, err := dbos.RunAsStep(r.ctx, func(c context.Context) (store.CampaignTask, error) {
+		st := daemonFrom(c).store
+		cur, err := st.GetTask(c, t.CampaignID, t.Ref)
+		if err != nil || cur.State == store.TaskLanded {
+			return cur, err // a re-run: landed already, at its first time
+		}
+		now := time.Now().UTC()
+		t := t
+		t.State, t.OpenOrder, t.OpenHail, t.Why, t.LandedAt = store.TaskLanded, "", "", "", &now
+		_, err = st.SetTask(c, t, r.entry(head, text, map[string]any{"branch": branch, "commit": commit,
+			"already": pushed.Already}))
+		return t, err
+	}, append([]dbos.StepOption{dbos.WithStepName("land-done")}, storeRetries...)...)
+	if err != nil {
+		return landResult{}, err
+	}
+	r.t = landed
+	return landResult{Landed: true}, nil
+}
+
+// askLand raises campaign_land under land-<n> (campaignLandHail) for the
+// head, with the commits over the review base and the last review read
+// in land-context, sets the task landing with the hail as its open hail
+// (task-land-hail), and acts on the decision: land returns ok to push,
+// retry and drop return their outcome. Only the captain answers the
+// hail, with no timeout (regs.CaptainFixed). A hail closed undecided, or
+// a decision that doesn't parse (logged once), drops the task when the
+// campaign is being belayed; otherwise the task waits one recheck and
+// raises the next land hail, as a stall does.
+func (r *taskRun) askLand() (landResult, bool, error) {
+	repo, base, commit := r.c.Repo, r.t.ReviewBase, r.t.HeadCommit
+	lc, err := dbos.RunAsStep(r.ctx, func(c context.Context) (landCommits, error) {
+		return daemonFrom(c).landCommits(c, repo, base, commit)
+	}, append([]dbos.StepOption{dbos.WithStepName("land-context")}, storeRetries...)...)
+	if err != nil {
+		if r.ctx.Err() != nil {
+			return landResult{}, false, err
+		}
+		return landResult{StallCode: stallPushFailed, StallWhy: "land-context: " + oneLine(stepError(err))}, false, nil
+	}
+	ctx := CampaignLandContext{CampaignHailTask: r.hailTask(), Repo: r.c.Repo, Branch: r.t.Branch, Head: r.t.Head,
+		HeadCommit: r.t.HeadCommit, ReviewBase: r.t.ReviewBase, Commits: lc.Commits, CommitCount: lc.Count, Rounds: r.t.Round}
+	if r.last != nil && r.last.Order != "" {
+		ctx.Review, ctx.ReviewSummary, ctx.Passed = r.last.Order, r.last.Summary, len(r.last.Blocking) == 0
+	}
+	h, err := campaignLandHail(ctx)
+	if err != nil {
+		return landResult{}, false, err
+	}
+	for {
+		r.lands++
+		hailID, err := raiseBridgeHail(r.ctx, campaignLandKey(r.lands), h, store.LogEntry{Kind: logHail, OrderID: r.t.Head,
+			Text: r.roundText(fmt.Sprintf("land of %s (%s) on %s asked", r.t.Head, shortCommit(r.t.HeadCommit),
+				oneLine(r.t.Branch)))})
+		if err != nil {
+			return landResult{}, false, err
+		}
+		if err := r.setTask("task-land-hail", func(t *store.CampaignTask) {
+			t.State, t.OpenOrder, t.OpenHail, t.Why = store.TaskLanding, "", hailID, ""
+		}, r.t.Head, r.roundText(fmt.Sprintf("%s (%s) waits to land on %s: %s", r.t.Head, shortCommit(r.t.HeadCommit),
+			oneLine(r.t.Branch), hailID)), nil); err != nil {
+			return landResult{}, false, err
+		}
+		hl, err := awaitCampaignDecision(r.ctx, hailID)
+		if err != nil {
+			return landResult{}, false, err
+		}
+		var choice campaignChoice
+		if hl.Status == store.HailDecided {
+			choice, err = parseCampaignChoice(hl.Decision, hl.Options)
+			if err != nil {
+				// Defensive: a stored decision always parses
+				// (checkCampaignAnswer).
+				if err := r.noteOnce(r.t.Head, "unread-"+hailID, fmt.Sprintf("%s: land %s's decision does not parse (%s): "+
+					"asking again", r.in.Ref, hailID, oneLine(err.Error()))); err != nil {
+					return landResult{}, false, err
+				}
+			}
+		}
+		switch choice.Option {
+		case campaignLand:
+			return landResult{}, true, nil
+		case campaignRetry:
+			return landResult{Retry: true, Note: choice.Note}, false, nil
+		case campaignDrop:
+			return landResult{Drop: true, DropWhy: "dropped on " + hailID}, false, nil
+		}
+		// Closed undecided, or unreadable: unless the campaign is being
+		// belayed, wait out one recheck and ask again, so a hail that
+		// keeps closing can't loop fast.
+		belaying, err := r.belaying()
+		if err != nil {
+			return landResult{}, false, err
+		}
+		if !belaying {
+			if _, err := dbos.Sleep(r.ctx, taskRecheckOf(r.ctx)); err != nil {
+				return landResult{}, false, err
+			}
+			if belaying, err = r.belaying(); err != nil {
+				return landResult{}, false, err
+			}
+		}
+		if belaying {
+			return landResult{Drop: true, DropWhy: "campaign belayed"}, false, nil
+		}
+	}
+}
+
+// landCommits is the land-context step's recorded result: the first
+// maxCampaignCommits commits over the review base, newest first, and
+// how many there are.
+type landCommits struct {
+	Commits []CampaignCommit
+	Count   int
+}
+
+// landCommits reads the commits of repo's clone over base up to commit
+// (`git log --format='%H %s' <base>..<commit>`, at most
+// maxCampaignCommits, and `git rev-list --count`), under the repo's
+// lock. Subjects are made valid UTF-8 here; campaignLandHail makes them
+// one line and cuts them.
+func (d *Daemon) landCommits(ctx context.Context, repo, base, commit string) (landCommits, error) {
+	unlock, err := d.lockRepo(ctx, repo)
+	if err != nil {
+		return landCommits{}, err
+	}
+	defer unlock()
+	span := base + ".." + commit
+	out, err := runGit(ctx, d.repoDir(repo), "log", "--no-show-signature", "-n", strconv.Itoa(maxCampaignCommits),
+		"--format=%H %s", "--end-of-options", span)
+	if err != nil {
+		return landCommits{}, err
+	}
+	var lc landCommits
+	for line := range strings.SplitSeq(out, "\n") {
+		if line == "" {
+			continue
+		}
+		sha, subject, _ := strings.Cut(line, " ")
+		lc.Commits = append(lc.Commits, CampaignCommit{SHA: sha, Subject: strings.ToValidUTF8(subject, "\uFFFD")})
+	}
+	n, err := runGit(ctx, d.repoDir(repo), "rev-list", "--count", "--end-of-options", span)
+	if err != nil {
+		return landCommits{}, err
+	}
+	if lc.Count, err = strconv.Atoi(n); err != nil {
+		return landCommits{}, fmt.Errorf("git rev-list --count: %q: %w", n, err)
+	}
+	return lc, nil
+}
+
+// landPushed is the land-push step's recorded result: pushed, or found
+// already on the remote (Already), or the stall code and reason.
+type landPushed struct {
+	Already bool   `json:",omitempty"`
+	Code    string `json:",omitempty"`
+	Why     string `json:",omitempty"`
+}
+
+// landPush is the land-push step (section 7): head order's work on repo,
+// at commit, to branch of the repo's registered URL. `git ls-remote`
+// first: the branch already at commit means an earlier run pushed it,
+// and nothing is pushed again. Otherwise PushOrder(ctx, head, branch,
+// false) pushes the done entry's commit, checked in the clone under the
+// repo's lock, without force, and logs it on the head order. A
+// transient error is tried again up to landPushTries times in all, after
+// landBackoff, doubled each time; a rejection (ErrPushRejected: the
+// branch exists and has moved) stalls push_rejected at once; a refusal
+// (the order, its branch in the clone, the branch name) stalls
+// push_failed at once, and so does a transient error out of tries.
+func (d *Daemon) landPush(ctx context.Context, repo, head, commit, branch string) (landPushed, error) {
+	wait := d.landBackoff
+	for try := 1; ; try++ {
+		at, err := d.remoteBranch(ctx, repo, branch)
+		if err == nil && at == commit {
+			return landPushed{Already: true}, nil
+		}
+		if err == nil {
+			if _, err = d.PushOrder(ctx, head, branch, false); err == nil {
+				return landPushed{}, nil
+			}
+		}
+		var re *rpcError
+		switch {
+		case errors.Is(err, ErrPushRejected):
+			return landPushed{Code: stallPushRejected, Why: fmt.Sprintf("the push of %s to %s was rejected: %s", head,
+				branch, oneLine(err.Error()))}, nil
+		case errors.As(err, &re) || errors.Is(err, ErrNotFound):
+			return landPushed{Code: stallPushFailed, Why: fmt.Sprintf("the push of %s to %s was refused: %s", head, branch,
+				oneLine(err.Error()))}, nil
+		}
+		if ctx.Err() != nil {
+			return landPushed{}, ctx.Err()
+		}
+		if try >= landPushTries {
+			return landPushed{Code: stallPushFailed, Why: fmt.Sprintf("the push of %s to %s failed %d times: %s", head, branch,
+				try, oneLine(err.Error()))}, nil
+		}
+		d.logger.Warn("land push failed; trying again", "order", head, "branch", branch, "try", try, "err", err)
+		select {
+		case <-ctx.Done():
+			return landPushed{}, ctx.Err()
+		case <-time.After(wait):
+		}
+		wait *= 2
+	}
+}
+
+// remoteBranch is the commit refs/heads/<branch> is at on repo's
+// registered URL (`git ls-remote`), "" when the branch doesn't exist.
+func (d *Daemon) remoteBranch(ctx context.Context, repo, branch string) (string, error) {
+	url, ok := d.repos[repo]
+	if !ok {
+		return "", badRequest("repo %s is not registered on this bridge (repos: %s)", repo, d.repoNames())
+	}
+	ctx, cancel := context.WithTimeout(ctx, gitFetchTimeout)
+	defer cancel()
+	ref := "refs/heads/" + branch
+	out, err := runGit(ctx, d.repoDir(repo), "ls-remote", "--end-of-options", url, ref)
+	if err != nil {
+		return "", err
+	}
+	for line := range strings.SplitSeq(out, "\n") {
+		if sha, name, ok := strings.Cut(line, "\t"); ok && name == ref {
+			return sha, nil
+		}
+	}
+	return "", nil
 }
 
 // drop drops the task (section 6): drop-order ends its open order, if
