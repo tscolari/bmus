@@ -99,6 +99,7 @@ func newCampaignRig(t *testing.T, o campaignOpts) *campaignRig {
 	g.cfg.Tracker = g.fake
 	g.cfg.StandingOrders = true
 	g.cfg.taskRecheck = 300 * time.Millisecond
+	g.cfg.landBackoff = 10 * time.Millisecond
 	g.cfg.trackerRetries = []dbos.StepOption{dbos.WithStepMaxRetries(2), dbos.WithStepBaseInterval(10 * time.Millisecond),
 		dbos.WithStepMaxInterval(50 * time.Millisecond)}
 	if o.regs != nil {
