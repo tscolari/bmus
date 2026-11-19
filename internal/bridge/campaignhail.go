@@ -74,8 +74,10 @@ const (
 	maxCampaignSubject = 200
 	// maxCampaignSummary caps the passing review's summary.
 	maxCampaignSummary = 8 << 10
-	// maxCampaignReason caps a stall's reason.
-	maxCampaignReason = 2 << 10
+	// maxCampaignReason caps a stall's reason, and maxCampaignTightReason
+	// in fitCampaignFindings' tight pass.
+	maxCampaignReason      = 2 << 10
+	maxCampaignTightReason = 512
 	// maxCampaignNote caps the note a stalled or land decision may carry.
 	maxCampaignNote = 2 << 10
 )
@@ -197,10 +199,13 @@ func (t CampaignHailTask) clean() CampaignHailTask {
 // mediums, the review's medium findings, numbered from 1 in the context
 // (c.Findings is replaced). Raise it under campaignTriageKey(c.Round).
 //
-// The question: "Triage 2 medium findings from ORD-0009's review of
-// o/r#12, round 1: answer file, fix or drop for all of them, or a JSON
-// object {"fix": [..], "file": [..], "drop": [..]} of finding numbers;
-// unnamed findings are filed."
+// The question: "Triage 2 medium findings from ORD-0009's review in round
+// 1: answer file, fix or drop for all of them, or a JSON object {"fix":
+// [..], "file": [..], "drop": [..]} of finding numbers; unnamed findings
+// are filed." It leaves out the task's ref, which is free text a
+// captain_only rule could match (acme/salesforce#12 fits the
+// delete|destroy|force option rule) and send every triage to the
+// captain; the context names it.
 func campaignTriageHail(c CampaignTriageContext, mediums []comms.VerdictFinding) (store.Hail, error) {
 	if err := c.check(); err != nil {
 		return store.Hail{}, err
@@ -212,9 +217,9 @@ func campaignTriageHail(c CampaignTriageContext, mediums []comms.VerdictFinding)
 		return store.Hail{}, errors.New("a campaign_triage hail needs a finding to triage")
 	}
 	c.CampaignHailTask = c.clean()
-	raw, err := fitCampaignFindings(mediums, func(fs []CampaignFinding) ([]byte, error) {
+	raw, err := fitCampaignFindings(mediums, func(fs []CampaignFinding, _ bool) ([]byte, error) {
 		c.Findings = fs
-		return json.Marshal(c)
+		return encodeContext(c)
 	})
 	if err != nil {
 		return store.Hail{}, err
@@ -223,9 +228,9 @@ func campaignTriageHail(c CampaignTriageContext, mediums []comms.VerdictFinding)
 	if len(mediums) == 1 {
 		all = "answer file, fix or drop"
 	}
-	q := fmt.Sprintf(`Triage %d medium %s from %s's review of %s, round %d: %s, or a JSON object `+
+	q := fmt.Sprintf(`Triage %d medium %s from %s's review in round %d: %s, or a JSON object `+
 		`{"fix": [..], "file": [..], "drop": [..]} of finding numbers; unnamed findings are filed.`,
-		len(mediums), plural(len(mediums), "finding"), oneLine(c.Review), oneLine(c.Task), c.Round, all)
+		len(mediums), plural(len(mediums), "finding"), oneLine(c.Review), c.Round, all)
 	return store.Hail{Category: regs.CategoryCampaignTriage, Question: q, Options: campaignTriageOptions, Context: raw}, nil
 }
 
@@ -235,9 +240,11 @@ func campaignTriageHail(c CampaignTriageContext, mediums []comms.VerdictFinding)
 // or retry and drop when c has no head. Raise it under
 // campaignStallKey(n) for the task's nth stall.
 //
-// The question: "o/r#12 of campaign C-0001 stalled in round 2 of 3 on
+// The question: "A task of campaign C-0001 stalled in round 2 of 3 on
 // ORD-0011 (no_verdict): land ORD-0010 (3f2a9c1e0b7d) as it is, retry or
-// drop? An option may be followed by a note: retry: <note>."
+// drop? An option may be followed by a note: retry: <note>." It leaves
+// out the task's ref, as the triage question does, so a ref can't send a
+// stall Command may answer to the captain; the context names it.
 func campaignStalledHail(c CampaignStalledContext, blocking []comms.VerdictFinding) (store.Hail, error) {
 	if err := c.check(); err != nil {
 		return store.Hail{}, err
@@ -252,10 +259,13 @@ func campaignStalledHail(c CampaignStalledContext, blocking []comms.VerdictFindi
 		return store.Hail{}, fmt.Errorf("head %q at %q is not an order and its full commit id", c.Head, c.HeadCommit)
 	}
 	c.CampaignHailTask = c.clean()
-	c.Reason = clip(oneLine(c.Reason), maxCampaignReason)
-	raw, err := fitCampaignFindings(blocking, func(fs []CampaignFinding) ([]byte, error) {
-		c.Blocking = fs
-		return json.Marshal(c)
+	reason := clip(oneLine(c.Reason), maxCampaignReason)
+	raw, err := fitCampaignFindings(blocking, func(fs []CampaignFinding, tight bool) ([]byte, error) {
+		c.Blocking, c.Reason = fs, reason
+		if tight {
+			c.Reason = clip(reason, maxCampaignTightReason)
+		}
+		return encodeContext(c)
 	})
 	if err != nil {
 		return store.Hail{}, err
@@ -269,8 +279,8 @@ func campaignStalledHail(c CampaignStalledContext, blocking []comms.VerdictFindi
 		opts = campaignLandOptions
 		ask = fmt.Sprintf("land %s (%s) as it is, retry or drop?", oneLine(c.Head), shortCommit(c.HeadCommit))
 	}
-	q := fmt.Sprintf("%s of campaign %s stalled in round %d of %d%s (%s): %s An option may be followed by a note: retry: <note>.",
-		oneLine(c.Task), oneLine(c.Campaign), c.Round, c.MaxRounds, on, c.Code, ask)
+	q := fmt.Sprintf("A task of campaign %s stalled in round %d of %d%s (%s): %s An option may be followed by a note: retry: <note>.",
+		oneLine(c.Campaign), c.Round, c.MaxRounds, on, c.Code, ask)
 	return store.Hail{Category: regs.CategoryCampaignStalled, Question: q, Options: opts, Context: raw}, nil
 }
 
@@ -281,7 +291,9 @@ func campaignStalledHail(c CampaignStalledContext, blocking []comms.VerdictFindi
 //
 // The question: "Land o/r#12 of campaign C-0001: push ORD-0011
 // (3f2a9c1e0b7d) to campaign/C-0001/o-r-12 on repo app, 4 commits over
-// 8b1d0e2c4a55, passed review in round 2?"
+// 8b1d0e2c4a55, passed review in round 2?" It names the ref and the
+// branch, free text that could fit a captain_only rule, and that changes
+// nothing: the category is fixed to the captain (regs.CaptainFixed).
 func campaignLandHail(c CampaignLandContext) (store.Hail, error) {
 	if err := c.check(); err != nil {
 		return store.Hail{}, err
@@ -300,7 +312,7 @@ func campaignLandHail(c CampaignLandContext) (store.Hail, error) {
 	}
 	c.Commits = commits
 	c.ReviewSummary = clip(c.ReviewSummary, maxCampaignSummary)
-	raw, err := json.Marshal(c)
+	raw, err := encodeContext(c)
 	if err != nil {
 		return store.Hail{}, err
 	}
@@ -318,14 +330,27 @@ func plural(n int, word string) string {
 	return word + "s"
 }
 
+// encodeContext is v as JSON without HTML escaping, which would grow each
+// <, > and & to 6 bytes.
+func encodeContext(v any) ([]byte, error) {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), nil
+}
+
 // fitCampaignFindings numbers fs from 1 and encodes the context build
 // makes of them, within maxConsultContext so Command reads all of it:
 // each body is cut to maxCampaignBody, halving the cap while the context
-// is too long, and with empty bodies each title is cut to
-// maxCampaignTightTitle and each path to maxCampaignTightPath. At most 20
-// findings of a verdict then always fit; what still doesn't is encoded as
-// it is.
-func fitCampaignFindings(fs []comms.VerdictFinding, build func([]CampaignFinding) ([]byte, error)) ([]byte, error) {
+// is too long, and with empty bodies a tight pass (build's tight) cuts
+// each title to maxCampaignTightTitle and each path to
+// maxCampaignTightPath, and build cuts its own free text (a stall's
+// reason). At most 20 findings of a verdict then always fit; what still
+// doesn't is encoded as it is.
+func fitCampaignFindings(fs []comms.VerdictFinding, build func(fs []CampaignFinding, tight bool) ([]byte, error)) ([]byte, error) {
 	tight := false
 	for cut := maxCampaignBody; ; cut /= 2 {
 		out := make([]CampaignFinding, 0, len(fs))
@@ -336,7 +361,7 @@ func fitCampaignFindings(fs []comms.VerdictFinding, build func([]CampaignFinding
 			}
 			out = append(out, cf)
 		}
-		raw, err := build(out)
+		raw, err := build(out, tight)
 		if err != nil || len(raw) <= maxConsultContext || cut == 0 && tight {
 			return raw, err
 		}
@@ -358,24 +383,41 @@ func raiseCampaignHail(ctx dbos.Context, key string, h store.Hail, entry store.L
 	return awaitCampaignDecision(ctx, id)
 }
 
+// campaignHailRead is the check-campaign-hail step's recorded result: the
+// hail's row and whether its countermand window had passed when it was
+// read under the store's write lock.
+type campaignHailRead struct {
+	Hail  store.Hail
+	Final bool
+}
+
 // awaitCampaignDecision waits for campaign hail id to close
 // (awaitBridgeHail). A decision the captain may still countermand
 // (Command's, or a captain timeout's default_option) is waited out in
 // full (awaitCountermandWindow, uncapped: a campaign isn't bound to a
-// tour), and the row is read again (check-campaign-hail), so the caller
-// acts on the final decision, a countermand included. The captain's own
-// decision returns at once.
+// tour), and the row is read again under the store's write lock with the
+// time taken inside it (check-campaign-hail, store.GetHailLocked), so a
+// countermand that took the lock before the deadline commits first. A
+// read whose time isn't past countermand_until waits and reads again.
+// The caller then acts on the final decision, a countermand included.
+// The captain's own decision returns at once.
 func awaitCampaignDecision(ctx dbos.Context, id string) (store.Hail, error) {
 	h, err := awaitBridgeHail(ctx, id)
 	if err != nil || h.Status != store.HailDecided || h.CountermandUntil == nil {
 		return h, err
 	}
-	if err := awaitCountermandWindow(ctx, id, "campaign-window", true); err != nil {
-		return store.Hail{}, err
+	for {
+		if err := awaitCountermandWindow(ctx, id, "campaign-window", true); err != nil {
+			return store.Hail{}, err
+		}
+		r, err := dbos.RunAsStep(ctx, func(c context.Context) (campaignHailRead, error) {
+			h, now, err := daemonFrom(c).store.GetHailLocked(c, id)
+			return campaignHailRead{Hail: h, Final: h.CountermandUntil == nil || now.After(*h.CountermandUntil)}, err
+		}, append([]dbos.StepOption{dbos.WithStepName("check-campaign-hail")}, storeRetries...)...)
+		if err != nil || r.Final {
+			return r.Hail, err
+		}
 	}
-	return dbos.RunAsStep(ctx, func(c context.Context) (store.Hail, error) {
-		return daemonFrom(c).store.GetHail(c, id)
-	}, append([]dbos.StepOption{dbos.WithStepName("check-campaign-hail")}, storeRetries...)...)
 }
 
 // campaignTriage is a campaign_triage decision: the finding numbers to
@@ -557,16 +599,20 @@ func (c campaignChoice) normal() string {
 // parseCampaignChoice reads a campaign_stalled or campaign_land decision
 // against the hail's options: an option word, in any case, optionally
 // followed by a colon and a note, "retry: the flaky test is real". The
-// decision is one line: no control character, line or paragraph
+// decision is one line: no control character, format character
+// (unicode.Cf: bidi overrides, zero-width spaces), line or paragraph
 // separator, in valid UTF-8. The note, trimmed, is at most
 // maxCampaignNote bytes; an empty one is no note.
 func parseCampaignChoice(decision string, options []string) (campaignChoice, error) {
 	if !utf8.ValidString(decision) {
 		return campaignChoice{}, errors.New("not valid UTF-8")
 	}
-	if i := strings.IndexFunc(decision, func(r rune) bool { return unicode.IsControl(r) || r == '\u2028' || r == '\u2029' }); i >= 0 {
+	notLine := func(r rune) bool {
+		return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '\u2028' || r == '\u2029'
+	}
+	if i := strings.IndexFunc(decision, notLine); i >= 0 {
 		r, _ := utf8.DecodeRuneInString(decision[i:])
-		return campaignChoice{}, fmt.Errorf("a decision is one line, with no control character (%q at byte %d)", r, i)
+		return campaignChoice{}, fmt.Errorf("a decision is one line, with no control or format character (%q at byte %d)", r, i)
 	}
 	word, note, _ := strings.Cut(strings.TrimSpace(decision), ":")
 	word, note = strings.ToLower(strings.TrimSpace(word)), strings.TrimSpace(note)
@@ -601,7 +647,10 @@ func orList(words []string) string {
 // An option given with a decision that doesn't match it, or a decision
 // that doesn't parse, is a bad request saying what the hail takes.
 func checkCampaignAnswer(h store.Hail, decision string, option *int) (string, *int, error) {
-	if decision == "" && option != nil && *option >= 0 && *option < len(h.Options) {
+	if option != nil && (*option < 0 || *option >= len(h.Options)) {
+		return "", nil, badRequest("hail %s: option %d out of range (%d options)", h.ID, *option, len(h.Options))
+	}
+	if decision == "" && option != nil {
 		decision, option = h.Options[*option], nil
 	}
 	var (

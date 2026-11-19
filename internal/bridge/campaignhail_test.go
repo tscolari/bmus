@@ -43,7 +43,7 @@ func TestCampaignHailBuilders(t *testing.T) {
 	tr, err := campaignTriageHail(CampaignTriageContext{CampaignHailTask: campaignTask, Review: "ORD-0009", Round: 1}, mediums(2))
 	require.NoError(t, err)
 	require.Equal(t, regs.CategoryCampaignTriage, tr.Category)
-	require.Equal(t, `Triage 2 medium findings from ORD-0009's review of o/r#12, round 1: answer file, fix or drop for all of them, `+
+	require.Equal(t, `Triage 2 medium findings from ORD-0009's review in round 1: answer file, fix or drop for all of them, `+
 		`or a JSON object {"fix": [..], "file": [..], "drop": [..]} of finding numbers; unnamed findings are filed.`, tr.Question)
 	require.Equal(t, []string{"file", "fix", "drop"}, tr.Options)
 	var tc CampaignTriageContext
@@ -56,26 +56,40 @@ func TestCampaignHailBuilders(t *testing.T) {
 
 	one, err := campaignTriageHail(CampaignTriageContext{CampaignHailTask: campaignTask, Review: "ORD-0009", Round: 2}, mediums(1))
 	require.NoError(t, err)
-	require.Equal(t, `Triage 1 medium finding from ORD-0009's review of o/r#12, round 2: answer file, fix or drop, `+
+	require.Equal(t, `Triage 1 medium finding from ORD-0009's review in round 2: answer file, fix or drop, `+
 		`or a JSON object {"fix": [..], "file": [..], "drop": [..]} of finding numbers; unnamed findings are filed.`, one.Question)
 
-	// 20 findings with the largest titles, bodies and paths still fit a
-	// consult whole.
+	// 20 findings with the largest titles, bodies and paths, in the
+	// characters JSON escapes longest, still fit a consult whole, in a
+	// triage and in a stall with the longest reason. < > & stay as they
+	// are.
 	var big []comms.VerdictFinding
 	for range 20 {
-		big = append(big, comms.VerdictFinding{Severity: "medium", Title: strings.Repeat("<", 200), Body: strings.Repeat("<", 8<<10),
-			Path: strings.Repeat("<", 512), Line: 1})
+		big = append(big, comms.VerdictFinding{Severity: "high", Title: strings.Repeat("\u2028", 200),
+			Body: strings.Repeat("\x01", 8<<10), Path: strings.Repeat(`"`, 512), Line: 1})
 	}
 	full, err := campaignTriageHail(CampaignTriageContext{CampaignHailTask: campaignTask, Review: "ORD-0009", Round: 1}, big)
 	require.NoError(t, err)
 	require.LessOrEqual(t, len(full.Context), maxConsultContext)
 	require.NoError(t, json.Unmarshal(full.Context, &tc))
 	require.Len(t, tc.Findings, 20)
+	fullStall, err := campaignStalledHail(CampaignStalledContext{CampaignHailTask: campaignTask, Code: "max_rounds",
+		Reason: strings.Repeat(`"`, 4<<10), Round: 3, MaxRounds: 3, Head: "ORD-0010", HeadCommit: headCommit}, big)
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(fullStall.Context), maxConsultContext)
+	var fsc CampaignStalledContext
+	require.NoError(t, json.Unmarshal(fullStall.Context, &fsc))
+	require.Len(t, fsc.Blocking, 20)
+	require.Len(t, fsc.Reason, maxCampaignTightReason)
+	lt, err := campaignTriageHail(CampaignTriageContext{CampaignHailTask: campaignTask, Review: "ORD-0009", Round: 1},
+		[]comms.VerdictFinding{{Severity: "medium", Title: "a < b && c > d", Body: "<b>"}})
+	require.NoError(t, err)
+	require.Contains(t, string(lt.Context), `"title":"a < b && c > d"`)
 
 	st, err := campaignStalledHail(CampaignStalledContext{CampaignHailTask: campaignTask, Code: "no_verdict", Reason: hostile,
 		Round: 2, MaxRounds: 3, Head: "ORD-0010", HeadCommit: headCommit, Order: "ORD-0011"}, mediums(1))
 	require.NoError(t, err)
-	require.Equal(t, "o/r#12 of campaign C-0001 stalled in round 2 of 3 on ORD-0011 (no_verdict): land ORD-0010 (3f2a9c1e0b7d) "+
+	require.Equal(t, "A task of campaign C-0001 stalled in round 2 of 3 on ORD-0011 (no_verdict): land ORD-0010 (3f2a9c1e0b7d) "+
 		"as it is, retry or drop? An option may be followed by a note: retry: <note>.", st.Question)
 	require.Equal(t, []string{"land", "retry", "drop"}, st.Options)
 	var sc CampaignStalledContext
@@ -88,7 +102,7 @@ func TestCampaignHailBuilders(t *testing.T) {
 	headless, err := campaignStalledHail(CampaignStalledContext{CampaignHailTask: campaignTask, Code: "tracker_failed",
 		Reason: "tracker down", Round: 1, MaxRounds: 3}, nil)
 	require.NoError(t, err)
-	require.Equal(t, "o/r#12 of campaign C-0001 stalled in round 1 of 3 (tracker_failed): retry or drop? "+
+	require.Equal(t, "A task of campaign C-0001 stalled in round 1 of 3 (tracker_failed): retry or drop? "+
 		"An option may be followed by a note: retry: <note>.", headless.Question)
 	require.Equal(t, []string{"retry", "drop"}, headless.Options)
 	require.NoError(t, json.Unmarshal(headless.Context, &sc))
@@ -238,9 +252,12 @@ func TestParseCampaignChoice(t *testing.T) {
 		"":                                       `"" is not land, retry or drop`,
 		"retry the flaky test":                   `"retry the flaky test" is not land, retry or drop`,
 		"keep":                                   `"keep" is not land, retry or drop`,
-		"retry: a\nb":                            `no control character ('\n' at byte 8)`,
-		"retry: a\u2028b":                        `no control character ('\u2028' at byte 8)`,
-		"retry: \x1b[31m":                        `no control character ('\x1b' at byte 7)`,
+		"retry: a\nb":                            `no control or format character ('\n' at byte 8)`,
+		"retry: a\u2028b":                        `no control or format character ('\u2028' at byte 8)`,
+		"retry: \x1b[31m":                        `no control or format character ('\x1b' at byte 7)`,
+		"retry: a\u202eb":                        `no control or format character ('\u202e' at byte 8)`,
+		"retry: a\u200bb":                        `no control or format character ('\u200b' at byte 8)`,
+		"land\ufeff":                             `no control or format character ('\ufeff' at byte 4)`,
 		"retry: \xff":                            "not valid UTF-8",
 		"retry: " + strings.Repeat("x", 2<<10+1): "the note is 2049 bytes, over 2048",
 	} {
@@ -302,6 +319,9 @@ func TestCheckCampaignAnswer(t *testing.T) {
 		{st, "keep", nil, `hail H-0002: "keep" is not land, retry or drop; answer land, retry or drop, ` +
 			`optionally followed by a one-line note (retry: <note>)`},
 		{land, "retry: x", opt(0), `hail H-0003: option 0 (land) does not match the decision "retry: x"`},
+		{land, "", opt(3), `hail H-0003: option 3 out of range (3 options)`},
+		{land, "land", opt(-1), `hail H-0003: option -1 out of range (3 options)`},
+		{tr, "", opt(9), `hail H-0001: option 9 out of range (3 options)`},
 	} {
 		_, _, err := checkCampaignAnswer(tc.h, tc.decision, tc.option)
 		var re *rpcError
@@ -358,6 +378,38 @@ func TestClassifyCampaignHails(t *testing.T) {
 				require.Equal(t, regs.DefaultCountermandWindow, r.CountermandWindow)
 			}
 		})
+	}
+}
+
+// A task's ref is free text a captain_only rule may fit: the triage and
+// stalled questions leave it out, so Command still answers them and its
+// answer passes regs.CheckAnswer. The land question names it, and the
+// category is the captain's anyway.
+func TestCampaignQuestionsLeaveOutRef(t *testing.T) {
+	t.Parallel()
+	cfg := loadRegsText(t, strings.Replace(string(regs.Default), "  - category: campaign_stalled\n", "", 1))
+	for _, ref := range []string{"acme/salesforce#12", "acme/git-push-hooks#3", "acme/deploy-destroy#1"} {
+		task := CampaignHailTask{Campaign: "C-0001", Task: ref, IssueTitle: "git push --force to deploy"}
+		tr, err := campaignTriageHail(CampaignTriageContext{CampaignHailTask: task, Review: "ORD-0009", Round: 1}, mediums(2))
+		require.NoError(t, err)
+		st, err := campaignStalledHail(CampaignStalledContext{CampaignHailTask: task, Code: "no_verdict", Reason: "git push --force",
+			Round: 1, MaxRounds: 3, Head: "ORD-0010", HeadCommit: headCommit, Order: "ORD-0011"}, nil)
+		require.NoError(t, err)
+		for _, h := range []store.Hail{tr, st} {
+			require.NotContains(t, h.Question, ref)
+			rh := regsHail(h, store.Order{})
+			route, _, rule := cfg.Classify(rh)
+			require.Equal(t, regs.RouteCommand, route, "%s %s: %s", ref, h.Category, rule)
+			one := 1
+			ok, why := cfg.CheckAnswer(rh, regs.Reply{Decision: regs.DecisionAnswer, Option: &one, Confidence: 1})
+			require.True(t, ok, "%s %s: %s", ref, h.Category, why)
+		}
+		land, err := campaignLandHail(CampaignLandContext{CampaignHailTask: task, Repo: "app", Branch: "campaign/C-0001/x",
+			Head: "ORD-0011", HeadCommit: headCommit, ReviewBase: baseCommit, Rounds: 1, Review: "ORD-0012"})
+		require.NoError(t, err)
+		require.Contains(t, land.Question, ref)
+		route, _, rule := cfg.Classify(regsHail(land, store.Order{}))
+		require.Equal(t, [2]string{regs.RouteCaptain, "category campaign_land is fixed to the captain"}, [2]string{route, rule})
 	}
 }
 
