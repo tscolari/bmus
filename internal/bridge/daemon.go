@@ -347,6 +347,10 @@ type Daemon struct {
 
 	// login is the transporter's login as watchLogin last read it (#102),
 	// and loginExpiredAt the last time it was seen expired.
+	// campaignMu serializes campaign.run (#186): it reads the next
+	// campaign id, checks the branch that id names, and inserts under it.
+	campaignMu sync.Mutex
+
 	loginMu        sync.Mutex
 	login          loginState
 	loginExpiredAt time.Time

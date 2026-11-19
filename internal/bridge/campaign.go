@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"slices"
 	"strconv"
@@ -1790,7 +1791,9 @@ func (d *Daemon) landRepoCheck(ctx context.Context, repo, head string) (string, 
 // not url.*.pushInsteadOf: with a pushInsteadOf for the URL it reads
 // where the bridge fetches, which may differ from where PushOrder
 // pushes. Then a replay can push again, and a non-forced push of the
-// same commit changes nothing.
+// same commit changes nothing. Before the bridge has made its clone (no
+// order has shipped the repo yet, as at campaign.run, #186) it runs in
+// the bridge's home, which holds no repository.
 func (d *Daemon) remoteBranch(ctx context.Context, repo, branch string) (string, error) {
 	url, ok := d.repos[repo]
 	if !ok {
@@ -1799,7 +1802,11 @@ func (d *Daemon) remoteBranch(ctx context.Context, repo, branch string) (string,
 	ctx, cancel := context.WithTimeout(ctx, gitFetchTimeout)
 	defer cancel()
 	ref := "refs/heads/" + branch
-	out, err := runGit(ctx, d.repoDir(repo), "ls-remote", "--end-of-options", url, ref)
+	dir := d.repoDir(repo)
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		dir = d.home
+	}
+	out, err := runGit(ctx, dir, "ls-remote", "--end-of-options", url, ref)
 	if err != nil {
 		return "", err
 	}
@@ -1858,18 +1865,36 @@ func (r *taskRun) fileOpenReview(id string) error {
 // that ended meanwhile, or a refusal (too late), is left alone. It
 // reports whether it asked for an end.
 func (d *Daemon) endTaskOrder(ctx context.Context, id, reason string) (bool, error) {
+	how, err := d.endTaskOrderHow(ctx, id, reason)
+	return how != "", err
+}
+
+// What endTaskOrderHow asked of an order.
+const (
+	taskOrderWithdrawn = "withdrawn"
+	taskOrderBelay     = "belay requested"
+)
+
+// endTaskOrderHow is endTaskOrder, which also says what it asked:
+// taskOrderWithdrawn, taskOrderBelay, or "" when it left the order alone.
+func (d *Daemon) endTaskOrderHow(ctx context.Context, id, reason string) (string, error) {
 	o, err := d.store.GetOrder(ctx, id)
 	if err != nil || store.OrderEnded(o.State) {
-		return false, err
+		return "", err
 	}
+	how := taskOrderBelay
 	if (o.State == store.OrderPool || o.State == store.OrderDirected) && o.ParkedAt == nil {
+		how = taskOrderWithdrawn
 		_, err = d.withdrawOrder(ctx, id, reason)
 	} else {
 		_, err = d.belayOrder(ctx, id, reason)
 	}
 	var re *rpcError
 	if errors.As(err, &re) {
-		return false, nil
+		return "", nil
 	}
-	return err == nil, err
+	if err != nil {
+		return "", err
+	}
+	return how, nil
 }

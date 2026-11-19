@@ -51,6 +51,9 @@ type campaignOpts struct {
 	// reviewers are the science crew members, tuvok by default.
 	reviewers []string
 	regs      *regs.Config
+	// noCampaign leaves the campaign and its task out: the test starts
+	// one with campaign.run (#186).
+	noCampaign bool
 }
 
 const testCampaign = "C-0001"
@@ -84,13 +87,15 @@ func newCampaignRig(t *testing.T, o campaignOpts) *campaignRig {
 		require.NoError(t, st.InsertCrew(ctx, c, testEntry))
 	}
 	require.NoError(t, st.Close())
-	db := campaignDB(t, g.home)
-	_, err = db.ExecContext(ctx, `INSERT INTO campaigns (id, repo, base_ref, division, assignee, review_division, max_rounds, created_at)
-		VALUES (?, 'app', 'main', 'eng', 'sorell', 'science', ?, ?)`, testCampaign, o.maxRounds, time.Now().UTC())
-	require.NoError(t, err)
-	_, err = db.ExecContext(ctx, `INSERT INTO campaign_tasks (campaign_id, ref, workflow_id, max_rounds, branch) VALUES (?, ?, ?, ?, ?)`,
-		testCampaign, g.ref, g.task, o.maxRounds, "campaign/C-0001/1")
-	require.NoError(t, err)
+	if !o.noCampaign {
+		db := campaignDB(t, g.home)
+		_, err = db.ExecContext(ctx, `INSERT INTO campaigns (id, repo, base_ref, division, assignee, review_division, max_rounds,
+			created_at) VALUES (?, 'app', 'main', 'eng', 'sorell', 'science', ?, ?)`, testCampaign, o.maxRounds, time.Now().UTC())
+		require.NoError(t, err)
+		_, err = db.ExecContext(ctx, `INSERT INTO campaign_tasks (campaign_id, ref, workflow_id, max_rounds, branch)
+			VALUES (?, ?, ?, ?, ?)`, testCampaign, g.ref, g.task, o.maxRounds, "campaign/C-0001/1")
+		require.NoError(t, err)
+	}
 
 	g.cfg = testConfig(g.home)
 	g.cfg.Transporter = &fakeProvider{blockProvision: true}
