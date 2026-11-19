@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"database/sql"
 	"encoding/json"
 	"path/filepath"
 	"strings"
@@ -657,6 +658,28 @@ func TestCampaignDrop(t *testing.T) {
 		require.NoError(t, err)
 		require.Empty(t, hails)
 	})
+}
+
+// A campaign belayed while its task is stalled, its stall hail closed
+// unanswered as campaign belay will close it, drops the task with no
+// further stall hail.
+func TestCampaignBelayedWhileStalled(t *testing.T) {
+	t.Parallel()
+	g := newCampaignRig(t, campaignOpts{})
+	work := g.waitOrder("r1:work")
+	g.claim(work.ID, "sorell")
+	g.fail(work.ID, "crew_error")
+	h, _ := g.stallHail()
+	_, err := campaignDB(t, g.home).ExecContext(t.Context(), `UPDATE campaigns SET state = 'belaying'`)
+	require.NoError(t, err)
+	closed, err := g.d.store.TimeOutOpenHailThen(t.Context(), h.ID, store.LogEntry{Kind: logHail, Text: "campaign belayed"},
+		func(tx *sql.Tx) error { return g.d.notifyHailClosed(tx, h.ID) })
+	require.NoError(t, err)
+	require.True(t, closed)
+	require.Equal(t, TaskResult{State: store.TaskDropped, Why: "campaign belayed"}, g.result())
+	hails, err := g.d.store.ListHails(t.Context(), "")
+	require.NoError(t, err)
+	require.Len(t, hails, 1)
 }
 
 // Plan Verification 10 for the review: the bridge stopped while the

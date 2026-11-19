@@ -433,13 +433,16 @@ type orderCreated struct {
 	ID   string `json:",omitempty"`
 	Code string `json:",omitempty"`
 	Why  string `json:",omitempty"`
+	// Belaying: the campaign is being belayed, and nothing was created.
+	Belaying bool `json:",omitempty"`
 }
 
 // createOrder runs step, which creates o through CreateOrder's checks
 // under its created_by (createOrderAs, once), so a re-run creates
 // nothing new, then writes the task's row with change applied and logs
 // text on the order (SetTask). direct, if set, picks the order's
-// assignee and division inside the step. A tracker error reading the
+// assignee and division inside the step. A campaign being belayed creates
+// nothing and returns Belaying. A tracker error reading the
 // source retries like filing (trackerRetries) and then stalls
 // tracker_failed; an item the tracker can't find stalls tracker_failed at
 // once, and any other refusal stalls failed.
@@ -448,6 +451,13 @@ func (r *taskRun) createOrder(step string, o store.Order, direct func(context.Co
 	t := r.t
 	out, err := dbos.RunAsStep(r.ctx, func(c context.Context) (orderCreated, error) {
 		d := daemonFrom(c)
+		cp, err := d.store.GetCampaign(c, r.c.ID)
+		if err != nil {
+			return orderCreated{}, err
+		}
+		if cp.State == store.CampaignBelaying {
+			return orderCreated{Belaying: true}, nil
+		}
 		o := o
 		if direct != nil {
 			if err := direct(c, d, &o); err != nil {
@@ -658,6 +668,9 @@ func (r *taskRun) work() (taskPhase, error) {
 	}, func(id string) string { return r.roundText(text + " " + id + " created") })
 	if err != nil {
 		return phaseEnd, err
+	}
+	if created.Belaying {
+		return r.drop("campaign belayed")
 	}
 	if created.Why != "" {
 		return r.stall(created.Code, created.Why, "", phaseWork, kind)
@@ -944,6 +957,9 @@ func (r *taskRun) review() (taskPhase, error) {
 	if err != nil {
 		return phaseEnd, err
 	}
+	if created.Belaying {
+		return r.drop("campaign belayed")
+	}
 	if created.Why != "" {
 		return r.stall(created.Code, created.Why, "", phaseReview, "review")
 	}
@@ -1200,10 +1216,19 @@ func (r *taskRun) fileReviewFindings(id string) error {
 // retry repeats what stalled (phase, with keyKind's next attempt); after
 // max_rounds it raises the task's max_rounds by one and starts the next
 // fix round. land lands the head as it is, with the captain's consent
-// when the captain decided. drop drops the task. A hail closed undecided
-// drops the task when the campaign is being belayed, and stalls again
-// otherwise.
+// when the captain decided. drop drops the task. A campaign being belayed
+// drops the task instead of stalling it (check-campaign), and so does a
+// hail closed undecided then; one closed undecided otherwise stalls the
+// task again.
 func (r *taskRun) stall(code, reason, order string, phase taskPhase, keyKind string) (taskPhase, error) {
+	// A campaign being belayed drops its task with no stall hail.
+	belaying, err := r.belaying()
+	if err != nil {
+		return phaseEnd, err
+	}
+	if belaying {
+		return r.drop("campaign belayed")
+	}
 	reason = clip(oneLine(reason), maxCampaignReason)
 	if err := r.setTask("task-stalled", func(t *store.CampaignTask) {
 		t.State, t.Why, t.OpenOrder, t.OpenHail = store.TaskStalled, reason, "", ""
