@@ -127,35 +127,55 @@ func (d *Daemon) AddCrew(ctx context.Context, c store.Crew) error {
 // created and nil is returned: the tour claims it after its next mission or
 // wait timeout (missionCheckEvery).
 func (d *Daemon) CreateOrder(ctx context.Context, o store.Order) (string, error) {
+	id, _, err := d.createOrderAs(ctx, o, false)
+	return id, err
+}
+
+// sourceError is a tracker error createOrderAs met reading the order's
+// source (resolveSource), as a campaign's order steps tell it apart
+// (#184): one wrapping neither ErrNotFound nor a bad request is worth a
+// retry.
+type sourceError struct{ err error }
+
+func (e *sourceError) Error() string { return e.err.Error() }
+func (e *sourceError) Unwrap() error { return e.err }
+
+// createOrderAs is CreateOrder. With once, the order is inserted keyed on
+// o.CreatedBy (store.InsertOrderOnce, #184): an order already created
+// under the key is returned with created false, and nothing is written,
+// so a re-run of a campaign's order step creates no second order. The
+// crew member's tour is signalled, or the division woken, either way. A
+// resolveSource error comes back wrapped in a sourceError.
+func (d *Daemon) createOrderAs(ctx context.Context, o store.Order, once bool) (id string, created bool, err error) {
 	if o.Assignee == "" && o.Division == "" {
-		return "", badRequest("order assignee or division is required")
+		return "", false, badRequest("order assignee or division is required")
 	}
 	if o.Priority < store.PriorityRoutine || o.Priority > store.PriorityRed {
-		return "", badRequest("order priority %d out of range (0 routine, 1 yellow, 2 red)", o.Priority)
+		return "", false, badRequest("order priority %d out of range (0 routine, 1 yellow, 2 red)", o.Priority)
 	}
 	var crew store.Crew
 	if o.Assignee != "" {
 		var err error
 		crew, err = d.store.GetCrew(ctx, o.Assignee)
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", fmt.Errorf("assignee %s: %w", o.Assignee, ErrNotFound)
+			return "", false, fmt.Errorf("assignee %s: %w", o.Assignee, ErrNotFound)
 		}
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		if crew.Status == store.CrewSickbay || crew.Status == store.CrewDismissed {
-			return "", fmt.Errorf("assignee %s is %s: %w", crew.ID, crew.Status, ErrUnavailable)
+			return "", false, fmt.Errorf("assignee %s is %s: %w", crew.ID, crew.Status, ErrUnavailable)
 		}
 	}
 	if err := d.checkDivision(o.Division); err != nil {
-		return "", err
+		return "", false, err
 	}
 	if err := d.checkOrderRepos(o.Repos); err != nil {
-		return "", err
+		return "", false, err
 	}
 	bases, err := d.checkOrderBases(ctx, o.Repos)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	for _, id := range bases {
 		if !slices.Contains(o.After, id) {
@@ -163,37 +183,42 @@ func (d *Daemon) CreateOrder(ctx context.Context, o store.Order) (string, error)
 		}
 	}
 	if err := d.resolveSource(ctx, &o); err != nil {
-		return "", err
+		return "", false, &sourceError{err}
 	}
 	if strings.TrimSpace(o.Title) == "" {
-		return "", badRequest("order title is required")
+		return "", false, badRequest("order title is required")
 	}
 	entry := store.LogEntry{Kind: logOrder, CrewID: o.Assignee, Text: "order created: " + o.Title}
 	if o.Source != "" {
 		var err error
 		if entry, err = logEntry(logOrder, o.Assignee, "", entry.Text, map[string]any{"source": o.Source}); err != nil {
-			return "", err
+			return "", false, err
 		}
 	}
-	id, err := d.store.InsertOrder(ctx, o, entry)
+	if once {
+		id, created, err = d.store.InsertOrderOnce(ctx, o, entry)
+	} else {
+		id, err = d.store.InsertOrder(ctx, o, entry)
+		created = err == nil
+	}
 	if errors.Is(err, store.ErrAfter) {
-		return "", badRequest("%s", strings.TrimSuffix(err.Error(), ": "+store.ErrAfter.Error()))
+		return "", false, badRequest("%s", strings.TrimSuffix(err.Error(), ": "+store.ErrAfter.Error()))
 	}
 	if errors.Is(err, store.ErrOrderKind) {
-		return "", badRequest("%s", err.Error())
+		return "", false, badRequest("%s", err.Error())
 	}
 	if err != nil {
-		return "", fmt.Errorf("create order: %w", err)
+		return "", false, fmt.Errorf("create order: %w", err)
 	}
 	if o.Assignee == "" {
 		d.wakeDivision(ctx, o.Division)
-		return id, nil
+		return id, created, nil
 	}
 	tour := tourWorkflowID(crew.ID, crew.TourNo)
 	if err := dbos.Send(d.dbos, tour, CrewSignal{Kind: SignalOrderAssigned, OrderID: id}, crewEventsTopic); err != nil {
 		d.logger.Warn("order created but its crew tour was not signalled", "order", id, "tour", tour, "err", err)
 	}
-	return id, nil
+	return id, created, nil
 }
 
 // AnswerHail delivers the captain's decision on an open hail to the mission
