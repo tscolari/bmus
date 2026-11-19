@@ -247,6 +247,7 @@ captain_only:
   - match: deploy # read in answers too
   - category: tracker_comment
   - category: order_reorder
+  - category: campaign_stalled
 
 
 auto_allow:

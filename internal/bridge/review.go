@@ -126,7 +126,7 @@ func reviewFindings(ctx dbos.Context, orderID string, b findingsBegin, res *Find
 	if err != nil {
 		return err
 	}
-	id, err := raiseBridgeHail(ctx, store.Hail{Category: regs.CategoryTrackerReview, Question: reviewQuestion(rc),
+	id, err := raiseBridgeHail(ctx, "", store.Hail{Category: regs.CategoryTrackerReview, Question: reviewQuestion(rc),
 		Options: reviewOptions, Context: raw}, store.LogEntry{Kind: logHail, OrderID: orderID,
 		Text: fmt.Sprintf("the captain asked to review %s filed from %s's findings", countIssues(len(rc.Issues)), orderID)})
 	if err != nil {

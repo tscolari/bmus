@@ -284,7 +284,7 @@ func triageFindings(ctx dbos.Context, orderID string, b findingsBegin) ([]store.
 		for _, it := range backlog[:n] {
 			offered = append(offered, it.Ref)
 		}
-		id, err := raiseBridgeHail(ctx, store.Hail{Category: categoryFindingsTriage, Question: triageQuestion(orderID, len(fs)),
+		id, err := raiseBridgeHail(ctx, "", store.Hail{Category: categoryFindingsTriage, Question: triageQuestion(orderID, len(fs)),
 			Context: hctx}, store.LogEntry{Kind: logHail, OrderID: orderID,
 			Text: fmt.Sprintf("Command asked to triage %s of %s", countFindings(len(fs)), orderID)})
 		if err != nil {
@@ -498,11 +498,7 @@ func (d *Daemon) applyTriage(ctx context.Context, orderID string, keys, offered 
 // duplicate, or block itself. It returns what to do to each finding
 // named, in the batch's order.
 func parseTriage(answer string, keys, offered []string, canon func(string) (string, error)) ([]store.FindingTriage, error) {
-	s := strings.TrimSpace(answer)
-	if rest, ok := strings.CutPrefix(s, "```"); ok {
-		_, body, _ := strings.Cut(rest, "\n")
-		s = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(body), "```"))
-	}
+	s := unfence(answer)
 	if !strings.HasPrefix(s, "{") {
 		return nil, errors.New("not a JSON object")
 	}

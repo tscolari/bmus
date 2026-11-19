@@ -944,7 +944,7 @@ func runMission(ctx dbos.Context, in MissionInput, held *heldCorrections, carrie
 			if hail.Category == comms.CategoryOrderReorder && body.Option != nil && *body.Option == 0 {
 				// A decision the captain may still countermand (a captain
 				// timeout's default_option) waits out its window first.
-				if err := awaitCountermandWindow(ctx, body.HailID, "reorder-window"); err != nil {
+				if err := awaitCountermandWindow(ctx, body.HailID, "reorder-window", false); err != nil {
 					return MissionResult{}, cur.CrewID, err
 				}
 				out, err := dbos.RunAsStep(ctx, func(c context.Context) (reorderOutcome, error) {
@@ -2094,7 +2094,7 @@ func hailDecidedEntry(crewID, orderID string, body comms.AnswerBody) (store.LogE
 	if body.Rationale != "" {
 		payload["rationale"] = body.Rationale
 	}
-	return logEntry(logHail, crewID, orderID, "hail "+body.HailID+" decided: "+body.Decision, payload)
+	return logEntry(logHail, crewID, orderID, "hail "+body.HailID+" decided: "+oneLine(body.Decision), payload)
 }
 
 // decideHail confirms a decision on the hail. Its sender (AnswerHail,

@@ -291,6 +291,10 @@ captain_only:
   # (#148). Hails from Command reach the captain whatever this file says;
   # removing this rule only lets on_timeout default_option decide one.
   - category: order_reorder
+  # A campaign task that stalled (#183): land its head as it is, retry what
+  # stalled, or drop the task. Remove this rule to let Command answer
+  # stalls: each retry it picks then costs tokens without the captain.
+  - category: campaign_stalled
   # A budget hail (a crew member over its order's budget asking to extend
   # it or stop) is always the captain's, whatever this file says, and
   # on_timeout default_option never decides one.
@@ -300,6 +304,11 @@ captain_only:
   # order's findings before they are filed. Only Command answers it:
   # wherever it would reach the captain the bridge skips triage and files
   # every finding, so listing findings_triage here turns triage off.
+  # A campaign_triage hail asks whether to file, fix or drop a campaign
+  # review's medium findings. It goes to Command unless listed here, and
+  # listing it hands every medium finding to the captain.
+  # A campaign_land hail, which pushes a campaign task's branch, is always
+  # the captain's, whatever this file says, and it has no captain_timeout.
 
 auto_allow:
   - tool: Bash
