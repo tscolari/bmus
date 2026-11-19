@@ -281,7 +281,7 @@ func (s *Store) OpenTaskHeads(ctx context.Context) ([]TaskHead, error) {
 		UNION SELECT t.ref, c.repo, t.open_order FROM campaign_tasks t JOIN campaigns c ON c.id = t.campaign_id
 		JOIN orders o ON o.id = t.open_order
 		WHERE o.kind = ? AND t.state NOT IN (?, ?)
-		ORDER BY 3`, TaskLanded, TaskDropped, OrderKindWork, TaskLanded, TaskDropped)
+		ORDER BY 3, 1`, TaskLanded, TaskDropped, OrderKindWork, TaskLanded, TaskDropped)
 	if err != nil {
 		return nil, err
 	}
