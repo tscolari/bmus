@@ -1567,12 +1567,12 @@ func (r *taskRun) askLand() (landResult, bool, error) {
 		}
 		return landResult{StallCode: stallPushFailed, StallWhy: "land-context: " + oneLine(stepError(err))}, false, nil
 	}
-	ctx := CampaignLandContext{CampaignHailTask: r.hailTask(), Repo: r.c.Repo, Branch: r.t.Branch, Head: r.t.Head,
+	hc := CampaignLandContext{CampaignHailTask: r.hailTask(), Repo: r.c.Repo, Branch: r.t.Branch, Head: r.t.Head,
 		HeadCommit: r.t.HeadCommit, ReviewBase: r.t.ReviewBase, Commits: lc.Commits, CommitCount: lc.Count, Rounds: r.t.Round}
 	if r.last != nil && r.last.Order != "" {
-		ctx.Review, ctx.ReviewSummary, ctx.Passed = r.last.Order, r.last.Summary, len(r.last.Blocking) == 0
+		hc.Review, hc.ReviewSummary, hc.Passed = r.last.Order, r.last.Summary, len(r.last.Blocking) == 0
 	}
-	h, err := campaignLandHail(ctx)
+	h, err := campaignLandHail(hc)
 	if err != nil {
 		return landResult{}, false, err
 	}
