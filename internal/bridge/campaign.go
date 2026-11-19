@@ -1093,10 +1093,7 @@ func (r *taskRun) verdict(id string, v verdictRead) (taskPhase, error) {
 		payload["dropped"] = dropped
 	}
 	set := r.t
-	set.OpenOrder, set.OpenHail = "", ""
-	if pass {
-		set.State = store.TaskLanding
-	}
+	set.State, set.OpenOrder, set.OpenHail = store.TaskReviewing, "", ""
 	reviewer := v.Reviewer
 	_, err := dbos.RunAsStep(r.ctx, func(c context.Context) (bool, error) {
 		d := daemonFrom(c)
@@ -1265,7 +1262,11 @@ func (r *taskRun) stall(code, reason, order string, phase taskPhase, keyKind str
 			r.t.Round++
 			return phaseWork, nil
 		}
-		r.retryKey(keyKind)
+		if order != "" {
+			// A fresh order under the key's next attempt; a stall before
+			// any order was created (no reviewer, the tracker) keeps it.
+			r.retryKey(keyKind)
+		}
 		return phase, nil
 	}
 }
