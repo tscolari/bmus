@@ -104,15 +104,18 @@ type taskEndedMsg struct {
 // transaction that ended or split order o.Order, it sends {order, state}
 // on taskOrdersTopic to the order's task workflow when that is live, as
 // notifyRaiser does for a hail. A message to a task not yet started, or
-// lost, costs the task one recheck (awaitTaskOrder).
+// lost, costs the task one recheck (awaitTaskOrder). The message is only
+// a wake-up, so a failure to send it is logged and never rolls back the
+// order's ending: it always returns nil.
 func (d *Daemon) notifyTask(tx *sql.Tx, o store.TaskOrder) error {
 	live, _, err := workflowLive(d, o.Task)
-	if err != nil || !live {
-		return err
+	if err == nil && live {
+		err = dbos.Send(d.dbos, o.Task, taskOrderMsg{Order: o.Order, State: o.State}, taskOrdersTopic,
+			dbos.WithSendTransaction(tx))
 	}
-	if err := dbos.Send(d.dbos, o.Task, taskOrderMsg{Order: o.Order, State: o.State}, taskOrdersTopic,
-		dbos.WithSendTransaction(tx)); err != nil {
-		return fmt.Errorf("tell %s: %w", o.Task, err)
+	if err != nil {
+		d.logger.Warn("campaign task not woken; it rereads the order at its next recheck", "task", o.Task, "order", o.Order,
+			"state", o.State, "err", err)
 	}
 	return nil
 }
@@ -445,7 +448,8 @@ type orderCreated struct {
 // nothing and returns Belaying. A tracker error reading the
 // source retries like filing (trackerRetries) and then stalls
 // tracker_failed; an item the tracker can't find stalls tracker_failed at
-// once, and any other refusal stalls failed.
+// once, and any other refusal, or another error past the step's
+// retries, stalls failed.
 func (r *taskRun) createOrder(step string, o store.Order, direct func(context.Context, *Daemon, *store.Order) error,
 	change func(t *store.CampaignTask, id string), text func(id string) string) (orderCreated, error) {
 	t := r.t
@@ -488,7 +492,13 @@ func (r *taskRun) createOrder(step string, o store.Order, direct func(context.Co
 		if r.ctx.Err() != nil {
 			return orderCreated{}, err
 		}
-		return orderCreated{Code: stallTrackerFailed, Why: oneLine(stepError(err))}, nil
+		// Only a tracker error is tracker_failed. The recorded error is
+		// read by its text, which a replay keeps and its type doesn't.
+		why := oneLine(stepError(err))
+		if strings.Contains(why, sourceErrorMark) {
+			return orderCreated{Code: stallTrackerFailed, Why: why}, nil
+		}
+		return orderCreated{Code: stallFailed, Why: why}, nil
 	}
 	change(&t, out.ID)
 	r.t = t
@@ -969,7 +979,7 @@ func (r *taskRun) review() (taskPhase, error) {
 	if err != nil {
 		return phaseEnd, err
 	}
-	if end.State != store.OrderDone || end.Belaying {
+	if end.State != store.OrderDone {
 		// The reviewer's own findings are filed whatever became of the
 		// review.
 		if err := r.fileReviewFindings(id); err != nil {
@@ -977,7 +987,7 @@ func (r *taskRun) review() (taskPhase, error) {
 		}
 	}
 	switch {
-	case end.Belaying:
+	case end.Belaying && end.State != store.OrderDone:
 		return r.drop("campaign belayed")
 	case end.NoReviewer:
 		return r.stall(stallNoReviewer, fmt.Sprintf("no crew member of %s may review %s, so %s was withdrawn",
@@ -991,6 +1001,9 @@ func (r *taskRun) review() (taskPhase, error) {
 	}, append([]dbos.StepOption{dbos.WithStepName("read-verdict")}, storeRetries...)...)
 	if err != nil {
 		return phaseEnd, err
+	}
+	if end.Belaying {
+		return r.dropWithVerdict(id, v)
 	}
 	if !v.Valid {
 		if err := r.fileReviewFindings(id); err != nil {
@@ -1061,10 +1074,7 @@ func (r *taskRun) verdict(id string, v verdictRead) (taskPhase, error) {
 			return phaseEnd, err
 		}
 		if belaying {
-			if err := r.fileReviewFindings(id); err != nil {
-				return phaseEnd, err
-			}
-			return r.drop("campaign belayed")
+			return r.dropWithVerdict(id, v)
 		}
 		triage = t
 	}
@@ -1085,11 +1095,7 @@ func (r *taskRun) verdict(id string, v verdictRead) (taskPhase, error) {
 	for _, i := range fileAt {
 		f := v.Findings[i]
 		file = append(file, f)
-		body := f.Body
-		if loc := findingLocation(f); loc != "" {
-			body = loc + "\n\n" + body
-		}
-		rows = append(rows, store.Finding{Key: store.VerdictFindingKey(i + 1), Title: f.Title, Body: body, Severity: f.Severity})
+		rows = append(rows, verdictRow(i, f))
 	}
 	var dropped []string
 	for _, n := range triage.Drop {
@@ -1175,9 +1181,62 @@ func (r *taskRun) triage(id string, v verdictRead, mediums []int) (campaignTriag
 	}
 	t, err := parseCampaignTriage(hl.Decision, len(ms))
 	if err != nil {
-		return campaignTriage{}, false, fmt.Errorf("hail %s's decision: %w", hailID, err)
+		// Defensive: a stored decision always parses (checkCampaignAnswer).
+		if err := r.noteOnce(id, "unread-"+hailID, r.roundText(fmt.Sprintf("triage %s's decision does not parse (%s): "+
+			"every medium is filed", hailID, oneLine(err.Error())))); err != nil {
+			return campaignTriage{}, false, err
+		}
+		t, _ = parseCampaignTriage(campaignFile, len(ms))
 	}
 	return t, false, nil
+}
+
+// noteOnce logs text as a task entry on order orderID (none when ""),
+// once under mark once (store.AppendLogOnce), in step note-once.
+func (r *taskRun) noteOnce(orderID, once, text string) error {
+	e := r.onceEntry(orderID, text)
+	_, err := dbos.RunAsStep(r.ctx, func(c context.Context) (bool, error) {
+		return true, daemonFrom(c).store.AppendLogOnce(c, orderID, once, e)
+	}, append([]dbos.StepOption{dbos.WithStepName("note-once")}, storeRetries...)...)
+	return err
+}
+
+// dropWithVerdict drops the task, the campaign being belayed, after done
+// review id's verdict was read: its mediums and lows are written as
+// findings, every medium as filed (file-verdict-findings), and
+// findings/<id> is started with the reviewer's own, before the drop.
+func (r *taskRun) dropWithVerdict(id string, v verdictRead) (taskPhase, error) {
+	var rows []store.Finding
+	for i, f := range v.Findings {
+		if f.Severity == comms.SeverityHigh {
+			continue
+		}
+		rows = append(rows, verdictRow(i, f))
+	}
+	reviewer := v.Reviewer
+	entry := r.onceEntry(id, r.roundText(fmt.Sprintf("%d %s of %s's review filed as the campaign is belayed", len(rows),
+		plural(len(rows), "finding"), id)))
+	if len(rows) > 0 {
+		if _, err := dbos.RunAsStep(r.ctx, func(c context.Context) (int, error) {
+			return daemonFrom(c).store.AddVerdictFindings(c, id, reviewer, rows, entry)
+		}, append([]dbos.StepOption{dbos.WithStepName("file-verdict-findings")}, storeRetries...)...); err != nil {
+			return phaseEnd, err
+		}
+	}
+	if err := r.fileReviewFindings(id); err != nil {
+		return phaseEnd, err
+	}
+	return r.drop("campaign belayed")
+}
+
+// verdictRow is the findings row of a verdict's finding f at index i:
+// keyed verdict.<i+1>, with its path and line as its body's first line.
+func verdictRow(i int, f comms.VerdictFinding) store.Finding {
+	body := f.Body
+	if loc := findingLocation(f); loc != "" {
+		body = loc + "\n\n" + body
+	}
+	return store.Finding{Key: store.VerdictFindingKey(i + 1), Title: f.Title, Body: body, Severity: f.Severity}
 }
 
 // belaying is the check-campaign step: whether the campaign is being
@@ -1259,19 +1318,38 @@ func (r *taskRun) stall(code, reason, order string, phase taskPhase, keyKind str
 		if err != nil {
 			return phaseEnd, err
 		}
-		if hl.Status != store.HailDecided {
+		var choice campaignChoice
+		if hl.Status == store.HailDecided {
+			choice, err = parseCampaignChoice(hl.Decision, hl.Options)
+			if err != nil {
+				// Defensive: a stored decision always parses
+				// (checkCampaignAnswer).
+				if err := r.noteOnce(order, "unread-"+hailID, fmt.Sprintf("%s: stall %s's decision does not parse (%s): "+
+					"stalling again", r.in.Ref, hailID, oneLine(err.Error()))); err != nil {
+					return phaseEnd, err
+				}
+			}
+		}
+		if choice.Option == "" {
+			// Closed undecided, or unreadable: unless the campaign is
+			// being belayed, the task waits out one recheck before it
+			// stalls again, so a hail that keeps closing can't loop fast.
 			belaying, err := r.belaying()
 			if err != nil {
 				return phaseEnd, err
+			}
+			if !belaying {
+				if _, err := dbos.Sleep(r.ctx, taskRecheckOf(r.ctx)); err != nil {
+					return phaseEnd, err
+				}
+				if belaying, err = r.belaying(); err != nil {
+					return phaseEnd, err
+				}
 			}
 			if belaying {
 				return r.drop("campaign belayed")
 			}
 			continue
-		}
-		choice, err := parseCampaignChoice(hl.Decision, hl.Options)
-		if err != nil {
-			return phaseEnd, fmt.Errorf("hail %s's decision: %w", hailID, err)
 		}
 		r.note = choice.Note
 		switch choice.Option {
@@ -1283,7 +1361,11 @@ func (r *taskRun) stall(code, reason, order string, phase taskPhase, keyKind str
 		}
 		// retry
 		if code == stallMaxRounds {
-			r.t.MaxRounds++
+			raised := r.t.MaxRounds + 1
+			if err := r.setTask("task-max-rounds", func(t *store.CampaignTask) { t.MaxRounds, t.OpenHail = raised, "" }, "",
+				fmt.Sprintf("%s: max_rounds raised to %d on %s, for one more round", r.in.Ref, raised, hailID), nil); err != nil {
+				return phaseEnd, err
+			}
 			r.t.Round++
 			return phaseWork, nil
 		}

@@ -3,6 +3,7 @@ package bridge
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -617,6 +618,7 @@ func TestCampaignMaxRoundsRetry(t *testing.T) {
 	require.Equal(t, []any{stallMaxRounds, review.ID, 1, 1, "Leaks"}, []any{c.Code, c.Order, c.Round, c.MaxRounds, c.Blocking[0].Title})
 	g.answer(h.ID, "retry: one more")
 	fix := g.waitOrder("r2:fix")
+	require.Contains(t, g.texts(), g.ref+": max_rounds raised to 2 on "+h.ID+", for one more round")
 	require.Contains(t, fix.Body, "one more")
 	tk := g.waitState(store.TaskFixing)
 	require.Equal(t, []any{2, 2}, []any{tk.Round, tk.MaxRounds})
@@ -748,6 +750,17 @@ func TestCampaignRestartDuringTriage(t *testing.T) {
 	require.Equal(t, []string{oneLine("Third \u009b31mred")}, p.Dropped)
 	require.NotContains(t, p.Dropped[0], "\u009b")
 	require.Len(t, workflows(t, g.d, findingsWorkflowID(review.ID)), 1)
+
+	// The filed medium and the low reach the tracker through
+	// findings/<review> (plan Verification 7).
+	endFindings(t, g.d, review.ID, reviewKeep)
+	items, err := g.fake.List(t.Context(), tracker.Query{})
+	require.NoError(t, err)
+	var titles []string
+	for _, it := range items {
+		titles = append(titles, it.Title)
+	}
+	require.ElementsMatch(t, []string{"Fix the flake", "First", "Low"}, titles)
 }
 
 // The task hook wakes the task: with rechecks an hour apart, an order's
@@ -760,4 +773,104 @@ func TestCampaignTaskHookWakes(t *testing.T) {
 	work := g.waitOrder("r1:work")
 	g.work(work.ID, "sorell", g.base)
 	g.waitOrder("r1:review")
+}
+
+// belayCampaign sets the campaign belaying, as campaign belay will before
+// it closes an open hail.
+func (g *campaignRig) belayCampaign() {
+	g.t.Helper()
+	_, err := campaignDB(g.t, g.home).ExecContext(g.t.Context(), `UPDATE campaigns SET state = 'belaying'`)
+	require.NoError(g.t, err)
+}
+
+// closeHail closes open hail id unanswered and wakes its raiser.
+func (g *campaignRig) closeHail(id string) {
+	g.t.Helper()
+	closed, err := g.d.store.TimeOutOpenHailThen(g.t.Context(), id, store.LogEntry{Kind: logHail, Text: "closed"},
+		func(tx *sql.Tx) error { return g.d.notifyHailClosed(tx, id) })
+	require.NoError(g.t, err)
+	require.True(g.t, closed)
+}
+
+// forceDecision stores decision on open hail id as decided, bypassing
+// the answer checks, and wakes its raiser.
+func (g *campaignRig) forceDecision(id, decision string) {
+	g.t.Helper()
+	_, err := campaignDB(g.t, g.home).ExecContext(g.t.Context(),
+		`UPDATE hails SET status = 'decided', decision = ?, decided_by = 'captain', decided_at = ? WHERE id = ?`,
+		decision, time.Now().UTC(), id)
+	require.NoError(g.t, err)
+	require.NoError(g.t, dbos.Send(g.d.dbos, g.task, id, hailClosedTopic))
+}
+
+// A campaign belayed as a done review ends, or while its triage is open,
+// still writes the verdict's mediums (as filed) and lows as findings and
+// starts the review's findings workflow before the task drops.
+func TestCampaignBelayedReviewFilesVerdict(t *testing.T) {
+	t.Parallel()
+	v := verdictOf(comms.VerdictFinding{Severity: comms.SeverityHigh, Title: "High"},
+		comms.VerdictFinding{Severity: comms.SeverityMedium, Title: "Medium"},
+		comms.VerdictFinding{Severity: comms.SeverityLow, Title: "Low"})
+	for _, inTriage := range []bool{false, true} {
+		t.Run(fmt.Sprintf("in triage %v", inTriage), func(t *testing.T) {
+			t.Parallel()
+			g := newCampaignRig(t, campaignOpts{})
+			c1 := g.work(g.waitOrder("r1:work").ID, "sorell", g.base)
+			review := g.waitOrder("r1:review")
+			if inTriage {
+				g.reviewDone(review.ID, "tuvok", c1, v)
+				h := g.waitHail(regs.CategoryCampaignTriage)
+				g.belayCampaign()
+				g.closeHail(h.ID)
+			} else {
+				g.belayCampaign()
+				g.reviewDone(review.ID, "tuvok", c1, v)
+			}
+			require.Equal(t, TaskResult{State: store.TaskDropped, Why: "campaign belayed"}, g.result())
+			fs, err := g.d.store.OrderFindings(t.Context(), review.ID)
+			require.NoError(t, err)
+			var keys []string
+			for _, f := range fs {
+				keys = append(keys, f.Key+" "+f.Title)
+			}
+			require.Equal(t, []string{"verdict.2 Medium", "verdict.3 Low"}, keys)
+			require.Len(t, workflows(t, g.d, findingsWorkflowID(review.ID)), 1)
+			require.Contains(t, g.texts(), g.ref+" round 1: 2 findings of "+review.ID+"'s review filed as the campaign is belayed")
+		})
+	}
+}
+
+// A stall hail closed unanswered with the campaign running stalls again
+// after one recheck; a decision that doesn't parse (never stored by the
+// answer checks) is logged and stalls again, and an unparseable triage
+// decision files every medium.
+func TestCampaignUnreadableDecisions(t *testing.T) {
+	t.Parallel()
+	g := newCampaignRig(t, campaignOpts{})
+	work := g.waitOrder("r1:work")
+	g.claim(work.ID, "sorell")
+	g.fail(work.ID, "crew_error")
+	h1, _ := g.stallHail()
+	g.closeHail(h1.ID)
+	h2, _ := g.stallHail()
+	require.Equal(t, "stall-2", h2.RaiseKey)
+	g.forceDecision(h2.ID, "bogus")
+	h3, _ := g.stallHail()
+	require.Equal(t, "stall-3", h3.RaiseKey)
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		var hit bool
+		for _, x := range g.texts() {
+			hit = hit || strings.HasPrefix(x, g.ref+": stall "+h2.ID+"'s decision does not parse")
+		}
+		require.True(c, hit)
+	}, 10*time.Second, 20*time.Millisecond)
+	g.answer(h3.ID, "retry")
+
+	c1 := g.work(g.waitOrder("r1:work:a2").ID, "sorell", g.base)
+	review := g.waitOrder("r1:review")
+	g.reviewDone(review.ID, "tuvok", c1, verdictOf(comms.VerdictFinding{Severity: comms.SeverityMedium, Title: "Medium"}))
+	tr := g.waitHail(regs.CategoryCampaignTriage)
+	g.forceDecision(tr.ID, `{"fix": [9]}`)
+	require.Equal(t, store.TaskLanding, g.result().State, "the medium filed, nothing blocks")
+	require.Contains(t, g.texts(), g.ref+" round 1: review "+review.ID+" passed; filed 1, dropped 0")
 }

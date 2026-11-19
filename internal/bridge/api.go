@@ -128,6 +128,10 @@ func (d *Daemon) AddCrew(ctx context.Context, c store.Crew) error {
 // wait timeout (missionCheckEvery).
 func (d *Daemon) CreateOrder(ctx context.Context, o store.Order) (string, error) {
 	id, _, err := d.createOrderAs(ctx, o, false)
+	var se *sourceError
+	if errors.As(err, &se) {
+		err = se.err
+	}
 	return id, err
 }
 
@@ -137,7 +141,12 @@ func (d *Daemon) CreateOrder(ctx context.Context, o store.Order) (string, error)
 // retry.
 type sourceError struct{ err error }
 
-func (e *sourceError) Error() string { return e.err.Error() }
+func (e *sourceError) Error() string { return sourceErrorMark + e.err.Error() }
+
+// sourceErrorMark starts a sourceError's text, by which a campaign's
+// order step tells a recorded tracker error from any other (#184).
+const sourceErrorMark = "tracker source: "
+
 func (e *sourceError) Unwrap() error { return e.err }
 
 // createOrderAs is CreateOrder. With once, the order is inserted keyed on
