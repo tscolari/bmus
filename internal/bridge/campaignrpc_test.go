@@ -150,6 +150,20 @@ func TestCampaignRunShowList(t *testing.T) {
 	require.Contains(t, g.texts(), "campaign C-0002 started: "+other+" on app from main: work in eng, reviews in science, "+
 		"1 round, landing by push to feature/second")
 
+	// A third on the second's branch is refused in the insert, and
+	// creates nothing.
+	third := g.fake.Add(tracker.Item{Title: "Third"})
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		tk, err := g.d.store.GetTask(t.Context(), "C-0002", other)
+		require.NoError(c, err)
+		require.NotEmpty(c, tk.OpenOrder)
+	}, 30*time.Second, 20*time.Millisecond)
+	before := g.counts()
+	re := requireRPCError(t, call(t, g.home, "campaign.run", CampaignRunArgs{Issue: third, Repo: "app", Division: "eng",
+		Branch: "feature/second"}, nil), CodeBadRequest)
+	require.Equal(t, "branch feature/second on repo app is campaign C-0002's, whose task "+other+" is open", re.Message)
+	require.Equal(t, before, g.counts())
+
 	var list CampaignListResult
 	require.NoError(t, call(t, g.home, "campaign.list", nil, &list))
 	require.Len(t, list.Campaigns, 2)

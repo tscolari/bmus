@@ -823,8 +823,10 @@ func TestCampaignWrites(t *testing.T) {
 
 // InsertCampaign (#186) inserts the campaign and its task under the next
 // id, with one entry, and refuses an id that isn't the next and a ref in
-// another open task, writing nothing. A ref whose task was dropped may
-// start again. BelayCampaign sets a running campaign belaying once and
+// another open task or a branch another open task on the same repo
+// holds, writing nothing. A ref and branch whose task was dropped may
+// start again, and the branch on another repo is another branch.
+// BelayCampaign sets a running campaign belaying once and
 // refuses an ended one.
 func TestInsertAndBelayCampaign(t *testing.T) {
 	t.Parallel()
@@ -857,6 +859,14 @@ func TestInsertAndBelayCampaign(t *testing.T) {
 	var ote *OpenTaskError
 	require.ErrorAs(t, s.InsertCampaign(ctx, c, task, LogEntry{Text: "again"}), &ote)
 	require.Equal(t, "o/r#12 is already in campaign C-0001's open task", ote.Error())
+	c.ID = "C-0002"
+	var bte *BranchTakenError
+	require.ErrorAs(t, s.InsertCampaign(ctx, c, CampaignTask{Ref: "o/r#13", MaxRounds: 2, Branch: task.Branch}, LogEntry{Text: "x"}),
+		&bte)
+	require.Equal(t, "branch campaign/C-0001/o-r-12 on repo app is campaign C-0001's, whose task o/r#12 is open", bte.Error())
+	other := c
+	other.Repo = "lib"
+	other.ID = "C-0005"
 	c.ID = "C-0005"
 	require.ErrorIs(t, s.InsertCampaign(ctx, c, CampaignTask{Ref: "o/r#13", MaxRounds: 2, Branch: "b"}, LogEntry{Text: "x"}),
 		ErrCampaignID)
@@ -886,10 +896,14 @@ func TestInsertAndBelayCampaign(t *testing.T) {
 	_, err = s.BelayCampaign(ctx, "C-0009", LogEntry{Text: "none"})
 	require.ErrorIs(t, err, sql.ErrNoRows)
 
-	// The dropped task's ref may start again, under the next id.
+	// The dropped task's ref and branch may start again, under the next
+	// id; the same branch on another repo is another branch.
 	c.ID = "C-0002"
 	require.NoError(t, s.InsertCampaign(ctx, c, task, LogEntry{Text: "campaign C-0002 started"}))
+	other.ID = "C-0003"
+	require.NoError(t, s.InsertCampaign(ctx, other, CampaignTask{Ref: "o/r#13", MaxRounds: 2, Branch: task.Branch},
+		LogEntry{Text: "campaign C-0003 started"}))
 	all, err = s.ListCampaigns(ctx)
 	require.NoError(t, err)
-	require.Equal(t, []string{"C-0001", "C-0002"}, []string{all[0].ID, all[1].ID})
+	require.Equal(t, []string{"C-0001", "C-0002", "C-0003"}, []string{all[0].ID, all[1].ID, all[2].ID})
 }

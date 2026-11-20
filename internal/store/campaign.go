@@ -441,6 +441,16 @@ func (e *OpenTaskError) Error() string {
 	return fmt.Sprintf("%s is already in campaign %s's open task", e.Ref, e.Campaign)
 }
 
+// BranchTakenError is InsertCampaign's refusal of a land branch that an
+// open task of another campaign on the same repo already holds.
+type BranchTakenError struct {
+	Branch, Repo, Campaign, Ref string
+}
+
+func (e *BranchTakenError) Error() string {
+	return fmt.Sprintf("branch %s on repo %s is campaign %s's, whose task %s is open", e.Branch, e.Repo, e.Campaign, e.Ref)
+}
+
 // ErrCampaignID is InsertCampaign's refusal of a campaign whose id isn't
 // the next one (NextCampaignID): another campaign took it meanwhile.
 var ErrCampaignID = errors.New("campaign id taken")
@@ -484,7 +494,9 @@ func openTaskOf(ctx context.Context, db interface {
 // must be the next campaign id (NextCampaignID), else ErrCampaignID. t
 // takes c's id, the task workflow's id (TaskWorkflowID), state working
 // and round 1; its Ref, MaxRounds and Branch are the caller's. A ref
-// already in an open task is an *OpenTaskError. The entry's payload
+// already in an open task is an *OpenTaskError, and a branch an open task
+// of another campaign on the same repo holds a *BranchTakenError (#186):
+// both tasks would land on it. The entry's payload
 // gains campaign and ref.
 func (s *Store) InsertCampaign(ctx context.Context, c Campaign, t CampaignTask, entry LogEntry) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
@@ -501,6 +513,16 @@ func (s *Store) InsertCampaign(ctx context.Context, c Campaign, t CampaignTask, 
 		}
 		if other != "" {
 			return &OpenTaskError{Ref: t.Ref, Campaign: other}
+		}
+		var held, heldRef string
+		err = tx.QueryRowContext(ctx, `SELECT t.campaign_id, t.ref FROM campaign_tasks t JOIN campaigns c ON c.id = t.campaign_id
+			WHERE c.repo = ? AND t.branch = ? AND t.state NOT IN (?, ?) LIMIT 1`, c.Repo, t.Branch, TaskLanded, TaskDropped).
+			Scan(&held, &heldRef)
+		switch {
+		case err == nil:
+			return &BranchTakenError{Branch: t.Branch, Repo: c.Repo, Campaign: held, Ref: heldRef}
+		case !errors.Is(err, sql.ErrNoRows):
+			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO campaigns (id, state, land, repo, base_ref, division, assignee,
 			review_division, max_rounds, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,

@@ -173,7 +173,9 @@ func rpcCampaignBelay(ctx context.Context, d *Daemon, raw json.RawMessage) (any,
 // division the roster lacks or with no crew member who isn't dismissed;
 // max_rounds outside 1 to 10; land pr or merge, or any other mode; a
 // branch git refuses (checkBranchName, or campaignBranch for the
-// default); a branch that already exists on the repo's remote. Then the
+// default); a branch that already exists on the repo's remote, or that
+// another campaign's open task on the repo lands on (checked in the
+// insert's transaction). Then the
 // campaign and its task are inserted in one transaction
 // (store.InsertCampaign) and campaign/<id> starts. A start that fails
 // leaves the campaign running, and the bridge's next startup starts it
@@ -323,9 +325,12 @@ func (d *Daemon) runCampaign(ctx context.Context, a CampaignRunArgs) (CampaignVi
 		return CampaignView{}, err
 	}
 	err = d.store.InsertCampaign(ctx, c, t, entry)
-	var ote *store.OpenTaskError
+	var (
+		ote *store.OpenTaskError
+		bte *store.BranchTakenError
+	)
 	switch {
-	case errors.As(err, &ote):
+	case errors.As(err, &ote), errors.As(err, &bte):
 		return CampaignView{}, badRequest("%v", err)
 	case err != nil:
 		return CampaignView{}, fmt.Errorf("insert campaign %s: %w", id, err)
