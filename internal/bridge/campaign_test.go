@@ -51,6 +51,11 @@ type campaignOpts struct {
 	// reviewers are the science crew members, tuvok by default.
 	reviewers []string
 	regs      *regs.Config
+	// noCampaign leaves the campaign and its task out: the test starts
+	// one with campaign.run (#186).
+	noCampaign bool
+	// stepHook is the bridge's taskStepHook.
+	stepHook func(d *Daemon, step string)
 }
 
 const testCampaign = "C-0001"
@@ -84,13 +89,15 @@ func newCampaignRig(t *testing.T, o campaignOpts) *campaignRig {
 		require.NoError(t, st.InsertCrew(ctx, c, testEntry))
 	}
 	require.NoError(t, st.Close())
-	db := campaignDB(t, g.home)
-	_, err = db.ExecContext(ctx, `INSERT INTO campaigns (id, repo, base_ref, division, assignee, review_division, max_rounds, created_at)
-		VALUES (?, 'app', 'main', 'eng', 'sorell', 'science', ?, ?)`, testCampaign, o.maxRounds, time.Now().UTC())
-	require.NoError(t, err)
-	_, err = db.ExecContext(ctx, `INSERT INTO campaign_tasks (campaign_id, ref, workflow_id, max_rounds, branch) VALUES (?, ?, ?, ?, ?)`,
-		testCampaign, g.ref, g.task, o.maxRounds, "campaign/C-0001/1")
-	require.NoError(t, err)
+	if !o.noCampaign {
+		db := campaignDB(t, g.home)
+		_, err = db.ExecContext(ctx, `INSERT INTO campaigns (id, repo, base_ref, division, assignee, review_division, max_rounds,
+			created_at) VALUES (?, 'app', 'main', 'eng', 'sorell', 'science', ?, ?)`, testCampaign, o.maxRounds, time.Now().UTC())
+		require.NoError(t, err)
+		_, err = db.ExecContext(ctx, `INSERT INTO campaign_tasks (campaign_id, ref, workflow_id, max_rounds, branch)
+			VALUES (?, ?, ?, ?, ?)`, testCampaign, g.ref, g.task, o.maxRounds, "campaign/C-0001/1")
+		require.NoError(t, err)
+	}
 
 	g.cfg = testConfig(g.home)
 	g.cfg.Transporter = &fakeProvider{blockProvision: true}
@@ -100,6 +107,7 @@ func newCampaignRig(t *testing.T, o campaignOpts) *campaignRig {
 	g.cfg.StandingOrders = true
 	g.cfg.taskRecheck = 300 * time.Millisecond
 	g.cfg.landBackoff = 10 * time.Millisecond
+	g.cfg.taskStepHook = o.stepHook
 	g.cfg.trackerRetries = []dbos.StepOption{dbos.WithStepMaxRetries(2), dbos.WithStepBaseInterval(10 * time.Millisecond),
 		dbos.WithStepMaxInterval(50 * time.Millisecond)}
 	if o.regs != nil {
@@ -851,6 +859,30 @@ func (g *campaignRig) belayCampaign() {
 	require.NoError(g.t, err)
 }
 
+// waitStepAfter waits until the task workflow has recorded a step named
+// next after its last step named first.
+func (g *campaignRig) waitStepAfter(first, next string) {
+	g.t.Helper()
+	require.Eventually(g.t, func() bool {
+		steps, err := dbos.GetWorkflowSteps(g.d.dbos, g.task)
+		if err != nil {
+			return false
+		}
+		last := -1
+		for i, s := range steps {
+			if s.StepName == first {
+				last = i
+			}
+		}
+		for _, s := range steps[last+1:] {
+			if last >= 0 && s.StepName == next {
+				return true
+			}
+		}
+		return false
+	}, 30*time.Second, 20*time.Millisecond)
+}
+
 // closeHail closes open hail id unanswered and wakes its raiser.
 func (g *campaignRig) closeHail(id string) {
 	g.t.Helper()
@@ -888,9 +920,14 @@ func TestCampaignBelayedReviewFilesVerdict(t *testing.T) {
 			if inTriage {
 				g.reviewDone(review.ID, "tuvok", c1, v)
 				h := g.waitHail(regs.CategoryCampaignTriage)
+				g.waitStepAfter("task-triage", "check-campaign")
 				g.belayCampaign()
 				g.closeHail(h.ID)
 			} else {
+				// Belay only once the task checked the campaign after
+				// creating the review, or the task drops at that check and
+				// withdraws the review before it can report.
+				g.waitStepAfter("create-review", "check-campaign")
 				g.belayCampaign()
 				g.reviewDone(review.ID, "tuvok", c1, v)
 			}

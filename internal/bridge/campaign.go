@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"slices"
 	"strconv"
@@ -453,7 +454,9 @@ type orderCreated struct {
 // nothing new, then writes the task's row with change applied and logs
 // text on the order (SetTask). direct, if set, picks the order's
 // assignee and division inside the step. A campaign being belayed creates
-// nothing and returns Belaying. A tracker error reading the
+// nothing and returns Belaying, and so does one found being belayed in
+// the check-campaign step after the insert (#186), with the order as
+// the task's open order for the caller's drop to end. A tracker error reading the
 // source retries like filing (trackerRetries) and then stalls
 // tracker_failed; an item the tracker can't find stalls tracker_failed at
 // once, and any other refusal, or another error past the step's
@@ -510,7 +513,44 @@ func (r *taskRun) createOrder(step string, o store.Order, direct func(context.Co
 	}
 	change(&t, out.ID)
 	r.t = t
+	if out.ID != "" {
+		// A belay that committed between the step's read of the campaign
+		// and its insert swept before the order existed: the task ends it
+		// itself, through the caller's drop.
+		r.stepHook(step)
+		belaying, err := r.belaying()
+		if err != nil {
+			return orderCreated{}, err
+		}
+		out.Belaying = belaying
+	}
 	return out, nil
+}
+
+// stepHook calls the daemon's taskStepHook, a test's, after step.
+func (r *taskRun) stepHook(step string) {
+	if d := daemonFrom(r.ctx); d.taskStepHook != nil {
+		d.taskStepHook(d, step)
+	}
+}
+
+// closeIfBelayed is the check after step recorded hail hailID as the
+// task's open hail (#186): when the campaign is being belayed, a belay
+// committed while the task raised the hail, and its sweep may have
+// missed it. close-belayed-hail then closes the hail timed out, as the
+// belay would have (closeBelayedHail), and the task's wait reads it as
+// closed undecided and drops the task. Belay commits belaying before it
+// sweeps, so either the sweep sees the hail or this check sees belaying.
+func (r *taskRun) closeIfBelayed(step, hailID string) error {
+	r.stepHook(step)
+	belaying, err := r.belaying()
+	if err != nil || !belaying {
+		return err
+	}
+	_, err = dbos.RunAsStep(r.ctx, func(c context.Context) (bool, error) {
+		return daemonFrom(c).closeBelayedHail(c, r.c.ID, hailID, "")
+	}, append([]dbos.StepOption{dbos.WithStepName("close-belayed-hail")}, storeRetries...)...)
+	return err
 }
 
 // orderEnd is how an order the task waited on ended: its state, and the
@@ -1175,6 +1215,9 @@ func (r *taskRun) triage(id string, v verdictRead, mediums []int) (campaignTriag
 	}, id, r.roundText(fmt.Sprintf("review %s waits on triage %s", id, hailID)), nil); err != nil {
 		return campaignTriage{}, false, err
 	}
+	if err := r.closeIfBelayed("task-triage", hailID); err != nil {
+		return campaignTriage{}, false, err
+	}
 	hl, err := awaitCampaignDecision(r.ctx, hailID)
 	if err != nil {
 		return campaignTriage{}, false, err
@@ -1323,6 +1366,9 @@ func (r *taskRun) stall(code, reason, order string, phase taskPhase, keyKind str
 			return phaseEnd, err
 		}
 		if err := r.setTask("task-stall-hail", func(t *store.CampaignTask) { t.OpenHail = hailID }, "", "", nil); err != nil {
+			return phaseEnd, err
+		}
+		if err := r.closeIfBelayed("task-stall-hail", hailID); err != nil {
 			return phaseEnd, err
 		}
 		hl, err := awaitCampaignDecision(r.ctx, hailID)
@@ -1610,6 +1656,9 @@ func (r *taskRun) askLand() (landResult, bool, error) {
 			oneLine(r.t.Branch), hailID)), nil); err != nil {
 			return landResult{}, false, err
 		}
+		if err := r.closeIfBelayed("task-land-hail", hailID); err != nil {
+			return landResult{}, false, err
+		}
 		hl, err := awaitCampaignDecision(r.ctx, hailID)
 		if err != nil {
 			return landResult{}, false, err
@@ -1790,7 +1839,9 @@ func (d *Daemon) landRepoCheck(ctx context.Context, repo, head string) (string, 
 // not url.*.pushInsteadOf: with a pushInsteadOf for the URL it reads
 // where the bridge fetches, which may differ from where PushOrder
 // pushes. Then a replay can push again, and a non-forced push of the
-// same commit changes nothing.
+// same commit changes nothing. Before the bridge has made its clone (no
+// order has shipped the repo yet, as at campaign.run, #186) it runs in
+// the bridge's home, which holds no repository.
 func (d *Daemon) remoteBranch(ctx context.Context, repo, branch string) (string, error) {
 	url, ok := d.repos[repo]
 	if !ok {
@@ -1799,7 +1850,11 @@ func (d *Daemon) remoteBranch(ctx context.Context, repo, branch string) (string,
 	ctx, cancel := context.WithTimeout(ctx, gitFetchTimeout)
 	defer cancel()
 	ref := "refs/heads/" + branch
-	out, err := runGit(ctx, d.repoDir(repo), "ls-remote", "--end-of-options", url, ref)
+	dir := d.repoDir(repo)
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		dir = d.home
+	}
+	out, err := runGit(ctx, dir, "ls-remote", "--end-of-options", url, ref)
 	if err != nil {
 		return "", err
 	}
@@ -1858,18 +1913,36 @@ func (r *taskRun) fileOpenReview(id string) error {
 // that ended meanwhile, or a refusal (too late), is left alone. It
 // reports whether it asked for an end.
 func (d *Daemon) endTaskOrder(ctx context.Context, id, reason string) (bool, error) {
+	how, err := d.endTaskOrderHow(ctx, id, reason)
+	return how != "", err
+}
+
+// What endTaskOrderHow asked of an order.
+const (
+	taskOrderWithdrawn = "withdrawn"
+	taskOrderBelay     = "belay requested"
+)
+
+// endTaskOrderHow is endTaskOrder, which also says what it asked:
+// taskOrderWithdrawn, taskOrderBelay, or "" when it left the order alone.
+func (d *Daemon) endTaskOrderHow(ctx context.Context, id, reason string) (string, error) {
 	o, err := d.store.GetOrder(ctx, id)
 	if err != nil || store.OrderEnded(o.State) {
-		return false, err
+		return "", err
 	}
+	how := taskOrderBelay
 	if (o.State == store.OrderPool || o.State == store.OrderDirected) && o.ParkedAt == nil {
+		how = taskOrderWithdrawn
 		_, err = d.withdrawOrder(ctx, id, reason)
 	} else {
 		_, err = d.belayOrder(ctx, id, reason)
 	}
 	var re *rpcError
 	if errors.As(err, &re) {
-		return false, nil
+		return "", nil
 	}
-	return err == nil, err
+	if err != nil {
+		return "", err
+	}
+	return how, nil
 }

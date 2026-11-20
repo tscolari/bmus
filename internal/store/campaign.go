@@ -430,3 +430,169 @@ func (s *Store) TaskOrderIDs(ctx context.Context, task, kind string) ([]string, 
 	}
 	return ids, rows.Err()
 }
+
+// OpenTaskError is InsertCampaign's refusal of a tracker item already in
+// an open task (campaign_tasks_open): Campaign holds it.
+type OpenTaskError struct {
+	Ref, Campaign string
+}
+
+func (e *OpenTaskError) Error() string {
+	return fmt.Sprintf("%s is already in campaign %s's open task", e.Ref, e.Campaign)
+}
+
+// BranchTakenError is InsertCampaign's refusal of a land branch that an
+// open task of another campaign on the same repo already holds.
+type BranchTakenError struct {
+	Branch, Repo, Campaign, Ref string
+}
+
+func (e *BranchTakenError) Error() string {
+	return fmt.Sprintf("branch %s on repo %s is campaign %s's, whose task %s is open", e.Branch, e.Repo, e.Campaign, e.Ref)
+}
+
+// ErrCampaignID is InsertCampaign's refusal of a campaign whose id isn't
+// the next one (NextCampaignID): another campaign took it meanwhile.
+var ErrCampaignID = errors.New("campaign id taken")
+
+// ErrCampaignEnded is BelayCampaign's refusal of a campaign that ended.
+var ErrCampaignEnded = errors.New("campaign ended")
+
+// campaignIDFormat is a campaign's id: C-0001.
+const campaignIDFormat = "C-%04d"
+
+// NextCampaignID is the id the next campaign inserted takes (#186):
+// C-0001 for the first. Campaigns are never deleted, so the ids count up.
+func (s *Store) NextCampaignID(ctx context.Context) (string, error) {
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM campaigns`).Scan(&n); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(campaignIDFormat, n+1), nil
+}
+
+// OpenTaskOf returns the campaign whose task for tracker item ref hasn't
+// landed or been dropped, "" when none has.
+func (s *Store) OpenTaskOf(ctx context.Context, ref string) (string, error) {
+	return openTaskOf(ctx, s.db, ref)
+}
+
+func openTaskOf(ctx context.Context, db interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ref string) (string, error) {
+	var id string
+	err := db.QueryRowContext(ctx, `SELECT campaign_id FROM campaign_tasks WHERE ref = ? AND state NOT IN (?, ?)`,
+		ref, TaskLanded, TaskDropped).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
+}
+
+// InsertCampaign inserts campaign c, running, with its one task t, and
+// appends entry with kind LogKindCampaign, in one transaction (#186). c.ID
+// must be the next campaign id (NextCampaignID), else ErrCampaignID. t
+// takes c's id, the task workflow's id (TaskWorkflowID), state working
+// and round 1; its Ref, MaxRounds and Branch are the caller's. A ref
+// already in an open task is an *OpenTaskError, and a branch an open task
+// of another campaign on the same repo holds a *BranchTakenError (#186):
+// both tasks would land on it. The entry's payload
+// gains campaign and ref.
+func (s *Store) InsertCampaign(ctx context.Context, c Campaign, t CampaignTask, entry LogEntry) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		next, err := nextID(ctx, tx, "campaigns", campaignIDFormat)
+		if err != nil {
+			return err
+		}
+		if c.ID != next {
+			return fmt.Errorf("%s (the next is %s): %w", c.ID, next, ErrCampaignID)
+		}
+		other, err := openTaskOf(ctx, tx, t.Ref)
+		if err != nil {
+			return err
+		}
+		if other != "" {
+			return &OpenTaskError{Ref: t.Ref, Campaign: other}
+		}
+		var held, heldRef string
+		err = tx.QueryRowContext(ctx, `SELECT t.campaign_id, t.ref FROM campaign_tasks t JOIN campaigns c ON c.id = t.campaign_id
+			WHERE c.repo = ? AND t.branch = ? AND t.state NOT IN (?, ?) LIMIT 1`, c.Repo, t.Branch, TaskLanded, TaskDropped).
+			Scan(&held, &heldRef)
+		switch {
+		case err == nil:
+			return &BranchTakenError{Branch: t.Branch, Repo: c.Repo, Campaign: held, Ref: heldRef}
+		case !errors.Is(err, sql.ErrNoRows):
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO campaigns (id, state, land, repo, base_ref, division, assignee,
+			review_division, max_rounds, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			c.ID, CampaignRunning, c.Land, c.Repo, c.BaseRef, c.Division, c.Assignee, c.ReviewDivision, c.MaxRounds,
+			time.Now().UTC()); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO campaign_tasks (campaign_id, ref, workflow_id, state, round, max_rounds,
+			branch) VALUES (?, ?, ?, ?, 1, ?, ?)`,
+			c.ID, t.Ref, TaskWorkflowID(c.ID, t.Ref), TaskWorking, t.MaxRounds, t.Branch); err != nil {
+			return err
+		}
+		entry.Kind = LogKindCampaign
+		for _, f := range [][2]string{{"campaign", c.ID}, {"ref", t.Ref}} {
+			if entry.Payload, err = withField(entry.Payload, f[0], f[1]); err != nil {
+				return err
+			}
+		}
+		_, err = s.appendLog(ctx, tx, entry)
+		return err
+	})
+}
+
+// ListCampaigns returns every campaign, by id.
+func (s *Store) ListCampaigns(ctx context.Context) ([]Campaign, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+campaignCols+` FROM campaigns ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Campaign
+	for rows.Next() {
+		c, err := scanCampaign(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// BelayCampaign sets running campaign id belaying and appends entry with
+// kind LogKindCampaign and the campaign in its payload, in one
+// transaction (#186). A campaign already belaying is left alone and
+// nothing is logged; one that ended is ErrCampaignEnded, and a missing
+// one sql.ErrNoRows. It reports whether it wrote.
+func (s *Store) BelayCampaign(ctx context.Context, id string, entry LogEntry) (bool, error) {
+	wrote := false
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		var state string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM campaigns WHERE id = ?`, id).Scan(&state); err != nil {
+			return err
+		}
+		switch state {
+		case CampaignEnded:
+			return fmt.Errorf("campaign %s has ended: %w", id, ErrCampaignEnded)
+		case CampaignBelaying:
+			return nil
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE campaigns SET state = ? WHERE id = ?`, CampaignBelaying, id); err != nil {
+			return err
+		}
+		wrote = true
+		entry.Kind = LogKindCampaign
+		var err error
+		if entry.Payload, err = withField(entry.Payload, "campaign", id); err != nil {
+			return err
+		}
+		_, err = s.appendLog(ctx, tx, entry)
+		return err
+	})
+	return wrote, err
+}

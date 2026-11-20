@@ -282,4 +282,18 @@ Crew ask the bridge to comment on or close an issue with the `tracker_comment` a
 
 Crew also file findings as they work: something outside the order's scope that deserves its own issue. When the order's mission ends, Command triages them against the open backlog, and the bridge files the rest as issues labelled `bmus:unreviewed`. Then one `tracker_review` hail per order asks you to review them; it waits for you with no reminders or timeout. `bmus hails review <id>` lists the issues filed and the findings dropped or failed. Answer with `--keep`, `--discard <ref>` (repeatable; the rest are kept) and `--restore <key>` to file a dropped or failed finding. A blank `--discard` is refused; discard everything with `bmus hails answer <id> --option 1`. A kept issue loses `bmus:unreviewed`, a discarded one is closed as not planned, and a restored finding is filed without the label. `bmus hails answer <id> --option 0` keeps everything and `--option 1` discards everything.
 
+## Campaigns
+
+A campaign takes one issue from the tracker to a pushed branch. A crew member implements it, another who never worked on it reviews the result, and blocking findings start a fix round on the latest work. Once a review passes, a `campaign_land` hail asks you before the bridge pushes.
+
+```sh
+./bmus campaign run --issue '#12' --repo app --assignee sorell   # or --division eng for the pool
+# campaign C-0001 running #12 on app from main: work for sorell, reviews in science, up to 3 rounds, landing by push to campaign/C-0001/-12
+./bmus campaign list
+./bmus campaign show C-0001        # the task's state, round, head and open hail, and one row per order
+./bmus campaign belay C-0001 --reason "not now"
+```
+
+`run` needs a tracker. `--base` is where the work starts (default `main`), `--review-division` where reviews go (default `science`), `--max-rounds` the most rounds from 1 to 10 (default 3), and `--branch` the branch it lands on (default `campaign/<id>/<ref slug>`). Only `--land push` exists so far. The bridge refuses a closed issue, one already in an open campaign, a review division with no crew, and a branch that already exists on the remote, and then creates nothing. A stall (a failed order, a review with no verdict, no reviewer, the last round still blocked) raises a `campaign_stalled` hail: answer `retry`, `land` or `drop`, optionally with a note, `retry: the flaky test is real`. `belay` closes the task's open hail and belays or withdraws its open order; the task drops without a stall hail and the campaign ends. The task drops at its next wake, which can be up to 15 minutes later when it is sleeping between two hails that closed unanswered, so `campaign list` shows the campaign `belaying` until then.
+
 Run `bmus <command> --help` for each command's flags. The list commands take `--json`. `bmus` exits 3 when the bridge isn't running and 1 on any other error.

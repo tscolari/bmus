@@ -418,6 +418,11 @@ var rpcHandlers = map[string]rpcHandler{
 	"command.guidance.set": rpcCommandGuidanceSet,
 
 	"bridge.jettison": rpcBridgeJettison,
+
+	"campaign.run":   rpcCampaignRun,
+	"campaign.list":  rpcCampaignList,
+	"campaign.show":  rpcCampaignShow,
+	"campaign.belay": rpcCampaignBelay,
 }
 
 // rpcHandlerTimeouts are the handlers that may take longer than
@@ -425,6 +430,8 @@ var rpcHandlers = map[string]rpcHandler{
 var rpcHandlerTimeouts = map[string]time.Duration{
 	"order.push":      gitPushTimeout,
 	"bridge.jettison": jettisonTimeout,
+	// campaign.run reads the issue and the remote's branch (#186).
+	"campaign.run": gitPushTimeout,
 }
 
 // handlerTimeout bounds command cmd's handler.
