@@ -1218,7 +1218,7 @@ export function FindingList(props: { findings: readonly CampaignFinding[]; label
 function CampaignChoices(props: {
   hail: HailView;
   cardId: string;
-  labels: { land: string; retry: string };
+  labels: { land: string; retry: string; note: string };
   /** Whether land is the card's main action: on a land hail, not on a stall. */
   landFirst: boolean;
   dropPrompt: string;
@@ -1241,7 +1241,7 @@ function CampaignChoices(props: {
             id={noteId}
             class="field"
             type="text"
-            placeholder="Optional: what the next round should know"
+            placeholder={props.labels.note}
             value={note}
             disabled={a.busy}
             onInput={(e) => setNote(e.currentTarget.value)}
@@ -1350,7 +1350,7 @@ export function LandCard(props: { hail: HailView; repoUrls: Readonly<Record<stri
       <CampaignChoices
         hail={h}
         cardId={cardId}
-        labels={{ land: "Land", retry: "Another round" }}
+        labels={{ land: "Land", retry: "Another round", note: "Optional: sent only with Another round" }}
         landFirst
         dropPrompt={dropPrompt(c)}
         answer={a}
@@ -1400,7 +1400,7 @@ export function StalledCard(props: { hail: HailView; repoUrls: Readonly<Record<s
       <CampaignChoices
         hail={h}
         cardId={cardId}
-        labels={{ land: "Land as it is", retry: "Retry" }}
+        labels={{ land: "Land as it is", retry: "Retry", note: "Optional: what the next round should know" }}
         landFirst={false}
         dropPrompt={dropPrompt(c)}
         answer={a}

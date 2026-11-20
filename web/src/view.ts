@@ -857,11 +857,13 @@ export function commitsText(n: number): string {
 
 /**
  * A land or stall answer: the option's word, then ": <note>" when the
- * captain wrote one (#183's `retry: <note>`). The note is trimmed and its
- * runs of whitespace made one space, since the bridge takes one line.
+ * captain wrote one (#183's `retry: <note>`). The note's runs of
+ * whitespace become one space and it is trimmed, since the bridge takes
+ * one line; control and format characters (a pasted zero-width space or
+ * bidi override) are dropped, since the bridge refuses them.
  */
 export function choiceDecision(option: string, note: string): string {
-  const n = note.replace(/\s+/g, " ").trim();
+  const n = note.replace(/\s+/g, " ").replace(/[\p{Cc}\p{Cf}]/gu, "").trim();
   return n === "" ? option : `${option}: ${n}`;
 }
 
@@ -900,7 +902,12 @@ export function verdictText(findings: readonly { readonly severity: string }[]):
   return `${count("high") > 0 ? "Blocked" : "Findings"}: ${parts.join(", ")}`;
 }
 
-/** The confirm prompt for dropping a campaign's task: "Drop o/r#12 without landing? Campaign C-0001 ends with it." */
+/**
+ * The confirm prompt for dropping a campaign's task: "Drop o/r#12 without
+ * landing? Campaign C-0001 ends with it." A stage 3 campaign has one
+ * task, so dropping it ends the campaign; stage 4, with several tasks per
+ * campaign, must reword this.
+ */
 export function dropPrompt(t: CampaignHailTask): string {
   const camp = t.campaign ? `Campaign ${t.campaign}` : "Its campaign";
   return `Drop ${t.task || "this task"} without landing? ${camp} ends with it.`;

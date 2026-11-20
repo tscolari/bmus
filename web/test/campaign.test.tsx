@@ -122,6 +122,7 @@ describe("LandCard (#187)", () => {
     expect(html).toContain(">Land<");
     expect(html).toContain(">Another round<");
     expect(html).toContain('<label for="hail-H-0009-note" class="camp-note-label">Note for another round</label>');
+    expect(html).toContain('placeholder="Optional: sent only with Another round"');
     expect(html).toContain('aria-describedby="hail-H-0009-note"');
     expect(html).toContain('aria-label="Drop the task of H-0009"');
     // The confirm's first step only.
@@ -240,6 +241,23 @@ describe("campaign hails on the hails panel (#187)", () => {
     expect(notifies(landHail)).toBe(true);
     expect(notifies(stallHail)).toBe(true);
   });
+
+  it("notifies a campaign triage only once it is routed to the captain, including on a reroute", () => {
+    const triage = campaignHail("H-0020", "campaign_triage", { review: "ORD-0009" }, { route: "command", options: ["file", "fix", "drop"] });
+    expect(notifies(triage)).toBe(false);
+    expect(notifies({ ...triage, route: "captain" })).toBe(true);
+    let st = reduce(emptyState, { type: "snapshot", snapshot: snapshot() });
+    st = reduce(st, { type: "hail", view: triage });
+    expect(st.fresh).toEqual(["H-0020"]);
+    st = reduce(st, { type: "announced", ids: ["H-0020"] });
+    st = reduce(st, { type: "hail", view: { ...triage, rationale: "x" } });
+    expect(st.fresh).toEqual([]);
+    st = reduce(st, { type: "hail", view: { ...triage, route: "captain" } });
+    expect(st.fresh).toEqual(["H-0020"]);
+    st = reduce(st, { type: "announced", ids: ["H-0020"] });
+    st = reduce(st, { type: "hail", view: { ...triage, route: "captain", rationale: "y" } });
+    expect(st.fresh).toEqual([]);
+  });
 });
 
 describe("campaign helpers (#187)", () => {
@@ -247,6 +265,9 @@ describe("campaign helpers (#187)", () => {
     expect(choiceDecision("retry", "")).toBe("retry");
     expect(choiceDecision("retry", "   ")).toBe("retry");
     expect(choiceDecision("retry", "  the flaky\ttest\nis real ")).toBe("retry: the flaky test is real");
+    // A pasted zero-width space, bidi override or BOM is dropped: the bridge refuses them.
+    expect(choiceDecision("retry", "\u200bthe \u202eflaky\ufeff test\u0007")).toBe("retry: the flaky test");
+    expect(choiceDecision("retry", "\u200b\u202e")).toBe("retry");
   });
 
   it("reads contexts leniently", () => {

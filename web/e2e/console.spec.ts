@@ -1154,6 +1154,29 @@ test("a campaign's land hail is answered from the page, and the branch lands (#1
     await expect(confirm.getByRole("button", { name: "Drop" })).toBeFocused();
     await confirm.getByRole("button", { name: "Cancel" }).click();
 
+    // A note over the bridge's 2 KiB is refused on the card, and the hail
+    // stays open.
+    const note = card.getByRole("textbox", { name: "Note for another round" });
+    await note.fill("x".repeat(2100));
+    await card.getByRole("button", { name: "Another round" }).click();
+    await expect(card.getByRole("alert")).toContainText("the note is 2100 bytes, over 2048");
+    await expect(card.getByRole("button", { name: "Land", exact: true })).toBeEnabled();
+    const { hails: stillOpen } = JSON.parse(await bridge.bmus("hails", "list", "--json")) as { hails: { category: string }[] };
+    expect(stillOpen.map((h) => h.category)).toContain("campaign_land");
+
+    // Another round with a note sends retry: <note>, here refused by the
+    // test so the task doesn't run another round.
+    await page.route("**/api/hails/*/answer", (route) =>
+      route.fulfill({ status: 400, contentType: "application/json", body: JSON.stringify({ error: { code: "bad_request", message: "retry refused for the test" } }) }),
+    );
+    const retried = page.waitForRequest((r) => r.method() === "POST" && r.url().endsWith("/answer"));
+    await note.fill("  the flaky\u200b test is real ");
+    await card.getByRole("button", { name: "Another round" }).click();
+    expect(JSON.parse((await retried).postData() ?? "")).toEqual({ decision: "retry: the flaky test is real" });
+    await expect(card.getByRole("alert")).toHaveText("retry refused for the test");
+    await page.unroute("**/api/hails/*/answer");
+    await note.fill("");
+
     let sent = "";
     page.on("request", (r) => {
       if (r.method() === "POST" && r.url().endsWith("/answer")) sent = r.postData() ?? "";

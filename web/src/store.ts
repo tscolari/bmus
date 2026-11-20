@@ -15,6 +15,7 @@
 // the server-sent events onto them.
 
 import type { BridgeStatus, CrewView, HailView, LogEntryView, OrderView, Snapshot } from "./api.js";
+import { categoryCampaignTriage } from "./view.js";
 
 /**
  * How many log entries the live feed keeps; older ones are dropped as new
@@ -139,9 +140,17 @@ export function reduce(state: State, action: Action): State {
   }
 }
 
-/** Returns state.fresh with the open hails among views that state doesn't have yet appended. */
+/**
+ * Returns state.fresh with the open hails among views that state doesn't
+ * have yet appended, and a campaign triage newly routed to the captain
+ * (#187): Command's answer didn't fit, and the captain now has to answer.
+ */
 function withFresh(state: State, views: readonly HailView[]): readonly string[] {
-  const add = views.filter((v) => v.status === "open" && !state.hail.has(v.id) && !state.fresh.includes(v.id)).map((v) => v.id);
+  const rerouted = (v: HailView) => {
+    const was = state.hail.get(v.id);
+    return was !== undefined && v.category === categoryCampaignTriage && was.route !== "captain" && v.route === "captain";
+  };
+  const add = views.filter((v) => v.status === "open" && (!state.hail.has(v.id) || rerouted(v)) && !state.fresh.includes(v.id)).map((v) => v.id);
   return add.length === 0 ? state.fresh : [...state.fresh, ...add];
 }
 

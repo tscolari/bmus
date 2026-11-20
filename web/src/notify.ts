@@ -6,7 +6,7 @@
 
 import type { HailView } from "./api.js";
 import type { State } from "./store.js";
-import { bridgeHailOrder, hailKind } from "./view.js";
+import { bridgeHailOrder, categoryCampaignTriage, hailKind } from "./view.js";
 
 /** The page's notification permission, or "unsupported" without the API. */
 export type Permission = NotificationPermission | "unsupported";
@@ -45,8 +45,13 @@ const bridgeTitles: Partial<Record<ReturnType<typeof hailKind>, string>> = {
   stalled: "Stall from the bridge",
 };
 
-/** Whether a hail is the captain's to answer, so worth a notification: Command's advisory triage (#155) never is. */
+/**
+ * Whether a hail is the captain's to answer, so worth a notification:
+ * Command's advisory triage (#155) never is, and a campaign triage (#187)
+ * only once it is routed to the captain; Command answers it otherwise.
+ */
 export function notifies(h: HailView): boolean {
+  if (h.deliver_to && h.category === categoryCampaignTriage) return h.route === "captain";
   return hailKind(h) !== "triage";
 }
 
