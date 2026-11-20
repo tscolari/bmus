@@ -1,0 +1,13 @@
+[
+  { "at_pct": 10, "progress": "reading the issue" },
+  { "at_pct": 30, "commit": "Add retries to the webhook sender" },
+  { "at_pct": 50, "commit": "<script>alert(1)</script> Bound **the** backoff" },
+  {
+    "at_pct": 100,
+    "report": {
+      "summary": "Retries are bounded. <img src=x onerror=\"alert(1)\">",
+      "artifacts": [],
+      "verdict": { "findings": [] }
+    }
+  }
+]

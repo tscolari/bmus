@@ -1088,8 +1088,8 @@ body {
   grid-template-columns: 2ch auto minmax(0, 1fr);
   grid-template-areas:
     "n sev title"
-    ". . place"
-    ". . body";
+    ". place place"
+    ". body body";
   gap: 2px 10px;
   align-items: baseline;
   padding: 8px 10px;

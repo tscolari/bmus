@@ -1219,6 +1219,8 @@ function CampaignChoices(props: {
   hail: HailView;
   cardId: string;
   labels: { land: string; retry: string };
+  /** Whether land is the card's main action: on a land hail, not on a stall. */
+  landFirst: boolean;
   dropPrompt: string;
   answer: ReturnType<typeof useHailAnswer>;
 }) {
@@ -1248,7 +1250,7 @@ function CampaignChoices(props: {
       )}
       <div class="btns">
         {land >= 0 && (
-          <button type="button" class="btn blue" disabled={a.busy} onClick={() => void a.answer({ option: land })}>
+          <button type="button" class={props.landFirst ? "btn blue" : "btn blue-o"} disabled={a.busy} onClick={() => void a.answer({ option: land })}>
             {props.labels.land}
           </button>
         )}
@@ -1349,6 +1351,7 @@ export function LandCard(props: { hail: HailView; repoUrls: Readonly<Record<stri
         hail={h}
         cardId={cardId}
         labels={{ land: "Land", retry: "Another round" }}
+        landFirst
         dropPrompt={dropPrompt(c)}
         answer={a}
       />
@@ -1398,6 +1401,7 @@ export function StalledCard(props: { hail: HailView; repoUrls: Readonly<Record<s
         hail={h}
         cardId={cardId}
         labels={{ land: "Land as it is", retry: "Retry" }}
+        landFirst={false}
         dropPrompt={dropPrompt(c)}
         answer={a}
       />
