@@ -189,6 +189,71 @@ func TestOrderReportUnknowns(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
+// A review's report carries its verdict (#187), as the done entry holds
+// it: findings in order, an empty list for a pass, and agent text as it
+// came. A work order's entry with a verdict, and a review's entry with
+// one Check refuses, show none.
+func TestOrderReportVerdict(t *testing.T) {
+	t.Parallel()
+	r := startDaemonConfig(t, testConfig(privateHome(t)))
+	defer r.stop(t)
+	d, ctx := r.d, t.Context()
+	const base = "8b1d0e2c4a55f00dfeedfacecafebeef01234567"
+	done := func(o store.Order, payload string) string {
+		t.Helper()
+		o.State = store.OrderDone
+		id, err := d.store.InsertOrder(ctx, o, store.LogEntry{Kind: logOrder, Text: "order created: " + o.Title})
+		require.NoError(t, err)
+		_, err = d.store.AppendLog(ctx, store.LogEntry{Kind: logDone, OrderID: id, Text: "done", Payload: json.RawMessage(payload)})
+		require.NoError(t, err)
+		return id
+	}
+	review := func(round int, payload string) string {
+		return done(store.Order{Title: "Review o/r#12", Kind: store.OrderKindReview, Task: testTask, Round: round, ReviewBase: base}, payload)
+	}
+	verdictOf := func(id string) (*comms.Verdict, string) {
+		t.Helper()
+		got, err := d.OrderReport(ctx, id, consoleDiffCap)
+		require.NoError(t, err)
+		require.NotNil(t, got.Report)
+		b, err := json.Marshal(got.Report)
+		require.NoError(t, err)
+		return got.Report.Verdict, string(b)
+	}
+
+	blocked := review(1, `{"summary":"one must go","repos":[],"verdict":{"findings":[`+
+		`{"severity":"high","title":"<script>alert(1)</script> leaks","body":"**bold**","path":"x.go","line":3},`+
+		`{"severity":"low","title":"Later","body":"follow up"}]}}`)
+	v, raw := verdictOf(blocked)
+	require.NotNil(t, v)
+	require.Equal(t, []comms.VerdictFinding{
+		{Severity: comms.SeverityHigh, Title: "<script>alert(1)</script> leaks", Body: "**bold**", Path: "x.go", Line: 3},
+		{Severity: comms.SeverityLow, Title: "Later", Body: "follow up"},
+	}, v.Findings)
+	require.Contains(t, raw, `"summary":"one must go"`)
+
+	passed := review(2, `{"summary":"all good","repos":[],"verdict":{"findings":[]}}`)
+	v, raw = verdictOf(passed)
+	require.NotNil(t, v)
+	require.Empty(t, v.Findings)
+	require.Contains(t, raw, `"verdict":{"findings":[]}`)
+
+	bad := review(3, `{"summary":"odd","repos":[],"verdict":{"findings":[{"severity":"urgent","title":"x","body":""}]}}`)
+	v, raw = verdictOf(bad)
+	require.Nil(t, v)
+	require.NotContains(t, raw, "verdict")
+
+	none := review(4, `{"summary":"no verdict","repos":[]}`)
+	v, _ = verdictOf(none)
+	require.Nil(t, v)
+
+	work := done(store.Order{Title: "Implement o/r#12", Task: testTask, Round: 1},
+		`{"summary":"did it","repos":[],"verdict":{"findings":[]}}`)
+	v, raw = verdictOf(work)
+	require.Nil(t, v)
+	require.NotContains(t, raw, "verdict")
+}
+
 // diffRepo makes a repository with main at a base commit and bmus/<order>
 // one commit on, adding big.txt with lines lines, and returns its git dir
 // and the base.

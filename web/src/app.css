@@ -975,6 +975,191 @@ body {
   border-style: dashed;
 }
 
+/* Campaign hails (#187): the land and stalled cards, and a campaign
+   triage's mediums on HailCard. Findings and commits sit on the pad
+   background like review rows; a finding's left border is its severity. */
+.order-task {
+  font-size: 12px;
+  color: var(--blue-soft);
+  overflow-wrap: anywhere;
+}
+.camp-issue {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  margin: 0;
+}
+.camp-ref {
+  font-size: 13px;
+  color: var(--blue-soft);
+}
+.camp-title {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--cream);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.camp-facts dd {
+  font-size: 13px;
+}
+.camp-sub {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--label);
+}
+.camp-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.camp-commit {
+  display: grid;
+  grid-template-columns: 13ch minmax(0, 1fr);
+  gap: 10px;
+  padding: 6px 10px;
+  background: var(--pad-bg);
+  border: 1px solid var(--card-line);
+  border-radius: 4px;
+}
+.camp-sha {
+  font-size: 12px;
+  color: var(--gold);
+}
+.camp-subject {
+  font-size: 14px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.camp-review {
+  padding: 10px 12px;
+  background: var(--pad-bg);
+  border: 1px solid var(--card-line);
+  border-left: 4px solid var(--green);
+  border-radius: 4px;
+}
+.camp-review.unpassed {
+  border-left-color: var(--gold);
+}
+.camp-review.passed .camp-sub {
+  color: var(--green);
+}
+.camp-review.unpassed .camp-sub {
+  color: var(--gold);
+}
+.camp-warn {
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--gold);
+}
+.camp-summary {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  max-height: 16em;
+  overflow-y: auto;
+}
+.camp-reason {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin: 0;
+}
+.camp-why {
+  font-size: 15px;
+  color: var(--cream);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.camp-finding {
+  display: grid;
+  grid-template-columns: 2ch auto minmax(0, 1fr);
+  grid-template-areas:
+    "n sev title"
+    ". place place"
+    ". body body";
+  gap: 2px 10px;
+  align-items: baseline;
+  padding: 8px 10px;
+  background: var(--pad-bg);
+  border: 1px solid var(--card-line);
+  border-left: 4px solid var(--card-line);
+  border-radius: 4px;
+}
+.camp-finding .review-n { grid-area: n; }
+.camp-finding.sev-high { border-left-color: var(--red); }
+.camp-finding.sev-medium { border-left-color: var(--gold); }
+.camp-finding.sev-low { border-left-color: var(--blue); }
+.camp-sev {
+  grid-area: sev;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--label);
+}
+.sev-high .camp-sev { color: var(--red); }
+.sev-medium .camp-sev { color: var(--gold); }
+.sev-low .camp-sev { color: var(--blue-soft); }
+.camp-ftitle {
+  grid-area: title;
+  font-size: 15px;
+  color: var(--cream);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.camp-place {
+  grid-area: place;
+  font-size: 12px;
+  color: var(--blue-soft);
+  overflow-wrap: anywhere;
+}
+.camp-body {
+  grid-area: body;
+  margin: 2px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  max-height: 10em;
+  overflow-y: auto;
+}
+.camp-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.camp-note-label {
+  display: block;
+  margin: 0 0 6px;
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--label);
+}
+.report-verdict {
+  margin: 0 0 8px;
+  font-weight: 700;
+  color: var(--green);
+}
+.report-verdict.blocked {
+  color: var(--red);
+}
+.report-verdict.findings {
+  color: var(--gold);
+}
+
 /* Mission record */
 .record {
   display: flex;

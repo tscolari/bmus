@@ -3,6 +3,11 @@
 // to its colour (tone-<name> for text, bg-<name> for fills).
 
 import type {
+  CampaignCommit,
+  CampaignFinding,
+  CampaignHailTask,
+  CampaignLandContext,
+  CampaignStalledContext,
   BridgeStatus,
   CrewView,
   HailView,
@@ -599,6 +604,11 @@ export function pushedTo(state: State, id: string): string | undefined {
 export const categoryTrackerReview = "tracker_review";
 export const categoryFindingsTriage = "findings_triage";
 
+/** The hail categories a campaign's task raises (#183). */
+export const categoryCampaignTriage = "campaign_triage";
+export const categoryCampaignStalled = "campaign_stalled";
+export const categoryCampaignLand = "campaign_land";
+
 /** The findings workflow's id prefix: a findings hail's deliver_to is findings/<order>. */
 const findingsWorkflow = "findings/";
 
@@ -611,17 +621,30 @@ const str = (v: unknown): string => (typeof v === "string" ? v : "");
  * names its order itself (order_id).
  */
 export function bridgeHailOrder(h: HailView): string {
-  const fromContext = isRecord(h.context) ? str(h.context["order"]) : "";
+  const c = isRecord(h.context) ? h.context : {};
+  // A campaign hail (#187) is about its head (land), its review (triage),
+  // or the order it stalled on, else its head (stalled).
+  if (h.deliver_to && h.category === categoryCampaignLand) return str(c["head"]);
+  if (h.deliver_to && h.category === categoryCampaignTriage) return str(c["review"]);
+  const fromContext = str(c["order"]);
   if (fromContext !== "") return fromContext;
+  if (h.deliver_to && h.category === categoryCampaignStalled) return str(c["head"]);
   const to = h.deliver_to ?? "";
   return to.startsWith(findingsWorkflow) ? to.slice(findingsWorkflow.length) : "";
 }
 
-/** How a hail shows on the hails panel: a beam's hail, a bridge hail, the findings review or Command's triage. */
-export function hailKind(h: HailView): "crew" | "bridge" | "review" | "triage" {
+/**
+ * How a hail shows on the hails panel: a beam's hail, a bridge hail, the
+ * findings review, Command's triage, a campaign's land or a campaign's
+ * stall (#187). A campaign_triage that reaches the captain is a bridge
+ * hail, answered on HailCard.
+ */
+export function hailKind(h: HailView): "crew" | "bridge" | "review" | "triage" | "land" | "stalled" {
   if (!h.deliver_to) return "crew";
   if (h.category === categoryTrackerReview) return "review";
   if (h.category === categoryFindingsTriage) return "triage";
+  if (h.category === categoryCampaignLand) return "land";
+  if (h.category === categoryCampaignStalled) return "stalled";
   return "bridge";
 }
 
@@ -732,4 +755,166 @@ export function issueURL(ref: string, repoUrls: Readonly<Record<string, string>>
 export function discardAllPrompt(rc: ReviewContext, restore: ReadonlySet<string>): string {
   const keys = restoreKeys(rc, restore);
   return `Close all ${issuesText(rc.issues.length)} as not planned${keys.length > 0 ? ` and restore ${keys.join(", ")}` : ""}?`;
+}
+
+/* Campaigns (#187) ------------------------------------------------------- */
+
+const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+
+/** A campaign hail's campaign, task ref and issue title, read leniently. */
+function campaignTask(c: Record<string, unknown>): CampaignHailTask {
+  return { campaign: str(c["campaign"]), task: str(c["task"]), issue_title: str(c["issue_title"]) };
+}
+
+/** A campaign hail's findings, read leniently: an entry without a number or title is left out. */
+export function campaignFindings(v: unknown): CampaignFinding[] {
+  if (!Array.isArray(v)) return [];
+  return v
+    .filter(isRecord)
+    .map((f) => ({
+      n: num(f["n"]),
+      severity: str(f["severity"]),
+      title: str(f["title"]),
+      body: str(f["body"]),
+      ...(str(f["path"]) !== "" && { path: str(f["path"]) }),
+      ...(num(f["line"]) > 0 && { line: num(f["line"]) }),
+    }))
+    .filter((f) => f.n > 0 && f.title !== "");
+}
+
+/** A campaign_land hail's context, read leniently: a missing field is empty, and a commit without its id is left out. */
+export function landContext(h: HailView): CampaignLandContext {
+  const c = isRecord(h.context) ? h.context : {};
+  const commits: CampaignCommit[] = (Array.isArray(c["commits"]) ? c["commits"].filter(isRecord) : [])
+    .map((e) => ({ sha: str(e["sha"]), subject: str(e["subject"]) }))
+    .filter((e) => e.sha !== "");
+  return {
+    ...campaignTask(c),
+    repo: str(c["repo"]),
+    branch: str(c["branch"]),
+    head: str(c["head"]),
+    head_commit: str(c["head_commit"]),
+    review_base: str(c["review_base"]),
+    commits,
+    commit_count: Math.max(num(c["commit_count"]), commits.length),
+    rounds: num(c["rounds"]),
+    review: str(c["review"]),
+    review_summary: str(c["review_summary"]),
+    passed: c["passed"] === true,
+  };
+}
+
+/** A campaign_stalled hail's context, read leniently. */
+export function stalledContext(h: HailView): CampaignStalledContext {
+  const c = isRecord(h.context) ? h.context : {};
+  return {
+    ...campaignTask(c),
+    code: str(c["code"]),
+    reason: str(c["reason"]),
+    round: num(c["round"]),
+    max_rounds: num(c["max_rounds"]),
+    head: str(c["head"]),
+    head_commit: str(c["head_commit"]),
+    order: str(c["order"]),
+    blocking: campaignFindings(c["blocking"]),
+  };
+}
+
+/** A campaign_triage hail's numbered mediums, read leniently. */
+export function triageFindings(h: HailView): CampaignFinding[] {
+  return campaignFindings(isRecord(h.context) ? h.context["findings"] : undefined);
+}
+
+/** Whether h is one of a campaign task's hails. */
+export function isCampaignHail(h: HailView): boolean {
+  return !!h.deliver_to && [categoryCampaignTriage, categoryCampaignStalled, categoryCampaignLand].includes(h.category);
+}
+
+/**
+ * A campaign hail's meta line: its id, the bridge, the campaign and the
+ * task, as far as the context names them.
+ */
+export function campaignHailMeta(h: HailView): string[] {
+  const t = campaignTask(isRecord(h.context) ? h.context : {});
+  return [h.id, "Bridge", ...(t.campaign ? [`campaign ${t.campaign}`] : []), ...(t.task ? [`task ${t.task}`] : [])];
+}
+
+/** A commit id as questions and the CLI show it: its first 12 characters. */
+export function shortCommit(commit: string): string {
+  return commit.slice(0, 12);
+}
+
+/** A finding's place, "path:line", "path" or "". */
+export function findingPlace(f: { readonly path?: string; readonly line?: number }): string {
+  if (!f.path) return "";
+  return f.line ? `${f.path}:${f.line}` : f.path;
+}
+
+/** "1 commit", "4 commits". */
+export function commitsText(n: number): string {
+  return `${n} commit${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * A land or stall answer: the option's word, then ": <note>" when the
+ * captain wrote one (#183's `retry: <note>`). The note's runs of
+ * whitespace become one space and it is trimmed, since the bridge takes
+ * one line; control and format characters (a pasted zero-width space or
+ * bidi override) are dropped, since the bridge refuses them.
+ */
+export function choiceDecision(option: string, note: string): string {
+  const n = note.replace(/\s+/g, " ").replace(/[\p{Cc}\p{Cf}]/gu, "").trim();
+  return n === "" ? option : `${option}: ${n}`;
+}
+
+/** The index of word among a hail's options, or -1. */
+export function optionIndex(h: HailView, word: string): number {
+  return h.options.indexOf(word);
+}
+
+/** The campaign and ref of a task workflow id, campaign/<id>/task/<ref> (store.ParseTaskID); undefined for another shape. */
+export function parseTaskID(task: string): { campaign: string; ref: string } | undefined {
+  if (!task.startsWith("campaign/")) return undefined;
+  const rest = task.slice("campaign/".length);
+  const at = rest.indexOf("/task/");
+  if (at <= 0) return undefined;
+  const ref = rest.slice(at + "/task/".length);
+  return ref === "" ? undefined : { campaign: rest.slice(0, at), ref };
+}
+
+/**
+ * What a campaign order is (#187): "review of o/r#12, round 2" or "work
+ * on o/r#12, round 2"; undefined outside a campaign. A task id of another
+ * shape is named whole.
+ */
+export function campaignOrderText(o: OrderView): string | undefined {
+  if (!o.task) return undefined;
+  const what = o.kind === "review" ? "review of" : "work on";
+  const ref = parseTaskID(o.task)?.ref ?? o.task;
+  return o.round ? `${what} ${ref}, round ${o.round}` : `${what} ${ref}`;
+}
+
+/** A verdict's outcome line: "Passed" for no findings, else the count by severity, "Blocked: 1 high, 2 medium, 1 low" when any is high. */
+export function verdictText(findings: readonly { readonly severity: string }[]): string {
+  if (findings.length === 0) return "Passed: no findings";
+  const count = (s: string) => findings.filter((f) => f.severity === s).length;
+  const parts = (["high", "medium", "low"] as const).filter((s) => count(s) > 0).map((s) => `${count(s)} ${s}`);
+  return `${count("high") > 0 ? "Blocked" : "Findings"}: ${parts.join(", ")}`;
+}
+
+/**
+ * The confirm prompt for dropping a campaign's task: "Drop o/r#12 without
+ * landing? Campaign C-0001 ends with it." A stage 3 campaign has one
+ * task, so dropping it ends the campaign; stage 4, with several tasks per
+ * campaign, must reword this.
+ */
+export function dropPrompt(t: CampaignHailTask): string {
+  const camp = t.campaign ? `Campaign ${t.campaign}` : "Its campaign";
+  return `Drop ${t.task || "this task"} without landing? ${camp} ends with it.`;
+}
+
+/** A verdict's class on the report page: passed with no findings, blocked with a high, else findings. */
+export function verdictTone(findings: readonly { readonly severity: string }[]): "passed" | "blocked" | "findings" {
+  if (findings.length === 0) return "passed";
+  return findings.some((f) => f.severity === "high") ? "blocked" : "findings";
 }

@@ -6,7 +6,7 @@
 
 import type { HailView } from "./api.js";
 import type { State } from "./store.js";
-import { bridgeHailOrder, hailKind } from "./view.js";
+import { bridgeHailOrder, categoryCampaignTriage, hailKind } from "./view.js";
 
 /** The page's notification permission, or "unsupported" without the API. */
 export type Permission = NotificationPermission | "unsupported";
@@ -24,21 +24,34 @@ export interface NotifyEnv {
  * A notification's title and body for a hail: the crew member and order,
  * then the question. A bridge-raised hail (#152) has no crew member: the
  * title names the bridge and the order it is about, the findings review
- * as a review.
+ * as a review, a campaign's land and stall hails (#187) as a landing and
+ * a stall: the head the land pushes, the order the task stalled on.
  */
 export function hailNotice(state: State, h: HailView): { title: string; body: string; tag: string } {
   const kind = hailKind(h);
   if (kind !== "crew") {
     const order = bridgeHailOrder(h);
-    const what = kind === "review" ? "Review from the bridge" : "Hail from the bridge";
+    const what = bridgeTitles[kind] ?? "Hail from the bridge";
     return { title: order ? `${what} · ${order}` : what, body: h.question, tag: h.id };
   }
   const c = state.crew.get(h.crew_id);
   return { title: `Hail from ${c?.name || h.crew_id} · ${h.order_id}`, body: h.question, tag: h.id };
 }
 
-/** Whether a hail is the captain's to answer, so worth a notification: Command's advisory triage (#155) never is. */
+/** A bridge hail's notification title by its kind (hailKind). */
+const bridgeTitles: Partial<Record<ReturnType<typeof hailKind>, string>> = {
+  review: "Review from the bridge",
+  land: "Landing from the bridge",
+  stalled: "Stall from the bridge",
+};
+
+/**
+ * Whether a hail is the captain's to answer, so worth a notification:
+ * Command's advisory triage (#155) never is, and a campaign triage (#187)
+ * only once it is routed to the captain; Command answers it otherwise.
+ */
 export function notifies(h: HailView): boolean {
+  if (h.deliver_to && h.category === categoryCampaignTriage) return h.route === "captain";
   return hailKind(h) !== "triage";
 }
 

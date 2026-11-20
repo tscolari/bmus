@@ -3,15 +3,16 @@
 // /api/orders/{id}/report and shows the order, the crew member and beams
 // that ran it, the crew's report, its pushes, then each repo's unified
 // diff, a section per repo and a header per file, added lines green and
-// removed ones red. The order's body, the report and the diff come from
+// removed ones red. A review's verdict (#187) shows under its summary.
+// The order's body, the report, the verdict and the diff come from
 // the captain and the agent: they are rendered as plain text children
 // only, never as HTML.
 
 import { Fragment, type ComponentChildren } from "preact";
 import { useEffect, useState } from "preact/hooks";
 import { orderReport, type CrewView, type OrderRepo, type OrderReport, type OrderView, type RepoDiff } from "./api.js";
-import { UsageMeter } from "./panels.js";
-import { budgetSourceText, divisionInfo, extensionsText, orderBranch, orderUsage, priorityInfo } from "./view.js";
+import { FindingList, UsageMeter } from "./panels.js";
+import { budgetSourceText, campaignOrderText, divisionInfo, extensionsText, orderBranch, orderUsage, priorityInfo, verdictText, verdictTone } from "./view.js";
 
 /**
  * The most diff lines a repo's section renders: an agent can write a
@@ -346,6 +347,7 @@ export function ReportView(props: { report: OrderReport; copy?: CopyNote; maxLin
         <Facts
           rows={[
             ["State", o.state],
+            ...(campaignOrderText(o) ? [["Campaign", campaignOrderText(o)] as const] : []),
             ["Priority", priorityInfo(o.priority).label],
             ["Division", o.division === "" ? "" : divisionInfo(o.division).label],
             [
@@ -397,6 +399,15 @@ export function ReportView(props: { report: OrderReport; copy?: CopyNote; maxLin
         ) : (
           <>
             {r.report.summary === "" ? <p class="empty">No summary.</p> : <p class="report-summary">{r.report.summary}</p>}
+            {r.report.verdict && (
+              <>
+                <h3 class="report-sub">Verdict</h3>
+                <p class={`report-verdict ${verdictTone(r.report.verdict.findings)}`}>
+                  {verdictText(r.report.verdict.findings)}
+                </p>
+                <FindingList findings={r.report.verdict.findings.map((f, i) => ({ ...f, n: i + 1 }))} label="Findings" />
+              </>
+            )}
             <h3 class="report-sub">Artifacts</h3>
             {r.report.artifacts.length === 0 ? (
               <p class="empty">None.</p>

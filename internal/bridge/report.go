@@ -12,6 +12,9 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/tscolari/bmus/internal/comms"
+	"github.com/tscolari/bmus/internal/store"
 )
 
 // OrderReport is a done order's mission report. Crew is nil when the order
@@ -39,9 +42,13 @@ type ReportOrder struct {
 }
 
 // ReportSummary is the crew's report, from the done entry's payload.
+// Verdict is a review order's verdict (#187), as the done entry holds it
+// (#182); nil for a work order, and for an entry without a verdict Check
+// takes.
 type ReportSummary struct {
-	Summary   string   `json:"summary"`
-	Artifacts []string `json:"artifacts"`
+	Summary   string         `json:"summary"`
+	Artifacts []string       `json:"artifacts"`
+	Verdict   *comms.Verdict `json:"verdict,omitempty"`
 }
 
 // ReportPush is one push of the order's work, from its "repo <name>
@@ -91,6 +98,7 @@ func (d *Daemon) OrderReport(ctx context.Context, id string, limit int) (OrderRe
 			if out.Report.Artifacts == nil {
 				out.Report.Artifacts = []string{}
 			}
+			out.Report.Verdict = reportVerdict(o, p.Verdict)
 		}
 		at := done.TS
 		out.Order.DoneAt = &at
@@ -125,4 +133,15 @@ func (d *Daemon) OrderReport(ctx context.Context, id string, limit int) (OrderRe
 	}
 	out.Cap, out.Repos = diff.Cap, diff.Repos
 	return out, nil
+}
+
+// reportVerdict is the verdict a mission report shows for o: v when o is
+// a review and Check takes v, else nil. The mission stores only a verdict
+// Check took, and only for a review (#182); the check keeps a hand-made
+// entry from showing a verdict the bridge never accepted.
+func reportVerdict(o store.Order, v *comms.Verdict) *comms.Verdict {
+	if o.Kind != store.OrderKindReview || v == nil || v.Check() != nil {
+		return nil
+	}
+	return v
 }

@@ -296,7 +296,8 @@ export interface OrderReport {
   readonly crew: CrewView | null;
   /** The beams the order ran on, oldest first. */
   readonly beams: readonly string[];
-  readonly report: { readonly summary: string; readonly artifacts: readonly string[] } | null;
+  /** verdict is a review's (#187), absent for a work order. */
+  readonly report: { readonly summary: string; readonly artifacts: readonly string[]; readonly verdict?: Verdict } | null;
   readonly pushes: readonly ReportPush[];
   /** The bytes each repo's diff was capped at. */
   readonly cap: number;
@@ -426,4 +427,74 @@ export function setStandingOrders(csrf: string, on: boolean): Promise<StandingOr
 /** Reads the newest limit log entries below before, oldest first. */
 export function logBefore(before: number, limit: number): Promise<LogPage> {
   return getJSON<LogPage>(`/api/log?before=${before}&limit=${limit}`);
+}
+
+/** A finding of a review's verdict: comms.VerdictFinding (#181). Title, body and path are the reviewer's text. */
+export interface VerdictFinding {
+  /** high, medium or low. */
+  readonly severity: string;
+  readonly title: string;
+  readonly body: string;
+  /** Absent for none. */
+  readonly path?: string;
+  /** From 1; absent for none. */
+  readonly line?: number;
+}
+
+/** A review's verdict: comms.Verdict (#181). An empty list is a pass. */
+export interface Verdict {
+  readonly findings: readonly VerdictFinding[];
+}
+
+/** A review's finding in a campaign hail's context, numbered from 1: bridge.CampaignFinding (#183). */
+export interface CampaignFinding extends VerdictFinding {
+  readonly n: number;
+}
+
+/** A commit over a land's review base: bridge.CampaignCommit (#183). */
+export interface CampaignCommit {
+  readonly sha: string;
+  readonly subject: string;
+}
+
+/** What every campaign hail's context names: bridge.CampaignHailTask (#183). issue_title is tracker text. */
+export interface CampaignHailTask {
+  readonly campaign: string;
+  /** The task's ref, such as o/r#12. */
+  readonly task: string;
+  readonly issue_title: string;
+}
+
+/** A campaign_land hail's context: bridge.CampaignLandContext (#183, #185). */
+export interface CampaignLandContext extends CampaignHailTask {
+  readonly repo: string;
+  readonly branch: string;
+  /** The head order, whose work lands. */
+  readonly head: string;
+  readonly head_commit: string;
+  readonly review_base: string;
+  /** The first 50 commits over the review base. */
+  readonly commits: readonly CampaignCommit[];
+  /** Every commit over the review base. */
+  readonly commit_count: number;
+  readonly rounds: number;
+  /** The last review read; empty before any. */
+  readonly review: string;
+  readonly review_summary: string;
+  /** Whether that review passed (#185). */
+  readonly passed: boolean;
+}
+
+/** A campaign_stalled hail's context: bridge.CampaignStalledContext (#183). */
+export interface CampaignStalledContext extends CampaignHailTask {
+  readonly code: string;
+  readonly reason: string;
+  readonly round: number;
+  readonly max_rounds: number;
+  /** The task's head order; empty with none, when the hail has no land option. */
+  readonly head: string;
+  readonly head_commit: string;
+  /** The order it stalled on; empty for none. */
+  readonly order: string;
+  readonly blocking: readonly CampaignFinding[];
 }

@@ -13,7 +13,10 @@
 // target forced past a second confirm. The mission report (#104): a done
 // order, its crew, beam, report and diff in a new tab, the diff copied to
 // the clipboard. The findings review (#157): an order's findings filed to
-// a fake GitHub, triaged by Command, and reviewed from the page.
+// a fake GitHub, triaged by Command, and reviewed from the page. A
+// campaign (#187): its review waits in the pool on the open orders card,
+// passes, and its land hail is answered from the page; the push reaches
+// the bare remote and the review's report shows its verdict.
 import { expect, test, type Locator, type Page, type TestInfo } from "@playwright/test";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
@@ -50,6 +53,8 @@ const splitScript = path.join(import.meta.dirname, "split.json");
 const workScript = path.join(import.meta.dirname, "work.json");
 /** Four findings filed as the mission ends, and Command's triage dropping one and marking one a duplicate (#157). */
 const findingsScript = path.join(import.meta.dirname, "findings.json");
+/** Every order commits twice and reports a passing verdict, which a work order's mission drops (#187). */
+const campaignScript = path.join(import.meta.dirname, "campaign.json");
 const repoRoot = path.resolve(import.meta.dirname, "..", "..");
 const missionTimeout = 60_000;
 
@@ -1094,6 +1099,119 @@ test("an order's findings, filed and triaged by Command, are reviewed from the p
     expect(github.issue(2)).toMatchObject({ state: "open", labels: [] });
     expect(github.issue(3)).toMatchObject({ state: "closed", state_reason: "not_planned" });
     expect(github.issue(4)).toMatchObject({ title: "Typo in a comment", state: "open", labels: [] });
+    expect(errors).toEqual([]);
+  } finally {
+    github.stop();
+  }
+});
+
+test("a campaign's land hail is answered from the page, and the branch lands (#187)", async ({ page, context }) => {
+  const errors = pageErrors(page);
+  const github = new FakeGitHub();
+  await github.start();
+  try {
+    const title = "<script>alert(1)</script> Retry **the** webhook sender";
+    github.add(title);
+    bridge = new Bridge();
+    const url = await bridge.start({
+      regs: fs.readFileSync(path.join(repoRoot, "internal", "regs", "default.yaml"), "utf8"),
+      script: campaignScript,
+      github,
+    });
+    await page.goto(url);
+    await bridge.bmus("crew", "add", "sorell", "--name", "Lt. Sorell", "--division", "engineering");
+    await bridge.bmus("crew", "add", "tuvok", "--name", "Lt. Tuvok", "--division", "science");
+    for (const name of ["Lt. Sorell", "Lt. Tuvok"]) {
+      await expect(page.getByRole("article", { name })).toContainText("On deck", { timeout: missionTimeout });
+    }
+    expect(await bridge.bmus("campaign", "run", "--issue", "acme/app#1", "--repo", "app", "--assignee", "sorell")).toContain("campaign C-0001 running");
+
+    // Standing orders are off: the review waits in the science pool, and
+    // the open orders card names it.
+    const open = page.getByRole("region", { name: /Open orders/ });
+    await expect(open.getByText("review of acme/app#1, round 1", { exact: true })).toBeVisible({ timeout: missionTimeout });
+    await bridge.bmus("standing-orders", "on");
+
+    const hails = page.getByRole("region", { name: "Hailing frequencies open" });
+    const card = hails.getByRole("group", { name: /Bridge · campaign C-0001 · task acme\/app#1 "Land acme\/app#1/ });
+    await expect(card).toBeVisible({ timeout: missionTimeout });
+    // Tracker and agent text is text.
+    await expect(card.getByText(title, { exact: true })).toBeVisible();
+    await expect(card.getByText("<script>alert(1)</script> Bound **the** backoff", { exact: true })).toBeVisible();
+    await expect(card.getByText('Retries are bounded. <img src=x onerror="alert(1)">', { exact: true })).toBeVisible();
+    await expect(card.locator("script, img")).toHaveCount(0);
+    await expect(card).toContainText("2 commits over the review base");
+    await expect(card).toContainText("app: campaign/C-0001/acme-app-1");
+    await expect(card.getByRole("heading", { name: /^Review ORD-\d+ passed$/ })).toBeVisible();
+    const review = /Review (ORD-\d+) passed/.exec((await card.textContent()) ?? "")?.[1] ?? "";
+    const headId = /Head\s*(ORD-\d+)/.exec((await card.textContent()) ?? "")?.[1] ?? "";
+    expect(headId).not.toBe("");
+    await expect(card.getByRole("button", { name: /Belay/ })).toHaveCount(0);
+
+    // Drop asks first; Cancel sends nothing.
+    await card.getByRole("button", { name: /^Drop the task of H-\d+$/ }).click();
+    const confirm = card.getByRole("group", { name: "Drop acme/app#1 without landing? Campaign C-0001 ends with it." });
+    await expect(confirm.getByRole("button", { name: "Drop" })).toBeFocused();
+    await confirm.getByRole("button", { name: "Cancel" }).click();
+
+    // A note over the bridge's 2 KiB is refused on the card, and the hail
+    // stays open.
+    const note = card.getByRole("textbox", { name: "Note for another round" });
+    await note.fill("x".repeat(2100));
+    await card.getByRole("button", { name: "Another round" }).click();
+    await expect(card.getByRole("alert")).toContainText("the note is 2100 bytes, over 2048");
+    await expect(card.getByRole("button", { name: "Land", exact: true })).toBeEnabled();
+    const { hails: stillOpen } = JSON.parse(await bridge.bmus("hails", "list", "--json")) as { hails: { category: string }[] };
+    expect(stillOpen.map((h) => h.category)).toContain("campaign_land");
+
+    // Another round with a note sends retry: <note>, here refused by the
+    // test so the task doesn't run another round.
+    await page.route("**/api/hails/*/answer", (route) =>
+      route.fulfill({ status: 400, contentType: "application/json", body: JSON.stringify({ error: { code: "bad_request", message: "retry refused for the test" } }) }),
+    );
+    const retried = page.waitForRequest((r) => r.method() === "POST" && r.url().endsWith("/answer"));
+    await note.fill("  the flaky\u200b test is real ");
+    await card.getByRole("button", { name: "Another round" }).click();
+    expect(JSON.parse((await retried).postData() ?? "")).toEqual({ decision: "retry: the flaky test is real" });
+    await expect(card.getByRole("alert")).toHaveText("retry refused for the test");
+    await page.unroute("**/api/hails/*/answer");
+    await note.fill("");
+
+    let sent = "";
+    page.on("request", (r) => {
+      if (r.method() === "POST" && r.url().endsWith("/answer")) sent = r.postData() ?? "";
+    });
+    await card.getByRole("button", { name: "Land", exact: true }).click();
+    await lastHailAnswered(page, hails);
+    expect(JSON.parse(sent)).toEqual({ option: 0 });
+
+    // The task lands: the branch is on the remote at the head's commit.
+    const bare = path.join(bridge.dir, "app.git");
+    const deadline = Date.now() + missionTimeout;
+    let task: { state: string; head: string; head_commit: string } | undefined;
+    for (;;) {
+      const shown = JSON.parse(await bridge.bmus("campaign", "show", "C-0001", "--json")) as { campaign: { tasks: (typeof task)[] } };
+      task = shown.campaign.tasks[0];
+      if (task?.state === "landed" || Date.now() > deadline) break;
+      await until(250);
+    }
+    expect(task).toMatchObject({ state: "landed", head: headId });
+    const landed = await gitOut(bridge.dir, "ls-remote", bare, "campaign/C-0001/acme-app-1");
+    expect(landed).toBe(`${task?.head_commit}\trefs/heads/campaign/C-0001/acme-app-1`);
+    const { hails: decided } = JSON.parse(await bridge.bmus("hails", "list", "--status", "decided", "--json")) as {
+      hails: { category: string; decision: string; decided_by: string }[];
+    };
+    expect(decided.find((h) => h.category === "campaign_land")).toMatchObject({ decided_by: "captain", decision: "land" });
+
+    // The review's mission report shows its verdict under its summary.
+    const reportPage = await context.newPage();
+    const reportErrors = pageErrors(reportPage);
+    await reportPage.goto(new URL(`/report/${review}`, url).toString());
+    const report = reportPage.getByRole("region", { name: "Report" });
+    await expect(report.getByText('Retries are bounded. <img src=x onerror="alert(1)">', { exact: true })).toBeVisible();
+    await expect(report.getByText("Passed: no findings", { exact: true })).toBeVisible();
+    await expect(reportPage.getByRole("region", { name: "Order" })).toContainText("review of acme/app#1, round 1");
+    expect(reportErrors).toEqual([]);
     expect(errors).toEqual([]);
   } finally {
     github.stop();
