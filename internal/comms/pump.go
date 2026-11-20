@@ -24,7 +24,7 @@ import (
 // the crew member's beam, reconnecting with backoff whenever it ends, and
 //
 //   - records every inbound message in the inbox, once, and acks it;
-//   - writes progress straight to the captain's log, and usage straight
+//   - writes progress straight to the ship's log, and usage straight
 //     to order_usage;
 //   - forwards hello, hail, checkpoint_ready, report, error and
 //     consult_reply to the Sink, which hands them to workflows;
@@ -48,7 +48,7 @@ var ErrNotConnected = errors.New("comms: combadge not connected")
 // ErrUndeliverable is wrapped by a Sink error to say the message's
 // destination doesn't exist yet (the bridge: a mission or hail workflow
 // that hasn't started). The pump retries such a message for
-// UndeliverableAfter, then records it as undeliverable in the captain's log
+// UndeliverableAfter, then records it as undeliverable in the ship's log
 // and moves on, so one message can't stall the crew member's stream forever.
 // Any other Sink error is retried indefinitely.
 var ErrUndeliverable = errors.New("comms: message destination does not exist yet")
@@ -169,7 +169,7 @@ const (
 	DefaultUndeliverableAfter = 5 * time.Minute
 )
 
-// Captain's log kinds the pump writes.
+// Ship's log kinds the pump writes.
 const (
 	// progressLogKind is for progress entries: one of the log's kinds
 	// (beam, order, hail, done, fail), as progress is an order's.

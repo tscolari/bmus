@@ -104,7 +104,7 @@ type JettisonResult struct {
 // withdrawn) at least olderThan ago, and with yes deletes them. A branch
 // whose order the store doesn't have is left alone and not counted.
 //
-// When an order ended is the time of its latest captain's log entry
+// When an order ended is the time of its latest ship's log entry
 // (store.LatestOrderLogTS): every move to an ended state logs one, so it
 // is never before the order ended. A branch an open order's base_ref
 // resolves to in the clone stays (protectedBranches): a re-run of that
@@ -393,7 +393,7 @@ func movedSkip(b JettisonBranch) JettisonSkip {
 	return JettisonSkip{Repo: b.Repo, Order: b.Order, Branch: b.Branch, Reason: "moved from " + b.Commit[:min(len(b.Commit), 12)] + " since it was listed"}
 }
 
-// jettisonText is the captain's log text of order id's branch jettisoned
+// jettisonText is the ship's log text of order id's branch jettisoned
 // from repo.
 func jettisonText(id, repo string) string {
 	return fmt.Sprintf("branch %s jettisoned from repo %s", orderBranch(id), repo)

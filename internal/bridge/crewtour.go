@@ -90,7 +90,7 @@ const CodeBudgetExceeded = "budget_exceeded"
 // The tour ends in sickbay with the error's reason (harnessCheckFailed).
 const CodeHarnessCheckFailed = "harness_check_failed"
 
-// Captain's log kinds (spec §7: log.kind).
+// Ship's log kinds (spec §7: log.kind).
 const (
 	logBeam   = "beam"
 	logCrew   = "crew"
@@ -721,7 +721,7 @@ func (d *Daemon) crewDismissed(ctx context.Context, crewID string) (bool, error)
 }
 
 // logCrewError is the log-crew-error step: a crew_error goes into the
-// captain's log.
+// ship's log.
 func logCrewError(ctx dbos.Context, in CrewTourInput, sig CrewSignal) error {
 	daemonFrom(ctx).logger.Warn("crew tour: crew-level error", "tour", tourWorkflowID(in.CrewID, in.TourNo),
 		"reason", sig.Reason, "code", sig.Code)

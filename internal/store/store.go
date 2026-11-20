@@ -353,7 +353,7 @@ func scanCrew(row interface{ Scan(...any) error }) (Crew, error) {
 	return c, err
 }
 
-// InsertCrew adds a crew member and appends entry to the captain's log, in
+// InsertCrew adds a crew member and appends entry to the ship's log, in
 // one transaction. An empty Status defaults to on_deck. An empty Harness
 // is stored as is: unset, serve's default (sdk) unless a division's applies.
 func (s *Store) InsertCrew(ctx context.Context, c Crew, entry LogEntry) error {
@@ -441,7 +441,7 @@ func (s *Store) ListCrew(ctx context.Context) ([]Crew, error) {
 }
 
 // SetCrewStatus sets a crew member's status and current beam alias and
-// appends entry to the captain's log, in one transaction. A crew member
+// appends entry to the ship's log, in one transaction. A crew member
 // already in status on beam is left alone and nothing is logged, so a
 // re-run of the step that set it logs nothing. dismissed is terminal: a
 // dismissed crew member is left alone too (#100). A missing crew member
@@ -453,7 +453,7 @@ func (s *Store) SetCrewStatus(ctx context.Context, id, status, beam string, entr
 }
 
 // UpdateCrewStatusFrom sets a crew member's status to status, leaving its
-// current beam as is, and appends entry to the captain's log, in one
+// current beam as is, and appends entry to the ship's log, in one
 // transaction, only while its status is from: a crew member in any other
 // status (dismissed or sickbay, say) is left alone and nothing is logged,
 // so a re-run writes nothing. It reports whether it changed the row. A
@@ -463,7 +463,7 @@ func (s *Store) UpdateCrewStatusFrom(ctx context.Context, id, from, status strin
 }
 
 // UpdateCrewStatus sets a crew member's status, leaving its current beam as
-// is, and appends entry to the captain's log, in one transaction. A crew
+// is, and appends entry to the ship's log, in one transaction. A crew
 // member already in status, or dismissed (terminal, #100), is left alone and
 // nothing is logged. A missing crew member returns sql.ErrNoRows.
 func (s *Store) UpdateCrewStatus(ctx context.Context, id, status string, entry LogEntry) error {
@@ -654,7 +654,7 @@ func (s *Store) orderRepos(ctx context.Context, ids []string) (map[string][]Orde
 }
 
 // InsertOrder creates an order and returns its generated id (ORD-0001, ...),
-// and appends entry, with its OrderID set to that id, to the captain's log,
+// and appends entry, with its OrderID set to that id, to the ship's log,
 // in one transaction. o.ID and o.ParkedAt are ignored. An empty State
 // defaults to directed when Assignee is set, pool otherwise. o.After are
 // the orders it waits on (order_after, #142): an unknown order, the order
@@ -1187,7 +1187,7 @@ func (s *Store) ListOrders(ctx context.Context) ([]Order, error) {
 // in (#106).
 //
 // A claim that moves an order also sets the crew member away and appends
-// entry, with its OrderID set to the order's id, to the captain's log, all
+// entry, with its OrderID set to the order's id, to the ship's log, all
 // in one transaction; claiming a work order with a task records crewID in
 // task_workers in it too (#180). Returning the order already away sets
 // the crew member away only if it is on_deck (a new tour taking up its
@@ -1407,7 +1407,7 @@ func (s *Store) settleOrder(ctx context.Context, id, assignee string, evenParked
 	return current, settled, nil
 }
 
-// logKindOrder and logKindFail are the bridge's captain's log kinds for
+// logKindOrder and logKindFail are the bridge's ship's log kinds for
 // an order's events and failures, which settleSplit's entries use.
 const (
 	logKindOrder = "order"
@@ -2408,7 +2408,7 @@ func (h Hail) CountermandedAway() bool {
 // an earlier tour's order leaves the current tour's status alone: #48),
 // sets h.OrderID hailing if it is away with h.CrewID as its assignee (an
 // order recalled or settled meanwhile is left alone: #134), and appends
-// entry to the captain's log with the hail's id added to its payload
+// entry to the ship's log with the hail's id added to its payload
 // object as hail_id. The hail's created_at is entry's TS (default now).
 //
 // In Phase 1 the agent is held inside its callback while a hail is open, so an
@@ -2500,7 +2500,7 @@ var ErrBridgeHail = errors.New("invalid bridge hail")
 // of the raising step raises nothing new; another key raises a new hail
 // (#180). The unique index hails_raise backs this.
 //
-// It appends entry to the captain's log with the hail's id added to its
+// It appends entry to the ship's log with the hail's id added to its
 // payload as hail_id, in the same transaction. entry.OrderID may name the
 // order the raiser works for; the hail itself names none. The hail's
 // created_at is entry's TS (default now).
@@ -2711,7 +2711,7 @@ type StatusSnapshot struct {
 	Crew        []Crew         // every crew member, ordered by id
 	OrderStates map[string]int // the number of orders in each state
 	HailsOpen   int
-	LastLogID   int64 // the captain's log's last id, 0 when empty
+	LastLogID   int64 // the ship's log's last id, 0 when empty
 	// RedOrders are the ids of open red orders (pool, directed, away or
 	// hailing with PriorityRed), in id order.
 	RedOrders []string
@@ -2838,7 +2838,7 @@ func (s *Store) MarkHailDecided(ctx context.Context, id, decidedBy, decision, ra
 
 // DecideOpenHail records a decision on hail id only if it is still open, sets
 // the hail's crew member back away if it is hailing, appends entry to the
-// captain's log, and runs fn (nil-able), e.g. a dbos.Send made with
+// ship's log, and runs fn (nil-able), e.g. a dbos.Send made with
 // dbos.WithSendTransaction on tx, all in one transaction: the decision and
 // fn's writes commit or roll back together. Unlike MarkHailDecided it is not
 // idempotent: a hail that isn't open, even one decided the same way, returns
@@ -2889,7 +2889,7 @@ func (s *Store) DecideOpenHailAs(ctx context.Context, id string, dec HailDecisio
 // CountermandHail records the captain's countermand of hail id's decision
 // (spec/phase-3-plan-2026-10-29.md section 6): decided_by captain, decision,
 // rationale reason, countermanded_at now (read inside the transaction,
-// which also becomes entry's TS), entry appended to the captain's log, and
+// which also becomes entry's TS), entry appended to the ship's log, and
 // fn (nil-able) run, all in one transaction. decided_at,
 // original_decided_by, route, confidence and countermand_until are left
 // alone, so a second countermand within the same window is taken too. It
@@ -3130,7 +3130,7 @@ func hailClosedAway(ctx context.Context, tx *sql.Tx, id string) error {
 
 // TimeOutOpenHail moves hail id from open to timed_out and, only if that
 // update changed the row, sets its crew member and order back away
-// (hailClosedAway) and appends entry to the captain's log, all in one
+// (hailClosedAway) and appends entry to the ship's log, all in one
 // transaction. It reports whether it closed the hail. A hail that isn't open
 // (already timed out, or decided) is left alone and nothing is logged, so of
 // two callers racing to close the same hail exactly one logs, and a re-run
@@ -3188,7 +3188,7 @@ func (s *Store) TimeOutOpenHailWhy(ctx context.Context, id, why string, entry Lo
 }
 
 // UpdateOpenHail sets hail id's route (unless route is empty) and appends
-// entry to the captain's log, in one transaction, only while the hail is
+// entry to the ship's log, in one transaction, only while the hail is
 // open: the hail workflow's routing, reminder and timeout entries. It
 // reports whether the hail was open; a closed one is left alone and
 // nothing is logged. A missing hail returns sql.ErrNoRows.
@@ -3453,7 +3453,7 @@ func (s *Store) SetBeamRemoved(ctx context.Context, crewID, alias string, at tim
 	})
 }
 
-// LogEntry is a row of the append-only captain's log.
+// LogEntry is a row of the append-only ship's log.
 type LogEntry struct {
 	ID      int64
 	TS      time.Time
@@ -3464,7 +3464,7 @@ type LogEntry struct {
 	Payload json.RawMessage
 }
 
-// AppendLog appends an entry to the captain's log and returns its id. A zero TS
+// AppendLog appends an entry to the ship's log and returns its id. A zero TS
 // defaults to now. The log is append-only: nothing updates or deletes rows.
 func (s *Store) AppendLog(ctx context.Context, e LogEntry) (int64, error) {
 	var id int64
@@ -3523,7 +3523,7 @@ func (s *Store) appendLog(ctx context.Context, db execer, e LogEntry) (int64, er
 	return res.LastInsertId()
 }
 
-// ListLog returns the captain's log entries with id above sinceID, oldest
+// ListLog returns the ship's log entries with id above sinceID, oldest
 // first.
 func (s *Store) ListLog(ctx context.Context, sinceID int64) ([]LogEntry, error) {
 	return s.ListLogLimit(ctx, sinceID, 0)
@@ -3562,7 +3562,7 @@ func (s *Store) ListOrderLogKind(ctx context.Context, orderID, kind string) ([]L
 		orderID, kind)
 }
 
-// LastLogID returns the captain's log's last id, 0 when it is empty.
+// LastLogID returns the ship's log's last id, 0 when it is empty.
 func (s *Store) LastLogID(ctx context.Context) (int64, error) {
 	var id int64
 	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM log`).Scan(&id)
@@ -3663,7 +3663,7 @@ type InboxTx struct {
 // commits or rolls back together with the inbox row.
 func (t InboxTx) SQL() *sql.Tx { return t.tx }
 
-// AppendLog appends a captain's log entry within the transaction (see
+// AppendLog appends a ship's log entry within the transaction (see
 // Store.AppendLog).
 func (t InboxTx) AppendLog(e LogEntry) (int64, error) { return t.s.appendLog(t.ctx, t.tx, e) }
 
@@ -3899,7 +3899,7 @@ func isBusy(err error) bool {
 	return errors.As(err, &se) && se.Code()&0xff == sqlite3.SQLITE_BUSY
 }
 
-// SetLogHook makes the store hand fn the captain's log entries each
+// SetLogHook makes the store hand fn the ship's log entries each
 // successful commit appended, oldest first, after the commit and in the
 // committing goroutine (#72). Entries already in the log aren't handed
 // over. fn must not block: it holds up the writer and every other

@@ -146,7 +146,7 @@ func transporterWorkflow(ctx dbos.Context, in TransporterInput) (TransporterResu
 // removePrevious is the remove-previous step: if the crew member's latest
 // beam was created by an earlier tour and still exists, it removes it, so a
 // crew member holds at most one beam (spec §5). A failure to check or remove
-// it is logged, here and in the captain's log, and the beam is left to its
+// it is logged, here and in the ship's log, and the beam is left to its
 // TTL. A beam removed is logged "beam <alias> removed".
 func removePrevious(ctx context.Context, d *Daemon, in TransporterInput) error {
 	beams, err := d.store.ListBeams(ctx, in.CrewID)
@@ -162,7 +162,7 @@ func removePrevious(ctx context.Context, d *Daemon, in TransporterInput) error {
 
 // removeBeam removes crewID's beam b if it still exists, logging "beam
 // <alias> removed". A failure to check or remove it is logged, here and in
-// the captain's log ("beam <alias> not removed, left to its TTL: <err>"),
+// the ship's log ("beam <alias> not removed, left to its TTL: <err>"),
 // and the beam is left to its TTL; only ctx ending or the store fails it.
 // A beam removed or found gone gets its row's removed_at
 // (store.SetBeamRemoved); one left to its TTL keeps it NULL.

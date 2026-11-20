@@ -42,14 +42,14 @@ const (
 // are the bridge's JSON shapes, shared with its RPC results.
 type Source interface {
 	Actions
-	// Subscribe subscribes to the captain's log entries committed from
+	// Subscribe subscribes to the ship's log entries committed from
 	// now on.
 	Subscribe() *store.Subscription
 	// Snapshot reads the console's whole state.
 	Snapshot(ctx context.Context) (Snapshot, error)
 	// Status reads the bridge's status.
 	Status(ctx context.Context) (Status, error)
-	// LastLogID returns the captain's log's last id, 0 when it is empty.
+	// LastLogID returns the ship's log's last id, 0 when it is empty.
 	LastLogID(ctx context.Context) (int64, error)
 	// Log returns at most limit entries above sinceID, oldest first.
 	Log(ctx context.Context, sinceID int64, limit int) ([]store.LogEntry, error)

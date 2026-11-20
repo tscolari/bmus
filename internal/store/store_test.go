@@ -17,7 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// testEntry is the captain's log entry tests pass to a mutating method
+// testEntry is the ship's log entry tests pass to a mutating method
 // when the entry itself isn't what they check.
 var testEntry = LogEntry{Kind: "test", Text: "test"}
 
@@ -1225,7 +1225,7 @@ func rowsOf(t *testing.T, s *Store) map[string]string {
 }
 
 // Every store method that changes a row of crew, orders, hails or beams
-// appends its captain's log entry in the same transaction (#69): each call
+// appends its ship's log entry in the same transaction (#69): each call
 // that changes rows adds exactly one entry, the one it was given, naming
 // every row it changed, and a call that changes nothing adds none.
 func TestChangesLogInTheSameTransaction(t *testing.T) {

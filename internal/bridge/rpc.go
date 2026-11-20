@@ -156,7 +156,7 @@ type (
 	}
 	// OrderActionArgs are order.belay's, order.recall's and
 	// order.withdraw's args: the order's id and an optional reason, which
-	// goes into the captain's log (and, for belay and recall, to the
+	// goes into the ship's log (and, for belay and recall, to the
 	// beam). Each returns the order as an OrderView (belay as an
 	// OrderBelayResult): for belay and recall, as it is when the request
 	// is queued for the order's mission, which carries it out.

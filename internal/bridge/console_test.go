@@ -1267,7 +1267,7 @@ func TestConsoleActionTimeout(t *testing.T) {
 	var re *rpcError
 	require.ErrorAs(t, err, &re)
 	require.Equal(t, console.CodeTimeout, re.Code())
-	require.Equal(t, "push timed out after 1ms; it may have taken effect in part: see the captain's log", re.Error())
+	require.Equal(t, "push timed out after 1ms; it may have taken effect in part: see the ship's log", re.Error())
 }
 
 // The console's answer to a findings review (#157) reaches AnswerHail as

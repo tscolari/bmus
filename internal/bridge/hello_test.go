@@ -281,7 +281,7 @@ func TestTourReconnectHello(t *testing.T) {
 	require.Equal(t, 1, strings.Count(hd.logText(t), "crew on deck: combadge said hello"))
 }
 
-// logText joins the captain's log's texts, one per line.
+// logText joins the ship's log's texts, one per line.
 func (hd *hdaemon) logText(t require.TestingT) string {
 	var b strings.Builder
 	for _, e := range hd.logEntries(t) {

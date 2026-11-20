@@ -21,7 +21,7 @@ const (
 	TaskDropped   = "dropped"
 )
 
-// LogKindCampaign is the captain's log kind of a task's entries (SetTask).
+// LogKindCampaign is the ship's log kind of a task's entries (SetTask).
 const LogKindCampaign = "campaign"
 
 // TaskOrder is an order of a task that ended or split, as settleFamily

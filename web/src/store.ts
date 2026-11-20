@@ -1,6 +1,6 @@
 // The console's one store, fed by the change feed (#72): crew members,
 // orders and hails keyed by id, the bridge's status and the recent
-// captain's log. An order's progress is on its view (#141). A snapshot
+// ship's log. An order's progress is on its view (#141). A snapshot
 // replaces everything; a log entry is appended; an entity view replaces
 // the one with its id; a status replaces the status. There are no
 // optimistic updates: actions post and wait for the feed (console plan,

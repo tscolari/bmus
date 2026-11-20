@@ -6,7 +6,7 @@ import "sync"
 // by before it is dropped.
 const DefaultFeedBuffer = 256
 
-// Feed fans captain's log entries out to in-process subscribers (#72).
+// Feed fans ship's log entries out to in-process subscribers (#72).
 // The store's log hook feeds it (SetLogHook(ctx, feed.Publish, onErr)). Each
 // subscriber gets a bounded channel; Publish never blocks, and drops a
 // subscriber whose channel is full. A dropped subscriber catches up from

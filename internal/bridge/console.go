@@ -419,7 +419,7 @@ func (c consoleSource) actFor(timeout time.Duration, what string, f func(context
 		return nil, &rpcError{code: CodeShutdown, err: errors.New("bridge is shutting down")}
 	}
 	defer c.actions.leave()
-	return c.runFor(c.ctx, timeout, what, "; it may have taken effect in part: see the captain's log", f)
+	return c.runFor(c.ctx, timeout, what, "; it may have taken effect in part: see the ship's log", f)
 }
 
 // readFor runs read what as actFor runs an action, except that it takes

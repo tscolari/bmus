@@ -239,7 +239,7 @@ func (d *Daemon) createOrderAs(ctx context.Context, o store.Order, once bool) (i
 // ErrNotFound if it doesn't exist.
 //
 // The decision (hails.status = decided), the crew member back away, its
-// captain's log entry and the message to the mission commit in one store
+// ship's log entry and the message to the mission commit in one store
 // transaction, the comms pump's pattern
 // (dbos.WithSendTransaction): of two concurrent calls exactly one succeeds
 // and the other gets ErrHailClosed, and a decided hail always has its answer
@@ -445,7 +445,7 @@ func (d *Daemon) CountermandHail(ctx context.Context, hailID, decision string, o
 	return true, nil
 }
 
-// correctionDroppedEntry is the captain's log entry for a correction that
+// correctionDroppedEntry is the ship's log entry for a correction that
 // never reached the agent, and why.
 func correctionDroppedEntry(crewID, orderID, hailID, why string) (store.LogEntry, error) {
 	return logEntry(logHail, crewID, orderID, fmt.Sprintf("correction for hail %s not delivered: %s", hailID, why),

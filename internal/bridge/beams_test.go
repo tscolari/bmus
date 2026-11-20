@@ -127,7 +127,7 @@ func stepNames(t *testing.T, d *Daemon, id string) []string {
 	return names
 }
 
-// logTexts returns the texts of crewID's captain's log entries.
+// logTexts returns the texts of crewID's ship's log entries.
 func logTexts(t *testing.T, d *Daemon, crewID string) []string {
 	t.Helper()
 	entries, err := d.store.ListLog(t.Context(), 0)

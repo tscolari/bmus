@@ -497,7 +497,7 @@ func orderActionCmd[T any](a *app, use, rpc, short, long string, say func(T) str
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&reason, "reason", "", "why, for the captain's log")
+	cmd.Flags().StringVar(&reason, "reason", "", "why, for the ship's log")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print the order as JSON")
 	return cmd
 }

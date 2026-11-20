@@ -34,7 +34,7 @@ func tourResult(t *testing.T, d *Daemon, tourID string) CrewTourResult {
 	return res
 }
 
-// testEntry is the captain's log entry tests pass to a store method they
+// testEntry is the ship's log entry tests pass to a store method they
 // call directly.
 var testEntry = store.LogEntry{Kind: "test", Text: "test"}
 

@@ -45,7 +45,7 @@ const infoRegsNotConfigured = "regs.yaml not configured"
 //   - BeamsLive counts crew members with a current beam who are neither in
 //     sickbay nor dismissed. A crew member gets its beam once serve is up,
 //     and keeps the alias in sickbay and dismissed.
-//   - LastLogID is the captain's log's last id when these were read, 0 for
+//   - LastLogID is the ship's log's last id when these were read, 0 for
 //     an empty log.
 //   - Console is the console's address, "" when it is off.
 //   - StandingOrders is whether standing orders are on (#78): the
