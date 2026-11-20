@@ -859,6 +859,30 @@ func (g *campaignRig) belayCampaign() {
 	require.NoError(g.t, err)
 }
 
+// waitStepAfter waits until the task workflow has recorded a step named
+// next after its last step named first.
+func (g *campaignRig) waitStepAfter(first, next string) {
+	g.t.Helper()
+	require.Eventually(g.t, func() bool {
+		steps, err := dbos.GetWorkflowSteps(g.d.dbos, g.task)
+		if err != nil {
+			return false
+		}
+		last := -1
+		for i, s := range steps {
+			if s.StepName == first {
+				last = i
+			}
+		}
+		for _, s := range steps[last+1:] {
+			if last >= 0 && s.StepName == next {
+				return true
+			}
+		}
+		return false
+	}, 30*time.Second, 20*time.Millisecond)
+}
+
 // closeHail closes open hail id unanswered and wakes its raiser.
 func (g *campaignRig) closeHail(id string) {
 	g.t.Helper()
@@ -896,9 +920,14 @@ func TestCampaignBelayedReviewFilesVerdict(t *testing.T) {
 			if inTriage {
 				g.reviewDone(review.ID, "tuvok", c1, v)
 				h := g.waitHail(regs.CategoryCampaignTriage)
+				g.waitStepAfter("task-triage", "check-campaign")
 				g.belayCampaign()
 				g.closeHail(h.ID)
 			} else {
+				// Belay only once the task checked the campaign after
+				// creating the review, or the task drops at that check and
+				// withdraws the review before it can report.
+				g.waitStepAfter("create-review", "check-campaign")
 				g.belayCampaign()
 				g.reviewDone(review.ID, "tuvok", c1, v)
 			}
