@@ -1,10 +1,12 @@
 package bridge
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -317,4 +319,65 @@ func TestCampaignBelayHolodeck(t *testing.T) {
 		}
 	}
 	require.Equal(t, 1, n)
+}
+
+// A belay that commits while the task creates an order or raises a hail,
+// after the belay's sweep looked, is caught by the task's own check after
+// that step (#186). The hook sets the campaign belaying right after the
+// step, as a belay whose sweep found nothing yet would leave it: the
+// order is withdrawn or the hail closed timed out, and the task drops
+// with no stall hail, no second land hail and no push.
+func TestCampaignBelayRacesStep(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		step string
+		run  func(g *campaignRig)
+	}{
+		{"create-work", func(g *campaignRig) {
+			work := g.waitOrder("r1:work")
+			require.Equal(t, TaskResult{State: store.TaskDropped, Why: "campaign belayed"}, g.result())
+			require.Equal(t, store.OrderWithdrawn, getOrder(t, g.d, work.ID).State)
+		}},
+		{"task-stall-hail", func(g *campaignRig) {
+			work := g.waitOrder("r1:work")
+			g.claim(work.ID, "sorell")
+			g.fail(work.ID, "crew_error")
+			require.Equal(t, TaskResult{State: store.TaskDropped, Why: "campaign belayed"}, g.result())
+			hails, err := g.d.store.ListHails(t.Context(), "")
+			require.NoError(t, err)
+			require.Len(t, hails, 1)
+			require.Equal(t, []string{store.HailTimedOut, campaignBelayedWhy}, []string{hails[0].Status, hails[0].Rationale})
+		}},
+		{"task-land-hail", func(g *campaignRig) {
+			work, _ := g.pass()
+			require.Equal(t, TaskResult{State: store.TaskDropped, Why: "campaign belayed"}, g.result())
+			require.Equal(t, []string{"land-1"}, g.landHails())
+			hails, err := g.d.store.ListHails(t.Context(), store.HailTimedOut)
+			require.NoError(t, err)
+			require.Len(t, hails, 1)
+			require.Equal(t, campaignBelayedWhy, hails[0].Rationale)
+			require.Empty(t, g.remoteAt(testBranch))
+			require.Empty(t, g.pushes(work.ID))
+			g.requireNoStall()
+		}},
+	} {
+		t.Run(c.step, func(t *testing.T) {
+			t.Parallel()
+			var once sync.Once
+			g := newCampaignRig(t, campaignOpts{stepHook: func(d *Daemon, step string) {
+				if step != c.step {
+					return
+				}
+				once.Do(func() {
+					db, err := sql.Open("sqlite", filepath.Join(d.home, store.DBFile)+"?_pragma=busy_timeout(5000)")
+					if assert.NoError(t, err) {
+						defer db.Close()
+						_, err = db.Exec(`UPDATE campaigns SET state = 'belaying'`)
+						assert.NoError(t, err)
+					}
+				})
+			}})
+			c.run(g)
+		})
+	}
 }

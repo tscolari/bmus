@@ -454,7 +454,9 @@ type orderCreated struct {
 // nothing new, then writes the task's row with change applied and logs
 // text on the order (SetTask). direct, if set, picks the order's
 // assignee and division inside the step. A campaign being belayed creates
-// nothing and returns Belaying. A tracker error reading the
+// nothing and returns Belaying, and so does one found being belayed in
+// the check-campaign step after the insert (#186), with the order as
+// the task's open order for the caller's drop to end. A tracker error reading the
 // source retries like filing (trackerRetries) and then stalls
 // tracker_failed; an item the tracker can't find stalls tracker_failed at
 // once, and any other refusal, or another error past the step's
@@ -511,7 +513,44 @@ func (r *taskRun) createOrder(step string, o store.Order, direct func(context.Co
 	}
 	change(&t, out.ID)
 	r.t = t
+	if out.ID != "" {
+		// A belay that committed between the step's read of the campaign
+		// and its insert swept before the order existed: the task ends it
+		// itself, through the caller's drop.
+		r.stepHook(step)
+		belaying, err := r.belaying()
+		if err != nil {
+			return orderCreated{}, err
+		}
+		out.Belaying = belaying
+	}
 	return out, nil
+}
+
+// stepHook calls the daemon's taskStepHook, a test's, after step.
+func (r *taskRun) stepHook(step string) {
+	if d := daemonFrom(r.ctx); d.taskStepHook != nil {
+		d.taskStepHook(d, step)
+	}
+}
+
+// closeIfBelayed is the check after step recorded hail hailID as the
+// task's open hail (#186): when the campaign is being belayed, a belay
+// committed while the task raised the hail, and its sweep may have
+// missed it. close-belayed-hail then closes the hail timed out, as the
+// belay would have (closeBelayedHail), and the task's wait reads it as
+// closed undecided and drops the task. Belay commits belaying before it
+// sweeps, so either the sweep sees the hail or this check sees belaying.
+func (r *taskRun) closeIfBelayed(step, hailID string) error {
+	r.stepHook(step)
+	belaying, err := r.belaying()
+	if err != nil || !belaying {
+		return err
+	}
+	_, err = dbos.RunAsStep(r.ctx, func(c context.Context) (bool, error) {
+		return daemonFrom(c).closeBelayedHail(c, r.c.ID, hailID, "")
+	}, append([]dbos.StepOption{dbos.WithStepName("close-belayed-hail")}, storeRetries...)...)
+	return err
 }
 
 // orderEnd is how an order the task waited on ended: its state, and the
@@ -1176,6 +1215,9 @@ func (r *taskRun) triage(id string, v verdictRead, mediums []int) (campaignTriag
 	}, id, r.roundText(fmt.Sprintf("review %s waits on triage %s", id, hailID)), nil); err != nil {
 		return campaignTriage{}, false, err
 	}
+	if err := r.closeIfBelayed("task-triage", hailID); err != nil {
+		return campaignTriage{}, false, err
+	}
 	hl, err := awaitCampaignDecision(r.ctx, hailID)
 	if err != nil {
 		return campaignTriage{}, false, err
@@ -1324,6 +1366,9 @@ func (r *taskRun) stall(code, reason, order string, phase taskPhase, keyKind str
 			return phaseEnd, err
 		}
 		if err := r.setTask("task-stall-hail", func(t *store.CampaignTask) { t.OpenHail = hailID }, "", "", nil); err != nil {
+			return phaseEnd, err
+		}
+		if err := r.closeIfBelayed("task-stall-hail", hailID); err != nil {
 			return phaseEnd, err
 		}
 		hl, err := awaitCampaignDecision(r.ctx, hailID)
@@ -1609,6 +1654,9 @@ func (r *taskRun) askLand() (landResult, bool, error) {
 			t.State, t.OpenOrder, t.OpenHail, t.Why = store.TaskLanding, "", hailID, ""
 		}, r.t.Head, r.roundText(fmt.Sprintf("%s (%s) waits to land on %s: %s", r.t.Head, shortCommit(r.t.HeadCommit),
 			oneLine(r.t.Branch), hailID)), nil); err != nil {
+			return landResult{}, false, err
+		}
+		if err := r.closeIfBelayed("task-land-hail", hailID); err != nil {
 			return landResult{}, false, err
 		}
 		hl, err := awaitCampaignDecision(r.ctx, hailID)

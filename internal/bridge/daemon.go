@@ -207,6 +207,10 @@ type Config struct {
 	taskRecheck time.Duration
 	// landBackoff, if set, replaces defaultLandBackoff (#185).
 	landBackoff time.Duration
+	// taskStepHook, if set, is called by a campaign task after each step
+	// that gives it a new open order or hail, before it checks whether
+	// its campaign is being belayed (#186).
+	taskStepHook func(d *Daemon, step string)
 }
 
 // MaxHailParkAfter is the longest Config.HailParkAfter: combadge serve's
@@ -375,6 +379,8 @@ type Daemon struct {
 	// landBackoff is land-push's first wait before a retry, doubled on
 	// each (#185).
 	landBackoff time.Duration
+	// taskStepHook is Config's.
+	taskStepHook func(d *Daemon, step string)
 }
 
 // daemonKey is the context key under which the Daemon travels to workflows.
@@ -546,6 +552,7 @@ func Run(ctx context.Context, cfg Config) (err error) {
 		trackerRetries:    cfg.trackerRetries,
 		taskRecheck:       cmp.Or(cfg.taskRecheck, defaultTaskRecheck),
 		landBackoff:       cmp.Or(cfg.landBackoff, defaultLandBackoff),
+		taskStepHook:      cfg.taskStepHook,
 		maxBundleBytes:    cmp.Or(cfg.MaxBundleBytes, DefaultMaxBundleBytes),
 		divisions:         maps.Clone(cfg.Divisions), limits: roster.Transporter,
 		standingOrdersDefault: cfg.StandingOrders, wakeSend: cfg.wakeSend,

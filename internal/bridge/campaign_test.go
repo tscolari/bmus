@@ -54,6 +54,8 @@ type campaignOpts struct {
 	// noCampaign leaves the campaign and its task out: the test starts
 	// one with campaign.run (#186).
 	noCampaign bool
+	// stepHook is the bridge's taskStepHook.
+	stepHook func(d *Daemon, step string)
 }
 
 const testCampaign = "C-0001"
@@ -105,6 +107,7 @@ func newCampaignRig(t *testing.T, o campaignOpts) *campaignRig {
 	g.cfg.StandingOrders = true
 	g.cfg.taskRecheck = 300 * time.Millisecond
 	g.cfg.landBackoff = 10 * time.Millisecond
+	g.cfg.taskStepHook = o.stepHook
 	g.cfg.trackerRetries = []dbos.StepOption{dbos.WithStepMaxRetries(2), dbos.WithStepBaseInterval(10 * time.Millisecond),
 		dbos.WithStepMaxInterval(50 * time.Millisecond)}
 	if o.regs != nil {

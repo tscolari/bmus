@@ -426,12 +426,14 @@ func (d *Daemon) showCampaign(ctx context.Context, id string) (CampaignShowResul
 // and drops itself with no stall hail. Then, for each task that hasn't
 // landed or been dropped, each in a transaction of its own: every open
 // hail the task raised is closed timed out with "campaign belayed" as its
-// rationale (store.TimeOutOpenHailWhy, waking the task and the hail's
-// workflow with notifyHailClosed), and every open order of the task is
+// rationale (closeBelayedHail), and every open order of the task is
 // withdrawn when unclaimed or belayed otherwise (endTaskOrderHow). The
 // task's row names one open hail and order; the call looks at all the
-// task raised and created, which also covers one the task raised but had
-// not yet written to its row. A campaign already belaying is swept again
+// task raised and created. An order or hail the task makes after this
+// sweep is the task's to end: it checks the campaign after each step
+// that gives it one (createOrder, closeIfBelayed), and since belaying
+// commits before the sweep, one side always sees the other. A campaign
+// already belaying is swept again
 // and logs nothing new for itself; one that ended is a bad request.
 func (d *Daemon) belayCampaign(ctx context.Context, a CampaignBelayArgs) (CampaignBelayResult, error) {
 	c, err := d.getCampaign(ctx, a.ID)
@@ -474,13 +476,7 @@ func (d *Daemon) belayCampaign(ctx context.Context, a CampaignBelayArgs) (Campai
 			if h.DeliverTo != t.WorkflowID {
 				continue
 			}
-			he, err := logEntry(logHail, "", "", "hail "+h.ID+" closed: "+why, map[string]string{"hail_id": h.ID,
-				"campaign": c.ID})
-			if err != nil {
-				return CampaignBelayResult{}, err
-			}
-			closed, err := d.store.TimeOutOpenHailWhy(ctx, h.ID, campaignBelayedWhy, he,
-				func(tx *sql.Tx) error { return d.notifyHailClosed(tx, h.ID) })
+			closed, err := d.closeBelayedHail(ctx, c.ID, h.ID, reason)
 			if err != nil {
 				return CampaignBelayResult{}, fmt.Errorf("close hail %s: %w", h.ID, err)
 			}
@@ -509,4 +505,23 @@ func (d *Daemon) belayCampaign(ctx context.Context, a CampaignBelayArgs) (Campai
 		return CampaignBelayResult{}, err
 	}
 	return res, nil
+}
+
+// closeBelayedHail closes open hail id of campaign campaignID's task timed
+// out with the rationale "campaign belayed", logs "hail H-0007 closed:
+// campaign C-0001 belayed[: reason]" and wakes the task and the hail's
+// workflow (notifyHailClosed), in one transaction. A hail already closed
+// is left alone. It reports whether it closed the hail. campaign.belay's
+// sweep and the task's own check after a raise (closeIfBelayed) call it.
+func (d *Daemon) closeBelayedHail(ctx context.Context, campaignID, id, reason string) (bool, error) {
+	text := "hail " + id + " closed: campaign " + campaignID + " belayed"
+	if reason != "" {
+		text += ": " + reason
+	}
+	entry, err := logEntry(logHail, "", "", text, map[string]string{"hail_id": id, "campaign": campaignID})
+	if err != nil {
+		return false, err
+	}
+	return d.store.TimeOutOpenHailWhy(ctx, id, campaignBelayedWhy, entry,
+		func(tx *sql.Tx) error { return d.notifyHailClosed(tx, id) })
 }
