@@ -103,6 +103,8 @@ func TestCampaignRunRefusals(t *testing.T) {
 
 	// The issue in an open task: the first run holds it.
 	require.NoError(t, call(t, g.home, "campaign.run", g.runArgs(), nil))
+	// Round 1's work order, created by the task, is in before the counts.
+	g.waitOpenOrder(g.waitOrder("r1:work").ID)
 	before := g.counts()
 	re = requireRPCError(t, call(t, g.home, "campaign.run", g.runArgs(), nil), CodeBadRequest)
 	require.Equal(t, g.ref+" is already in campaign C-0001's open task", re.Message)
