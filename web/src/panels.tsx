@@ -20,6 +20,7 @@ import {
   withdrawOrder,
   ApiError,
   type BridgeStatus,
+  type CampaignFinding,
   type CrewView,
   type HailView,
   type OrderView,
@@ -32,7 +33,19 @@ import {
   awayOrders,
   belayPrompt,
   bridgeHailOrder,
+  campaignHailMeta,
+  campaignOrderText,
   canPush,
+  choiceDecision,
+  commitsText,
+  findingPlace,
+  isCampaignHail,
+  landContext,
+  optionIndex,
+  dropPrompt,
+  shortCommit,
+  stalledContext,
+  triageFindings,
   canTake,
   clockHM,
   countermandableHails,
@@ -47,6 +60,7 @@ import {
   currentOrder,
   divisionInfo,
   composerRepo,
+  categoryCampaignTriage,
   hailKind,
   issuesText,
   issueURL,
@@ -701,8 +715,21 @@ export function HailsPanel(props: { state: State; csrf: string }) {
               return <ReviewCard key={h.id} hail={h} repoUrls={props.state.repoUrls} csrf={props.csrf} />;
             case "triage":
               return <TriageCard key={h.id} hail={h} />;
+            case "land":
+              return <LandCard key={h.id} hail={h} repoUrls={props.state.repoUrls} csrf={props.csrf} />;
+            case "stalled":
+              return <StalledCard key={h.id} hail={h} repoUrls={props.state.repoUrls} csrf={props.csrf} />;
             default:
-              return <HailCard key={h.id} hail={h} crew={props.state.crew.get(h.crew_id)} order={props.state.order.get(h.order_id)} csrf={props.csrf} />;
+              return (
+                <HailCard
+                  key={h.id}
+                  hail={h}
+                  crew={props.state.crew.get(h.crew_id)}
+                  order={props.state.order.get(h.order_id)}
+                  repoUrls={props.state.repoUrls}
+                  csrf={props.csrf}
+                />
+              );
           }
         })}
       </div>
@@ -716,13 +743,23 @@ export function HailsPanel(props: { state: State; csrf: string }) {
  * of its own to belay, so it has no belay control, and its meta line
  * names the bridge and the order it is about instead of a crew member.
  */
-export function HailCard(props: { hail: HailView; crew: CrewView | undefined; order: OrderView | undefined; csrf: string }) {
+export function HailCard(props: {
+  hail: HailView;
+  crew: CrewView | undefined;
+  order: OrderView | undefined;
+  csrf: string;
+  repoUrls?: Readonly<Record<string, string>>;
+}) {
   const { hail: h } = props;
   const [pending, setPending] = useState(false);
   const [sent, setSent] = useState(false);
   const [error, setError] = useState("");
   const [decision, setDecision] = useState("");
-  const ctx = contextText(h.context);
+  // A campaign triage (#187) shows its numbered mediums for the JSON form,
+  // and takes a decision beside its options.
+  const triage = h.deliver_to !== undefined && h.category === categoryCampaignTriage;
+  const findings = triage ? triageFindings(h) : [];
+  const ctx = triage ? "" : contextText(h.context);
 
   const answer = async (args: { option?: number; decision?: string }) => {
     if (pending || sent) return;
@@ -749,17 +786,19 @@ export function HailCard(props: { hail: HailView; crew: CrewView | undefined; or
       <div id={`${cardId}-meta`} class="mono hail-meta">
         {meta.join(" · ")}
       </div>
+      {triage && <CampaignIssue hail={h} repoUrls={props.repoUrls ?? {}} />}
       <p id={`${cardId}-q`} class="hail-q">
         "{h.question}"
       </p>
       {ctx && <p class="mono hail-ctx">{ctx}</p>}
+      {triage && <FindingList findings={findings} label="Medium findings" />}
       <div class="btns">
         {h.options.map((opt, i) => (
           <button type="button" key={i} class={i === 0 ? "btn blue" : "btn blue-o"} disabled={busy} onClick={() => void answer({ option: i })}>
             {opt}
           </button>
         ))}
-        {h.options.length === 0 && (
+        {(h.options.length === 0 || triage) && (
           <form
             class="decide"
             onSubmit={(e) => {
@@ -768,13 +807,13 @@ export function HailCard(props: { hail: HailView; crew: CrewView | undefined; or
             }}
           >
             <label for={`decide-${h.id}`} class="sr-only">
-              Decision for {h.id}
+              {triage ? `Decision for ${h.id}, as a JSON object of finding numbers` : `Decision for ${h.id}`}
             </label>
             <input
               id={`decide-${h.id}`}
-              class="field"
+              class="field mono"
               type="text"
-              placeholder="Your decision"
+              placeholder={triage ? '{"fix": [1], "file": [2], "drop": [3]}' : "Your decision"}
               value={decision}
               disabled={busy}
               onInput={(e) => setDecision(e.currentTarget.value)}
@@ -807,6 +846,7 @@ export function HailCard(props: { hail: HailView; crew: CrewView | undefined; or
 
 /** A bridge hail's meta line: its id, the bridge, and the order it is about (whose findings, for the findings hails), when it names one. */
 function bridgeHailMeta(h: HailView): string[] {
+  if (isCampaignHail(h)) return campaignHailMeta(h);
   const order = bridgeHailOrder(h);
   if (!order) return [h.id, "Bridge"];
   return [h.id, "Bridge", hailKind(h) === "bridge" ? order : `findings of ${order}`];
@@ -1064,6 +1104,308 @@ export function ReviewCard(props: { hail: HailView; repoUrls: Readonly<Record<st
   );
 }
 
+/* Campaign hails (#187) ---------------------------------------------------- */
+
+/**
+ * One answer at a time for a hail card: answer sends and shows "Answer
+ * sent" (focused, in a live region); confirmed is a ConfirmAction's run,
+ * which shows its own note and refusal. While either is pending or sent,
+ * busy holds.
+ */
+function useHailAnswer(csrf: string, hailId: string) {
+  const [pending, setPending] = useState(false);
+  const [sent, setSent] = useState<ReviewSent>("");
+  const [error, setError] = useState("");
+  const resultRef = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (sent === "answer") resultRef.current?.focus();
+  }, [sent]);
+  const answer = async (args: { option?: number; decision?: string }) => {
+    if (pending || sent) return;
+    setPending(true);
+    setError("");
+    try {
+      await answerHail(csrf, hailId, args);
+      setSent("answer"); // the feed closes the hail
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setPending(false);
+    }
+  };
+  const confirmed = async (args: { option?: number; decision?: string }) => {
+    setPending(true);
+    setError("");
+    try {
+      await answerHail(csrf, hailId, args);
+      setSent("confirmed");
+    } finally {
+      setPending(false);
+    }
+  };
+  return { busy: pending || sent !== "", sent, error, resultRef, answer, confirmed };
+}
+
+/** The result line and refusal under a hail card's buttons. */
+function AnswerResult(props: { sent: ReviewSent; error: string; resultRef: { current: HTMLParagraphElement | null } }) {
+  return (
+    <>
+      <div role="status" aria-live="polite">
+        {props.sent === "answer" && (
+          <p ref={props.resultRef} class="notice" tabIndex={-1}>
+            Answer sent. Waiting for the bridge.
+          </p>
+        )}
+      </div>
+      {props.error && (
+        <p class="error" role="alert">
+          {props.error}
+        </p>
+      )}
+    </>
+  );
+}
+
+/** A campaign hail's task: its ref, linked where issueURL can tell the address, and the issue's title as text. */
+function CampaignIssue(props: { hail: HailView; repoUrls: Readonly<Record<string, string>> }) {
+  const c = landContext(props.hail);
+  if (c.task === "" && c.issue_title === "") return null;
+  const url = c.task ? issueURL(c.task, props.repoUrls) : undefined;
+  return (
+    <p class="camp-issue">
+      {c.task &&
+        (url ? (
+          <a class="mono camp-ref" href={url} target="_blank" rel="noopener noreferrer">
+            {c.task}
+          </a>
+        ) : (
+          <span class="mono camp-ref">{c.task}</span>
+        ))}
+      {c.issue_title && <span class="camp-title">{c.issue_title}</span>}
+    </p>
+  );
+}
+
+/** A review's numbered findings: number, severity, title, place and body, all as text. */
+export function FindingList(props: { findings: readonly CampaignFinding[]; label: string }) {
+  if (props.findings.length === 0) return null;
+  return (
+    <section class="camp-findings" aria-label={props.label}>
+      <h3 class="camp-sub">
+        {props.label}: {props.findings.length}
+      </h3>
+      <ol class="camp-list">
+        {props.findings.map((f) => (
+          <li key={f.n} class={`camp-finding sev-${f.severity === "high" || f.severity === "medium" || f.severity === "low" ? f.severity : "other"}`}>
+            <span class="review-n mono">{f.n}</span>
+            <span class="camp-sev mono">{f.severity}</span>
+            <span class="camp-ftitle">{f.title}</span>
+            {findingPlace(f) && <span class="camp-place mono">{findingPlace(f)}</span>}
+            {f.body && <p class="camp-body">{f.body}</p>}
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
+/**
+ * A land or stall hail's options: the land option alone, retry with a
+ * note field (`retry: <note>`, or the option alone with no note), and
+ * drop behind a confirm. An option the hail lacks has no control: a stall
+ * with no head offers no land.
+ */
+function CampaignChoices(props: {
+  hail: HailView;
+  cardId: string;
+  labels: { land: string; retry: string };
+  dropPrompt: string;
+  answer: ReturnType<typeof useHailAnswer>;
+}) {
+  const { hail: h, cardId, answer: a } = props;
+  const [note, setNote] = useState("");
+  const land = optionIndex(h, "land");
+  const retry = optionIndex(h, "retry");
+  const drop = optionIndex(h, "drop");
+  const noteId = `${cardId}-note`;
+  return (
+    <div class="camp-actions">
+      {retry >= 0 && (
+        <div class="camp-note">
+          <label for={noteId} class="camp-note-label">
+            Note for {props.labels.retry.toLowerCase()}
+          </label>
+          <input
+            id={noteId}
+            class="field"
+            type="text"
+            placeholder="Optional: what the next round should know"
+            value={note}
+            disabled={a.busy}
+            onInput={(e) => setNote(e.currentTarget.value)}
+          />
+        </div>
+      )}
+      <div class="btns">
+        {land >= 0 && (
+          <button type="button" class="btn blue" disabled={a.busy} onClick={() => void a.answer({ option: land })}>
+            {props.labels.land}
+          </button>
+        )}
+        {retry >= 0 && (
+          <button
+            type="button"
+            class="btn blue-o"
+            disabled={a.busy}
+            aria-describedby={noteId}
+            onClick={() => {
+              const d = choiceDecision("retry", note);
+              void a.answer(d === "retry" ? { option: retry } : { decision: d });
+            }}
+          >
+            {props.labels.retry}
+          </button>
+        )}
+        {drop >= 0 && (
+          <ConfirmAction
+            idBase={`${cardId}-drop`}
+            label="Drop"
+            ariaLabel={`Drop the task of ${h.id}`}
+            prompt={props.dropPrompt}
+            confirmLabel="Drop"
+            disabled={a.busy}
+            run={() => a.confirmed({ option: drop })}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * A campaign_land hail (#187): the task's ref and issue title, where the
+ * head lands (repo and branch), the head and review base, the commits
+ * over the base and the last review's summary. A land Command decided on
+ * a stall has no passing review (#185), and the card says so above the
+ * summary. "Land" sends option 0, "Another round" retry with the note,
+ * and "Drop" asks first. Every subject, title and summary is agent or
+ * tracker text, rendered as text.
+ */
+export function LandCard(props: { hail: HailView; repoUrls: Readonly<Record<string, string>>; csrf: string }) {
+  const { hail: h } = props;
+  const c = landContext(h);
+  const a = useHailAnswer(props.csrf, h.id);
+  const cardId = hailCardId(h.id);
+  const more = c.commit_count - c.commits.length;
+  return (
+    <div id={cardId} class="row hail camp land" tabIndex={-1} role="group" aria-labelledby={`${cardId}-meta ${cardId}-q`} aria-busy={a.busy}>
+      <div id={`${cardId}-meta`} class="mono hail-meta">
+        {campaignHailMeta(h).join(" · ")}
+      </div>
+      <CampaignIssue hail={h} repoUrls={props.repoUrls} />
+      <p id={`${cardId}-q`} class="hail-q">
+        "{h.question}"
+      </p>
+      <dl class="facts camp-facts">
+        <dt>Branch</dt>
+        <dd class="mono">
+          {c.repo && `${c.repo}: `}
+          {c.branch}
+        </dd>
+        <dt>Head</dt>
+        <dd class="mono">
+          {c.head}
+          {c.head_commit && ` at ${shortCommit(c.head_commit)}`}
+        </dd>
+        <dt>Review base</dt>
+        <dd class="mono">{shortCommit(c.review_base)}</dd>
+        {c.rounds > 0 && (
+          <>
+            <dt>Rounds</dt>
+            <dd class="mono">{c.rounds}</dd>
+          </>
+        )}
+      </dl>
+      <section class="camp-commits" aria-label="Commits">
+        <h3 class="camp-sub">{commitsText(c.commit_count)} over the review base</h3>
+        <ul class="camp-list">
+          {c.commits.map((cm) => (
+            <li key={cm.sha} class="camp-commit">
+              <span class="mono camp-sha">{shortCommit(cm.sha)}</span>
+              <span class="camp-subject">{cm.subject}</span>
+            </li>
+          ))}
+        </ul>
+        {more > 0 && <p class="mono hail-ctx">and {more} more</p>}
+      </section>
+      <section class={`camp-review${c.passed ? " passed" : " unpassed"}`} aria-label="Review">
+        <h3 class="camp-sub">
+          {c.passed ? `Review ${c.review} passed` : c.review ? `No passing review: ${c.review} was the last` : "No review yet"}
+        </h3>
+        {!c.passed && <p class="camp-warn">This work has no passing review.</p>}
+        {c.review_summary !== "" && <p class="camp-summary">{c.review_summary}</p>}
+      </section>
+      <CampaignChoices
+        hail={h}
+        cardId={cardId}
+        labels={{ land: "Land", retry: "Another round" }}
+        dropPrompt={dropPrompt(c)}
+        answer={a}
+      />
+      <AnswerResult sent={a.sent} error={a.error} resultRef={a.resultRef} />
+    </div>
+  );
+}
+
+/**
+ * A campaign_stalled hail (#187): the task, the stall's code and reason,
+ * the round of its max, the head and the order it stalled on, and the
+ * last review's blocking findings, then the hail's options: land (only
+ * with a head), retry with a note and drop behind a confirm.
+ */
+export function StalledCard(props: { hail: HailView; repoUrls: Readonly<Record<string, string>>; csrf: string }) {
+  const { hail: h } = props;
+  const c = stalledContext(h);
+  const a = useHailAnswer(props.csrf, h.id);
+  const cardId = hailCardId(h.id);
+  return (
+    <div id={cardId} class="row hail camp stalled" tabIndex={-1} role="group" aria-labelledby={`${cardId}-meta ${cardId}-q`} aria-busy={a.busy}>
+      <div id={`${cardId}-meta`} class="mono hail-meta">
+        {campaignHailMeta(h).join(" · ")}
+      </div>
+      <CampaignIssue hail={h} repoUrls={props.repoUrls} />
+      <p id={`${cardId}-q`} class="hail-q">
+        "{h.question}"
+      </p>
+      <p class="camp-reason">
+        {c.code && <span class="chip-o tone-red mono">{c.code}</span>}
+        {c.reason && <span class="camp-why">{c.reason}</span>}
+      </p>
+      <dl class="facts camp-facts">
+        <dt>Round</dt>
+        <dd class="mono">{c.max_rounds > 0 ? `${c.round} of ${c.max_rounds}` : c.round}</dd>
+        <dt>Head</dt>
+        <dd class="mono">{c.head ? `${c.head}${c.head_commit ? ` at ${shortCommit(c.head_commit)}` : ""}` : "none yet"}</dd>
+        {c.order && (
+          <>
+            <dt>Stalled on</dt>
+            <dd class="mono">{c.order}</dd>
+          </>
+        )}
+      </dl>
+      <FindingList findings={c.blocking} label="Blocking findings" />
+      <CampaignChoices
+        hail={h}
+        cardId={cardId}
+        labels={{ land: "Land as it is", retry: "Retry" }}
+        dropPrompt={dropPrompt(c)}
+        answer={a}
+      />
+      <AnswerResult sent={a.sent} error={a.error} resultRef={a.resultRef} />
+    </div>
+  );
+}
+
 /* Countermand ----------------------------------------------------------- */
 
 /**
@@ -1245,6 +1587,7 @@ export function OpenOrdersPanel(props: { state: State; csrf: string }) {
                 <span class="row-state">{openOrderState(o)}</span>
               </div>
               <div class="order-title">{o.title}</div>
+              {campaignOrderText(o) && <div class="mono order-task">{campaignOrderText(o)}</div>}
               <div class="row-actions">
                 <RouteControl key={routeValue(o)} state={props.state} order={o} csrf={props.csrf} />
                 <ConfirmAction
