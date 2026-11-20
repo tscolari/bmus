@@ -27,7 +27,7 @@ func (g *campaignRig) runArgs() CampaignRunArgs {
 }
 
 // counts are the rows of the campaign tables and of orders, and the
-// campaign entries in the captain's log.
+// campaign entries in the ship's log.
 func (g *campaignRig) counts() [4]int {
 	g.t.Helper()
 	var n [4]int

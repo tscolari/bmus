@@ -94,7 +94,7 @@ func stepIndexes(steps []step, order string) []int {
 	return out
 }
 
-// logEntries returns the whole captain's log, through `log tail --json`.
+// logEntries returns the whole ship's log, through `log tail --json`.
 func (e *e2e) logEntries(t require.TestingT) []bridge.LogEntryView {
 	var out []bridge.LogEntryView
 	sc := bufio.NewScanner(strings.NewReader(e.run(t, "log", "tail", "--json")))

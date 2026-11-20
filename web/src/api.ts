@@ -158,7 +158,7 @@ export interface ReviewContext {
   readonly failed: readonly ReviewFailed[];
 }
 
-/** A captain's log entry: bridge.LogEntryView. */
+/** A ship's log entry: bridge.LogEntryView. */
 export interface LogEntryView {
   readonly id: number;
   /** RFC 3339, UTC. */

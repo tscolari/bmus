@@ -2087,7 +2087,7 @@ func recordHailAs(ctx context.Context, d *Daemon, in MissionInput, body comms.Ha
 	}, entry)
 }
 
-// hailDecidedEntry is the captain's log entry for a decision on a hail,
+// hailDecidedEntry is the ship's log entry for a decision on a hail,
 // with its rationale when it has one.
 func hailDecidedEntry(crewID, orderID string, body comms.AnswerBody) (store.LogEntry, error) {
 	payload := map[string]any{"hail_id": body.HailID, "decided_by": body.DecidedBy, "decision": body.Decision, "option": body.Option}
@@ -2374,7 +2374,7 @@ func (d *Daemon) pullWip(ctx context.Context, beam transporter.Beam, seq uint64,
 	return nil, nil
 }
 
-// logEntry builds a captain's log entry with payload marshalled to JSON
+// logEntry builds a ship's log entry with payload marshalled to JSON
 // (nil means {}; a json.RawMessage goes in as is).
 func logEntry(kind, crewID, orderID, text string, payload any) (store.LogEntry, error) {
 	var raw json.RawMessage
@@ -2392,7 +2392,7 @@ func logEntry(kind, crewID, orderID, text string, payload any) (store.LogEntry, 
 	return store.LogEntry{Kind: kind, CrewID: crewID, OrderID: orderID, Text: text, Payload: raw}, nil
 }
 
-// appendLog appends a captain's log entry with payload marshalled to JSON
+// appendLog appends a ship's log entry with payload marshalled to JSON
 // (nil means {}; a json.RawMessage goes in as is).
 func (d *Daemon) appendLog(ctx context.Context, kind, crewID, orderID, text string, payload any) error {
 	var raw json.RawMessage

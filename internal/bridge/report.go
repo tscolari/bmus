@@ -2,7 +2,7 @@ package bridge
 
 // The console's mission report (#104): a done order, the crew member and
 // beams that ran it, its report, its pushes and its diff, read from the
-// store, the captain's log and the bridge's clone.
+// store, the ship's log and the bridge's clone.
 
 import (
 	"context"

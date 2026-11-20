@@ -42,7 +42,7 @@ A ticked item works on `main`. The plan behind it is in [`spec/initial-plan-2026
 - [x] Give an order to a named crew member
 - [x] Ship the order's repo into the beam and get the finished work back as a local branch
 - [x] Answer the crew's hails from the CLI
-- [x] Follow everything in the captain's log
+- [x] Follow everything in the ship's log
 - [x] Check the ship's condition with `bmus status`
 - [x] Pick the harness and model per crew member
 - [x] Restart the bridge mid-mission and the mission completes
@@ -165,7 +165,7 @@ The body is the agent's task, so give it real work. The agent commits on `bmus/<
 
 The bridge needs your `tsh` login to stay valid. `bmus status` turns yellow 30 minutes before the login expires (`tsh login expires in <n>m`). From 2 minutes before the expiry (`tsh login expired`), the bridge runs no new `tsh` command until you run `tsh login`. Crew members stay on deck and claim no new orders. Provisioning and an order's transfers to and from its beam wait: a crew member whose tour waits for a beam stays `beaming_in`, and `bmus status` says so (`1 crew waiting for a beam (tsh login)`). A crew member whose connection was already open can still report back, and the bridge pulls its work once you log in. Work resumes within a minute or two of logging in.
 
-To push a done order's work, run `./bmus order push ORD-0001`. The bridge pushes `bmus/<order>` from its clone to the repo's registered URL with your own git config and credentials, to `bmus/<order>` or `--target-branch <name>`. It refuses an order that isn't done or whose work wasn't fetched at the reported commit. `--force` overwrites a target branch that has diverged. Each push goes into the captain's log.
+To push a done order's work, run `./bmus order push ORD-0001`. The bridge pushes `bmus/<order>` from its clone to the repo's registered URL with your own git config and credentials, to `bmus/<order>` or `--target-branch <name>`. It refuses an order that isn't done or whose work wasn't fetched at the reported commit. `--force` overwrites a target branch that has diverged. Each push goes into the ship's log.
 
 An order may name a `division` instead of an `assignee`. It then waits in that division's pool, and while standing orders are on, the next idle crew member of the division claims it. `priority: routine|yellow|red` (default routine) decides which order is claimed first, and `bmus status` stays red while a red order is open.
 
@@ -209,7 +209,7 @@ An order nobody has started yet (in the pool or directed, never claimed, with no
 ./bmus order after ORD-0003 --add ORD-0004 --remove ORD-0001
 ```
 
-`order rebase` sets the repo's `base_ref`. A new `order:<id>` base is checked as at create and replaces the order the old base put in `after`; a plain ref drops that wait, and the order's other `after` entries stay. `order after` adds and removes waits by id, and refuses to remove the one a base of `order:<id>` implies. Both refuse an order a crew member has started, an order that ended or was split, and a change that would make the order wait on itself or on one of its own dependents. A started order's work is built on its old base. Each change is one entry in the captain's log, and the console's open orders show the new base and wait at once. Command can ask for the same changes with its `reorder_orders` tool: you get an `order_reorder` hail showing each order's current and proposed base and wait, and once you allow it the bridge applies each change it still can, skipping and naming any order a crew member has claimed meanwhile. Like any hail from Command it is yours to answer. The default `regs.yaml` lists `order_reorder` under `captain_only`, so `on_timeout: default_option` never decides one; drop that rule to let it. A reorder allowed that way waits out its countermand window before the bridge applies anything.
+`order rebase` sets the repo's `base_ref`. A new `order:<id>` base is checked as at create and replaces the order the old base put in `after`; a plain ref drops that wait, and the order's other `after` entries stay. `order after` adds and removes waits by id, and refuses to remove the one a base of `order:<id>` implies. Both refuse an order a crew member has started, an order that ended or was split, and a change that would make the order wait on itself or on one of its own dependents. A started order's work is built on its old base. Each change is one entry in the ship's log, and the console's open orders show the new base and wait at once. Command can ask for the same changes with its `reorder_orders` tool: you get an `order_reorder` hail showing each order's current and proposed base and wait, and once you allow it the bridge applies each change it still can, skipping and naming any order a crew member has claimed meanwhile. Like any hail from Command it is yours to answer. The default `regs.yaml` lists `order_reorder` under `captain_only`, so `on_timeout: default_option` never decides one; drop that rule to let it. A reorder allowed that way waits out its countermand window before the bridge applies anything.
 
 To change course on an order:
 

@@ -70,7 +70,7 @@ func hailResult(t *testing.T, d *Daemon, id string) HailResult {
 	return res
 }
 
-// waitLog waits for a captain's log entry whose text starts with prefix
+// waitLog waits for a ship's log entry whose text starts with prefix
 // and returns it.
 func (hd *hdaemon) waitLog(t *testing.T, prefix string) store.LogEntry {
 	t.Helper()

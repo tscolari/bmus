@@ -2152,7 +2152,7 @@ export function StandingOrdersSwitch(props: { status: BridgeStatus | undefined; 
   );
 }
 
-/* Captain's log --------------------------------------------------------- */
+/* Ship's log --------------------------------------------------------- */
 
 export function LogPanel(props: { state: State; dispatch: (a: Action) => void }) {
   const { state } = props;
@@ -2178,9 +2178,9 @@ export function LogPanel(props: { state: State; dispatch: (a: Action) => void })
   return (
     <section class="panel area-log" aria-labelledby="log-h">
       <Heading id="log-h" tone="blue">
-        Captain's log
+        Ship's log
       </Heading>
-      <ol class="log" tabIndex={0} aria-label="Captain's log, newest first">
+      <ol class="log" tabIndex={0} aria-label="Ship's log, newest first">
         {entries.map((e) => {
           const t = logTag(e.kind);
           const who = [e.crew_id ? shortName(e.crew_id) : "", e.order_id].filter(Boolean).join(" ");

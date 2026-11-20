@@ -224,7 +224,7 @@ type FindingTriage struct {
 // entry as written once per order (appendOnce).
 const findingsOnce = "findings_once"
 
-// appendOnce appends entries to the captain's log in tx, each with once in
+// appendOnce appends entries to the ship's log in tx, each with once in
 // its payload, unless order id's log already holds an entry marked once.
 // It reports whether it wrote them. A step that re-runs after its
 // transaction committed then writes nothing twice.
@@ -263,7 +263,7 @@ func (s *Store) AppendLogOnce(ctx context.Context, id, once string, entries ...L
 const TriageOnce = "triage"
 
 // TriageFindings applies Command's triage to order id's findings that are
-// still new, and appends entry to the captain's log, in one transaction
+// still new, and appends entry to the ship's log, in one transaction
 // (#155). A dropped finding becomes FindingDropped with its Why and
 // DuplicateOf; added blockers join its blocked_by, each once. It runs once
 // per order: the entry is marked TriageOnce, and with one already in the
@@ -328,7 +328,7 @@ func (s *Store) SetFindingRefIn(ctx context.Context, id, key, ref, state string)
 
 // SettleFinding moves finding key of order id from new to state (filed or
 // failed), with why and, when not empty, ref, and appends entries to the
-// captain's log, in one transaction (#155). It reports whether the
+// ship's log, in one transaction (#155). It reports whether the
 // finding was still new; one that wasn't is left alone and nothing is
 // logged.
 func (s *Store) SettleFinding(ctx context.Context, id, key, state, ref, why string, entries ...LogEntry) (bool, error) {
@@ -337,7 +337,7 @@ func (s *Store) SettleFinding(ctx context.Context, id, key, state, ref, why stri
 
 // ReviewFinding moves finding key of order id from state from to state to
 // (kept, discarded or restored), with, when not empty, ref, and why when
-// not nil, and appends entries to the captain's log, in one transaction
+// not nil, and appends entries to the ship's log, in one transaction
 // (#156). It reports whether the finding was in state from; one that
 // wasn't (a review step re-run after its transaction committed) is left
 // alone and nothing is logged.

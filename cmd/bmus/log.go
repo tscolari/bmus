@@ -26,7 +26,7 @@ const (
 )
 
 func newLogCmd(a *app) *cobra.Command {
-	cmd := &cobra.Command{Use: "log", Short: "Read the captain's log"}
+	cmd := &cobra.Command{Use: "log", Short: "Read the ship's log"}
 	var (
 		follow bool
 		since  int64
@@ -34,8 +34,8 @@ func newLogCmd(a *app) *cobra.Command {
 	)
 	tail := &cobra.Command{
 		Use:   "tail",
-		Short: "Print the captain's log, one entry per line: <ts> <kind> <crew> <order> <text>",
-		Long: `Print the captain's log, one entry per line: <ts> <kind> <crew> <order> <text>.
+		Short: "Print the ship's log, one entry per line: <ts> <kind> <crew> <order> <text>",
+		Long: `Print the ship's log, one entry per line: <ts> <kind> <crew> <order> <text>.
 
 With --follow it keeps polling for new entries every 500ms until interrupted.
 Once it has reached the bridge it rides out a bridge restart, printing a note

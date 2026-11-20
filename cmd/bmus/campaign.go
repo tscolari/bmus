@@ -136,7 +136,7 @@ belayed closes anything left open; a campaign that has ended is refused.`,
 			return nil
 		},
 	}
-	belay.Flags().StringVar(&belayReason, "reason", "", "why, for the captain's log")
+	belay.Flags().StringVar(&belayReason, "reason", "", "why, for the ship's log")
 	belay.Flags().BoolVar(&belayJSON, "json", false, "print JSON")
 
 	cmd.AddCommand(runCmd, list, show, belay)

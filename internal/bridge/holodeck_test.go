@@ -612,7 +612,7 @@ func TestMissionHailCheckpointDone(t *testing.T) {
 	}, 10*time.Second, 50*time.Millisecond)
 	requirePending(t, hd.d, tourWorkflowID("sorell", 0))
 
-	// The captain's log has the whole story, report included.
+	// The ship's log has the whole story, report included.
 	var entries []store.LogEntry
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
 		entries = hd.logEntries(ct)

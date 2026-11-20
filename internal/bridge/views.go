@@ -120,7 +120,7 @@ type (
 		CountermandedAt   *time.Time `json:"countermanded_at,omitempty"`
 	}
 
-	// LogEntryView is a captain's log entry.
+	// LogEntryView is a ship's log entry.
 	LogEntryView struct {
 		ID      int64           `json:"id"`
 		TS      time.Time       `json:"ts"`

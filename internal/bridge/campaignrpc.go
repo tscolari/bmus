@@ -56,7 +56,7 @@ type (
 		ID string `json:"id"`
 	}
 	// CampaignBelayArgs are campaign.belay's args: the campaign and an
-	// optional reason for the captain's log.
+	// optional reason for the ship's log.
 	CampaignBelayArgs struct {
 		ID     string `json:"id"`
 		Reason string `json:"reason,omitempty"`
