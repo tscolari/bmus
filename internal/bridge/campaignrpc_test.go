@@ -227,6 +227,9 @@ func TestCampaignBelayLandHail(t *testing.T) {
 	g := newCampaignRig(t, campaignOpts{})
 	work, _ := g.pass()
 	h, _ := g.landHail()
+	// Belay after the task's own check of the campaign once it raised the
+	// hail, or that check closes the hail and the sweep finds none.
+	g.waitStepAfter("task-land-hail", "check-campaign")
 	res := g.belayRPC("")
 	require.Equal(t, []string{h.ID}, res.Hails)
 	require.Empty(t, res.Orders)
@@ -250,6 +253,7 @@ func TestCampaignBelayStallHail(t *testing.T) {
 	g.claim(work.ID, "sorell")
 	g.fail(work.ID, "crew_error")
 	h, _ := g.stallHail()
+	g.waitStepAfter("task-stall-hail", "check-campaign")
 	res := g.belayRPC("")
 	require.Equal(t, []string{h.ID}, res.Hails)
 	require.Equal(t, TaskResult{State: store.TaskDropped, Why: "campaign belayed"}, g.result())
